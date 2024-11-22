@@ -21,53 +21,7 @@ markdown
 bash
 深色版本
 pip install -r requirements.txt
-配置文件：
-编辑 config.json 文件，设置 API 密钥和其他参数。
-示例配置文件：
-json
-深色版本
-{
-  "api_key": "your_api_key",
-  "tags": ["tag1", "tag2"],
-  "download_path": "./downloads"
-}
-运行工具：
-bash
-深色版本
-python danbooru_download.py
-English
-Clone the repository:
-bash
-深色版本
-git clone https://github.com/yourusername/DanbooruDownload_Tool.git
-cd DanbooruDownload_Tool
-Install dependencies:
-bash
-深色版本
-pip install -r requirements.txt
-Configuration file:
-Edit the config.json file to set your API key and other parameters.
-Example configuration file:
-json
-深色版本
-{
-  "api_key": "your_api_key",
-  "tags": ["tag1", "tag2"],
-  "download_path": "./downloads"
-}
-Run the tool:
-bash
-深色版本
-python danbooru_download.py
-依赖项
-中文
-requests: 用于发送 HTTP 请求。
-os: 用于文件和目录操作。
-json: 用于处理 JSON 数据。
-English
-requests: For sending HTTP requests.
-os: For file and directory operations.
-json: For handling JSON data.
+
 许可证
 中文
 本项目采用 MIT 许可证，详情请参见 LICENSE 文件。
