@@ -23,7 +23,7 @@ config_file = "danbooru.config"
 # 配置模型
 class Config(BaseModel):
     username: str = Field(default="your_username", description="Danbooru 用户名")
-    api_key: str = Field(default="Xie2sjwmXDo3me9JWJ8VUKMF", description="Danbooru API 密钥")
+    api_key: str = Field(default="", description="Danbooru API 密钥")
     tags: str = Field(default="", description="搜索标签，逗号分隔")
     exclude_tags: str = Field(default="", description="排除标签，逗号分隔")
     score_threshold: int = Field(default=0, description="隐藏分阈值")
