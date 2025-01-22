@@ -13,7 +13,7 @@
 ### 中文
 1. 克隆仓库：
    ```bash
-   git clone https://github.com/xiemonb666/DanbooruDownload_Tool.git
+   git clone https://github.com/xiemonb666/Danbooru-Download-Tool.git
    cd DanbooruDownload_Tool
 安装依赖项：
 bash
