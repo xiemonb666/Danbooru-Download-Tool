@@ -1,5 +1,3 @@
-markdown
-深色版本
 # DanbooruDownload_Tool
 
 ## 项目简介
@@ -15,7 +13,7 @@ markdown
 ### 中文
 1. 克隆仓库：
    ```bash
-   git clone https://github.com/yourusername/DanbooruDownload_Tool.git
+   git clone https://github.com/xiemonb666/DanbooruDownload_Tool.git
    cd DanbooruDownload_Tool
 安装依赖项：
 bash
@@ -28,8 +26,6 @@ pip install -r requirements.txt
 
 English
 This project is licensed under the MIT License. See the LICENSE file for details.
-
-联系方式
 中文
 如果你有任何问题或建议，请联系 [你的邮箱] 或在 GitHub 上提交 Issue。
 
