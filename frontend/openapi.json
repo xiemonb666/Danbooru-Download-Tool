@@ -1,0 +1,4415 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "DanbooruDownload Tool Pro API",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/api/config": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_AppConfig"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "update_config",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateConfigRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_AppConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/danbooru/autocomplete": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "danbooru_autocomplete",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_Vec_TagSuggestion"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/danbooru/count": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "danbooru_count",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_DanbooruCount"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/danbooru/posts": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "danbooru_posts",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_DanbooruPostsPage"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/danbooru/posts/{id}": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "danbooru_post",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_DanbooruPost"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/danbooru/posts/{id}/media/{variant}": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "danbooru_media",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "variant",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "206": {
+            "description": "",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/downloads/history": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "download_history",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_DownloadHistoryPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_HealthStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/items": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "list_library_items",
+        "parameters": [
+          {
+            "name": "root_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_LibraryPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/items/{id}": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "library_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_LocalMedia"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/media/{id}/{variant}": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "library_media",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "variant",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "206": {
+            "description": "",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/quarantine": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "list_quarantine",
+        "parameters": [
+          {
+            "name": "root_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_Vec_QuarantineEntry"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "purge_quarantine",
+        "parameters": [
+          {
+            "name": "root_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_PurgeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/quarantine/{id}/restore": {
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "restore_quarantine",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_QuarantineEntry"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/roots": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "list_roots",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_Vec_MediaRoot"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "create_root",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveMediaRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_MediaRoot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/roots/{id}": {
+      "put": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "update_root",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveMediaRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_MediaRoot"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "delete_root",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_RootRemoval"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/library/roots/{id}/directories": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "list_root_directories",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_MediaDirectoryList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "create_root_directory",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMediaDirectoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_MediaDirectory"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/secrets/{kind}": {
+      "put": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "put_secret",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_SecretResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "delete_secret",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_SecretResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "list_tasks",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_TaskSnapshot"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "create_task",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_TaskSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/events": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "task_events",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "task_detail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "item_status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TaskItemStatus"
+            }
+          },
+          {
+            "name": "item_cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "item_limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_TaskDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/{action}": {
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "task_action",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_TaskSummary"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/vllm/health": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "vllm_health",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_VllmHealthStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "fields": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiFailure": {
+        "type": "object",
+        "required": [
+          "error",
+          "request_id"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ApiSuccess_AppConfig": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "danbooru_username",
+              "danbooru_api_key_configured",
+              "vllm_api_key_configured",
+              "vllm_base_url",
+              "vllm_allowed_hosts",
+              "vllm_model",
+              "vllm_system_prompt",
+              "vllm_tag_mode",
+              "vllm_language",
+              "vllm_max_tags",
+              "vllm_max_length",
+              "vllm_verify_danbooru",
+              "vllm_reference_existing",
+              "vllm_concurrency",
+              "download_concurrency",
+              "filename_template",
+              "ugoira_policy",
+              "blur_sensitive_media"
+            ],
+            "properties": {
+              "blur_sensitive_media": {
+                "type": "boolean"
+              },
+              "danbooru_api_key_configured": {
+                "type": "boolean"
+              },
+              "danbooru_username": {
+                "type": "string"
+              },
+              "download_concurrency": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "filename_template": {
+                "type": "string"
+              },
+              "proxy_url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ugoira_policy": {
+                "$ref": "#/components/schemas/UgoiraPolicy"
+              },
+              "vllm_allowed_hosts": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "vllm_api_key_configured": {
+                "type": "boolean"
+              },
+              "vllm_base_url": {
+                "type": "string"
+              },
+              "vllm_concurrency": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "vllm_language": {
+                "$ref": "#/components/schemas/VllmLanguage"
+              },
+              "vllm_max_length": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "vllm_max_tags": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "vllm_model": {
+                "type": "string"
+              },
+              "vllm_reference_existing": {
+                "type": "boolean"
+              },
+              "vllm_system_prompt": {
+                "type": "string"
+              },
+              "vllm_tag_mode": {
+                "$ref": "#/components/schemas/VllmTagMode"
+              },
+              "vllm_verify_danbooru": {
+                "type": "boolean"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_DanbooruCount": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "count",
+              "exact"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "exact": {
+                "type": "boolean"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_DanbooruPost": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "rating",
+              "score",
+              "fav_count",
+              "image_width",
+              "image_height",
+              "file_ext",
+              "file_size",
+              "is_video",
+              "is_ugoira",
+              "restricted",
+              "downloaded",
+              "tags"
+            ],
+            "properties": {
+              "downloaded": {
+                "type": "boolean"
+              },
+              "duration": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "double"
+              },
+              "fav_count": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "file_ext": {
+                "type": "string"
+              },
+              "file_size": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "id": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "image_height": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "image_width": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "is_ugoira": {
+                "type": "boolean"
+              },
+              "is_video": {
+                "type": "boolean"
+              },
+              "rating": {
+                "$ref": "#/components/schemas/ContentRating"
+              },
+              "restricted": {
+                "type": "boolean"
+              },
+              "score": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "source": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tags": {
+                "$ref": "#/components/schemas/DanbooruTags"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_DanbooruPostsPage": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "posts",
+              "page"
+            ],
+            "properties": {
+              "next_page": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "page": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "posts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DanbooruPost"
+                }
+              },
+              "previous_page": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_DownloadHistoryPage": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DownloadHistoryRecord"
+                }
+              },
+              "next_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_HealthStatus": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "status",
+              "version",
+              "database",
+              "uptime_seconds"
+            ],
+            "properties": {
+              "database": {
+                "$ref": "#/components/schemas/DatabaseHealthState"
+              },
+              "status": {
+                "$ref": "#/components/schemas/HealthState"
+              },
+              "uptime_seconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_LibraryPage": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "items",
+              "total"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/LocalMedia"
+                }
+              },
+              "next_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "total": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_LocalMedia": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "root_id",
+              "filename",
+              "relative_path",
+              "mime_type",
+              "size_bytes",
+              "tags",
+              "created_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "duration": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "double"
+              },
+              "filename": {
+                "type": "string"
+              },
+              "height": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
+              "id": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              },
+              "post_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "rating": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ContentRating"
+                  }
+                ]
+              },
+              "relative_path": {
+                "type": "string"
+              },
+              "root_id": {
+                "type": "string"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "width": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_MediaDirectory": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "relative_path"
+            ],
+            "properties": {
+              "relative_path": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_MediaDirectoryList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "directories",
+              "truncated"
+            ],
+            "properties": {
+              "directories": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_MediaRoot": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "indexed",
+              "media_count",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "indexed": {
+                "type": "boolean"
+              },
+              "linux_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "media_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "name": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "windows_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_PurgeResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "purged"
+            ],
+            "properties": {
+              "purged": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_QuarantineEntry": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "root_id",
+              "original_relative_path",
+              "quarantine_relative_path",
+              "size_bytes",
+              "reason",
+              "created_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "original_relative_path": {
+                "type": "string"
+              },
+              "quarantine_relative_path": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "root_id": {
+                "type": "string"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_RootRemoval": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_SecretResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "configured",
+              "storage"
+            ],
+            "properties": {
+              "configured": {
+                "type": "boolean"
+              },
+              "storage": {
+                "$ref": "#/components/schemas/SecretStorage"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_TaskDetails": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "task",
+              "item_counts",
+              "items"
+            ],
+            "properties": {
+              "item_counts": {
+                "$ref": "#/components/schemas/TaskItemCounts"
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TaskItem"
+                }
+              },
+              "next_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "result": {},
+              "task": {
+                "$ref": "#/components/schemas/TaskSummary"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_TaskSnapshot": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "tasks",
+              "last_event_id"
+            ],
+            "properties": {
+              "last_event_id": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "tasks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TaskSummary"
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_TaskSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "status",
+              "revision",
+              "title",
+              "progress",
+              "failures",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "failures": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TaskFailure"
+                }
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/components/schemas/TaskKind"
+              },
+              "preview": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TaskPreview"
+                  }
+                ]
+              },
+              "progress": {
+                "$ref": "#/components/schemas/TaskProgress"
+              },
+              "revision": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "status": {
+                "$ref": "#/components/schemas/TaskStatus"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_Vec_MediaRoot": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "indexed",
+                "media_count",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "indexed": {
+                  "type": "boolean"
+                },
+                "linux_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "media_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "name": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "windows_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_Vec_QuarantineEntry": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "root_id",
+                "original_relative_path",
+                "quarantine_relative_path",
+                "size_bytes",
+                "reason",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "original_relative_path": {
+                  "type": "string"
+                },
+                "quarantine_relative_path": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "root_id": {
+                  "type": "string"
+                },
+                "size_bytes": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_Vec_TagSuggestion": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "value",
+                "label",
+                "category"
+              ],
+              "properties": {
+                "category": {
+                  "$ref": "#/components/schemas/TagCategory"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "post_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_VllmHealthStatus": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "available",
+              "models",
+              "message"
+            ],
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "message": {
+                "type": "string"
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "AppConfig": {
+        "type": "object",
+        "required": [
+          "danbooru_username",
+          "danbooru_api_key_configured",
+          "vllm_api_key_configured",
+          "vllm_base_url",
+          "vllm_allowed_hosts",
+          "vllm_model",
+          "vllm_system_prompt",
+          "vllm_tag_mode",
+          "vllm_language",
+          "vllm_max_tags",
+          "vllm_max_length",
+          "vllm_verify_danbooru",
+          "vllm_reference_existing",
+          "vllm_concurrency",
+          "download_concurrency",
+          "filename_template",
+          "ugoira_policy",
+          "blur_sensitive_media"
+        ],
+        "properties": {
+          "blur_sensitive_media": {
+            "type": "boolean"
+          },
+          "danbooru_api_key_configured": {
+            "type": "boolean"
+          },
+          "danbooru_username": {
+            "type": "string"
+          },
+          "download_concurrency": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "filename_template": {
+            "type": "string"
+          },
+          "proxy_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ugoira_policy": {
+            "$ref": "#/components/schemas/UgoiraPolicy"
+          },
+          "vllm_allowed_hosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "vllm_api_key_configured": {
+            "type": "boolean"
+          },
+          "vllm_base_url": {
+            "type": "string"
+          },
+          "vllm_concurrency": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_language": {
+            "$ref": "#/components/schemas/VllmLanguage"
+          },
+          "vllm_max_length": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_max_tags": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_model": {
+            "type": "string"
+          },
+          "vllm_reference_existing": {
+            "type": "boolean"
+          },
+          "vllm_system_prompt": {
+            "type": "string"
+          },
+          "vllm_tag_mode": {
+            "$ref": "#/components/schemas/VllmTagMode"
+          },
+          "vllm_verify_danbooru": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ArtistPrefix": {
+        "type": "string",
+        "enum": [
+          "artist",
+          "at"
+        ]
+      },
+      "BatchDownloadFilter": {
+        "type": "object",
+        "required": [
+          "include_tags",
+          "exclude_tags",
+          "minimum_score",
+          "minimum_resolution"
+        ],
+        "properties": {
+          "exclude_tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "include_tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "minimum_resolution": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "minimum_score": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ContentRating": {
+        "type": "string",
+        "enum": [
+          "g",
+          "s",
+          "q",
+          "e",
+          "unknown"
+        ]
+      },
+      "CreateMediaDirectoryRequest": {
+        "type": "object",
+        "required": [
+          "relative_path"
+        ],
+        "properties": {
+          "relative_path": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateTaskRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DownloadTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/IndexLibraryTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/IntegrityScanTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/ExactDedupTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/NearDedupTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/ResizeTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/HeicConvertTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/DeleteByTagTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/TagPipelineTaskRequest"
+          },
+          {
+            "$ref": "#/components/schemas/VllmTagTaskRequest"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "delete_by_tag": "#/components/schemas/DeleteByTagTaskRequest",
+            "download": "#/components/schemas/DownloadTaskRequest",
+            "exact_dedup": "#/components/schemas/ExactDedupTaskRequest",
+            "heic_convert": "#/components/schemas/HeicConvertTaskRequest",
+            "index_library": "#/components/schemas/IndexLibraryTaskRequest",
+            "integrity_scan": "#/components/schemas/IntegrityScanTaskRequest",
+            "near_dedup": "#/components/schemas/NearDedupTaskRequest",
+            "resize": "#/components/schemas/ResizeTaskRequest",
+            "tag_pipeline": "#/components/schemas/TagPipelineTaskRequest",
+            "vllm_tag": "#/components/schemas/VllmTagTaskRequest"
+          }
+        }
+      },
+      "DanbooruCount": {
+        "type": "object",
+        "required": [
+          "count",
+          "exact"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "exact": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DanbooruPost": {
+        "type": "object",
+        "required": [
+          "id",
+          "rating",
+          "score",
+          "fav_count",
+          "image_width",
+          "image_height",
+          "file_ext",
+          "file_size",
+          "is_video",
+          "is_ugoira",
+          "restricted",
+          "downloaded",
+          "tags"
+        ],
+        "properties": {
+          "downloaded": {
+            "type": "boolean"
+          },
+          "duration": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "fav_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "file_ext": {
+            "type": "string"
+          },
+          "file_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "image_height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "image_width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "is_ugoira": {
+            "type": "boolean"
+          },
+          "is_video": {
+            "type": "boolean"
+          },
+          "rating": {
+            "$ref": "#/components/schemas/ContentRating"
+          },
+          "restricted": {
+            "type": "boolean"
+          },
+          "score": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "$ref": "#/components/schemas/DanbooruTags"
+          }
+        }
+      },
+      "DanbooruPostsPage": {
+        "type": "object",
+        "required": [
+          "posts",
+          "page"
+        ],
+        "properties": {
+          "next_page": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "posts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DanbooruPost"
+            }
+          },
+          "previous_page": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DanbooruTags": {
+        "type": "object",
+        "required": [
+          "general",
+          "artist",
+          "copyright",
+          "character",
+          "meta"
+        ],
+        "properties": {
+          "artist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "character": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "copyright": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "general": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "meta": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "DatabaseHealthState": {
+        "type": "string",
+        "enum": [
+          "ok"
+        ]
+      },
+      "DeleteByTagTaskOptions": {
+        "type": "object",
+        "required": [
+          "tag"
+        ],
+        "properties": {
+          "preflight": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag": {
+            "type": "string"
+          }
+        }
+      },
+      "DeleteByTagTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id",
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/DeleteByTagTaskOptions"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/DeleteByTagTaskType"
+          }
+        }
+      },
+      "DeleteByTagTaskType": {
+        "type": "string",
+        "enum": [
+          "delete_by_tag"
+        ]
+      },
+      "DownloadHistoryPage": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DownloadHistoryRecord"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DownloadHistoryRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "status",
+          "source_label",
+          "created_at",
+          "total_items",
+          "completed_items",
+          "skipped_items",
+          "failed_items",
+          "bytes_processed",
+          "can_repeat"
+        ],
+        "properties": {
+          "bytes_processed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "can_repeat": {
+            "type": "boolean"
+          },
+          "completed_items": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "duration_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_items": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "repeat_request": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateTaskRequest"
+              }
+            ]
+          },
+          "root_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skipped_items": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "total_items": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DownloadSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "query",
+              "type"
+            ],
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "query"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "post_ids",
+              "type"
+            ],
+            "properties": {
+              "post_ids": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "post_ids"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "DownloadTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "source",
+          "root_id",
+          "limit",
+          "concurrency",
+          "filename_template",
+          "skip_existing",
+          "media_policy"
+        ],
+        "properties": {
+          "batch_filter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BatchDownloadFilter"
+              }
+            ]
+          },
+          "concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "filename_template": {
+            "type": "string"
+          },
+          "keep_sidecar_txt": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "media_policy": {
+            "$ref": "#/components/schemas/MediaPolicy"
+          },
+          "prioritize_resolution": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "prioritize_score": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "skip_existing": {
+            "type": "boolean"
+          },
+          "source": {
+            "$ref": "#/components/schemas/DownloadSource"
+          },
+          "static_images_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/DownloadTaskType"
+          }
+        }
+      },
+      "DownloadTaskType": {
+        "type": "string",
+        "enum": [
+          "download"
+        ]
+      },
+      "ExactDedupTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id"
+        ],
+        "properties": {
+          "options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PreflightTaskOptions"
+              }
+            ]
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ExactDedupTaskType"
+          }
+        }
+      },
+      "ExactDedupTaskType": {
+        "type": "string",
+        "enum": [
+          "exact_dedup"
+        ]
+      },
+      "HealthState": {
+        "type": "string",
+        "enum": [
+          "ok"
+        ]
+      },
+      "HealthStatus": {
+        "type": "object",
+        "required": [
+          "status",
+          "version",
+          "database",
+          "uptime_seconds"
+        ],
+        "properties": {
+          "database": {
+            "$ref": "#/components/schemas/DatabaseHealthState"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthState"
+          },
+          "uptime_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "HeicConvertTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id",
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/MediaIdsTaskOptions"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/HeicConvertTaskType"
+          }
+        }
+      },
+      "HeicConvertTaskType": {
+        "type": "string",
+        "enum": [
+          "heic_convert"
+        ]
+      },
+      "IndexLibraryTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id"
+        ],
+        "properties": {
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/IndexLibraryTaskType"
+          }
+        }
+      },
+      "IndexLibraryTaskType": {
+        "type": "string",
+        "enum": [
+          "index_library"
+        ]
+      },
+      "IntegrityScanTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id"
+        ],
+        "properties": {
+          "options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PreflightTaskOptions"
+              }
+            ]
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/IntegrityScanTaskType"
+          }
+        }
+      },
+      "IntegrityScanTaskType": {
+        "type": "string",
+        "enum": [
+          "integrity_scan"
+        ]
+      },
+      "LibraryPage": {
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalMedia"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalMedia": {
+        "type": "object",
+        "required": [
+          "id",
+          "root_id",
+          "filename",
+          "relative_path",
+          "mime_type",
+          "size_bytes",
+          "tags",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "duration": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "post_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "rating": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContentRating"
+              }
+            ]
+          },
+          "relative_path": {
+            "type": "string"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "width": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "MediaDirectory": {
+        "type": "object",
+        "required": [
+          "relative_path"
+        ],
+        "properties": {
+          "relative_path": {
+            "type": "string"
+          }
+        }
+      },
+      "MediaDirectoryList": {
+        "type": "object",
+        "required": [
+          "directories",
+          "truncated"
+        ],
+        "properties": {
+          "directories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MediaIdsTaskOptions": {
+        "type": "object",
+        "properties": {
+          "media_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "MediaPolicy": {
+        "type": "object",
+        "required": [
+          "original",
+          "ugoira"
+        ],
+        "properties": {
+          "original": {
+            "type": "boolean"
+          },
+          "ugoira": {
+            "$ref": "#/components/schemas/UgoiraPolicy"
+          }
+        }
+      },
+      "MediaRoot": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "indexed",
+          "media_count",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "indexed": {
+            "type": "boolean"
+          },
+          "linux_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "windows_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NearDedupTaskOptions": {
+        "type": "object",
+        "properties": {
+          "distance": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "preflight": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NearDedupTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id"
+        ],
+        "properties": {
+          "options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NearDedupTaskOptions"
+              }
+            ]
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/NearDedupTaskType"
+          }
+        }
+      },
+      "NearDedupTaskType": {
+        "type": "string",
+        "enum": [
+          "near_dedup"
+        ]
+      },
+      "NearDuplicatePair": {
+        "type": "object",
+        "required": [
+          "left",
+          "right",
+          "distance"
+        ],
+        "properties": {
+          "distance": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "left": {
+            "type": "string"
+          },
+          "right": {
+            "type": "string"
+          }
+        }
+      },
+      "PreflightTaskOptions": {
+        "type": "object",
+        "properties": {
+          "preflight": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PurgeResponse": {
+        "type": "object",
+        "required": [
+          "purged"
+        ],
+        "properties": {
+          "purged": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "QuarantineEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "root_id",
+          "original_relative_path",
+          "quarantine_relative_path",
+          "size_bytes",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "original_relative_path": {
+            "type": "string"
+          },
+          "quarantine_relative_path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ResizeTaskOptions": {
+        "type": "object",
+        "properties": {
+          "max_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "media_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "quality": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ResizeTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id",
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/ResizeTaskOptions"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ResizeTaskType"
+          }
+        }
+      },
+      "ResizeTaskType": {
+        "type": "string",
+        "enum": [
+          "resize"
+        ]
+      },
+      "RootRemoval": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "SaveMediaRootRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "linux_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "windows_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecretRequest": {
+        "type": "object",
+        "required": [
+          "secret"
+        ],
+        "properties": {
+          "secret": {
+            "type": "string"
+          }
+        }
+      },
+      "SecretResponse": {
+        "type": "object",
+        "required": [
+          "configured",
+          "storage"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/SecretStorage"
+          }
+        }
+      },
+      "SecretStorage": {
+        "type": "string",
+        "enum": [
+          "system",
+          "session",
+          "none"
+        ]
+      },
+      "TagCategory": {
+        "type": "string",
+        "enum": [
+          "general",
+          "artist",
+          "copyright",
+          "character",
+          "meta",
+          "query"
+        ]
+      },
+      "TagPipelineTaskOptions": {
+        "type": "object",
+        "properties": {
+          "artist_prefix": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtistPrefix"
+              }
+            ]
+          },
+          "media_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TagPipelineTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id",
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/TagPipelineTaskOptions"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/TagPipelineTaskType"
+          }
+        }
+      },
+      "TagPipelineTaskType": {
+        "type": "string",
+        "enum": [
+          "tag_pipeline"
+        ]
+      },
+      "TagSuggestion": {
+        "type": "object",
+        "required": [
+          "value",
+          "label",
+          "category"
+        ],
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/TagCategory"
+          },
+          "label": {
+            "type": "string"
+          },
+          "post_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "TaskDetails": {
+        "type": "object",
+        "required": [
+          "task",
+          "item_counts",
+          "items"
+        ],
+        "properties": {
+          "item_counts": {
+            "$ref": "#/components/schemas/TaskItemCounts"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskItem"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {},
+          "task": {
+            "$ref": "#/components/schemas/TaskSummary"
+          }
+        }
+      },
+      "TaskEvent": {
+        "type": "object",
+        "required": [
+          "sequence",
+          "task_id",
+          "revision",
+          "event_type",
+          "task"
+        ],
+        "properties": {
+          "event_type": {
+            "$ref": "#/components/schemas/TaskEventType"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskSummary"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        }
+      },
+      "TaskEventType": {
+        "type": "string",
+        "enum": [
+          "created",
+          "updated"
+        ]
+      },
+      "TaskFailure": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TaskItem": {
+        "type": "object",
+        "required": [
+          "item_id",
+          "status",
+          "attempts",
+          "updated_at"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskFailure"
+              }
+            ]
+          },
+          "item_id": {
+            "type": "string"
+          },
+          "post_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "result": {},
+          "status": {
+            "$ref": "#/components/schemas/TaskItemStatus"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "TaskItemCounts": {
+        "type": "object",
+        "required": [
+          "total",
+          "queued",
+          "completed",
+          "skipped",
+          "failed",
+          "retryable_failed",
+          "completed_bytes"
+        ],
+        "properties": {
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "completed_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "retryable_failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskItemStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "completed",
+          "skipped",
+          "failed"
+        ]
+      },
+      "TaskKind": {
+        "type": "string",
+        "enum": [
+          "download",
+          "index_library",
+          "integrity_scan",
+          "exact_dedup",
+          "near_dedup",
+          "resize",
+          "heic_convert",
+          "delete_by_tag",
+          "tag_pipeline",
+          "vllm_tag"
+        ]
+      },
+      "TaskPreview": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TaskPreviewCandidate"
+            }
+          },
+          "pairs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/NearDuplicatePair"
+            }
+          }
+        }
+      },
+      "TaskPreviewCandidate": {
+        "type": "object",
+        "required": [
+          "relative_path",
+          "reason",
+          "size"
+        ],
+        "properties": {
+          "companion_paths": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "type": "string"
+          },
+          "relative_path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskProgress": {
+        "type": "object",
+        "required": [
+          "completed",
+          "total",
+          "bytes_downloaded",
+          "speed_bytes_per_sec"
+        ],
+        "properties": {
+          "bytes_downloaded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "eta_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "speed_bytes_per_sec": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskSnapshot": {
+        "type": "object",
+        "required": [
+          "tasks",
+          "last_event_id"
+        ],
+        "properties": {
+          "last_event_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskSummary"
+            }
+          }
+        }
+      },
+      "TaskStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "pausing",
+          "paused",
+          "cancelling",
+          "awaiting_confirmation",
+          "completed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "TaskSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "revision",
+          "title",
+          "progress",
+          "failures",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskFailure"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind"
+          },
+          "preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskPreview"
+              }
+            ]
+          },
+          "progress": {
+            "$ref": "#/components/schemas/TaskProgress"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "UgoiraPolicy": {
+        "type": "string",
+        "enum": [
+          "webm_and_zip",
+          "webm_only",
+          "zip_only"
+        ]
+      },
+      "UpdateConfigRequest": {
+        "type": "object",
+        "required": [
+          "danbooru_username",
+          "vllm_base_url",
+          "vllm_allowed_hosts",
+          "vllm_model",
+          "vllm_system_prompt",
+          "vllm_tag_mode",
+          "vllm_language",
+          "vllm_max_tags",
+          "vllm_max_length",
+          "vllm_verify_danbooru",
+          "vllm_reference_existing",
+          "vllm_concurrency",
+          "download_concurrency",
+          "filename_template",
+          "ugoira_policy",
+          "blur_sensitive_media"
+        ],
+        "properties": {
+          "blur_sensitive_media": {
+            "type": "boolean"
+          },
+          "danbooru_username": {
+            "type": "string"
+          },
+          "download_concurrency": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "filename_template": {
+            "type": "string"
+          },
+          "proxy_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ugoira_policy": {
+            "$ref": "#/components/schemas/UgoiraPolicy"
+          },
+          "vllm_allowed_hosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "vllm_base_url": {
+            "type": "string"
+          },
+          "vllm_concurrency": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_language": {
+            "$ref": "#/components/schemas/VllmLanguage"
+          },
+          "vllm_max_length": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_max_tags": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vllm_model": {
+            "type": "string"
+          },
+          "vllm_reference_existing": {
+            "type": "boolean"
+          },
+          "vllm_system_prompt": {
+            "type": "string"
+          },
+          "vllm_tag_mode": {
+            "$ref": "#/components/schemas/VllmTagMode"
+          },
+          "vllm_verify_danbooru": {
+            "type": "boolean"
+          }
+        }
+      },
+      "VllmHealthStatus": {
+        "type": "object",
+        "required": [
+          "available",
+          "models",
+          "message"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "VllmLanguage": {
+        "type": "string",
+        "enum": [
+          "zh",
+          "en",
+          "danbooru"
+        ]
+      },
+      "VllmTagMode": {
+        "type": "string",
+        "enum": [
+          "overwrite",
+          "append"
+        ]
+      },
+      "VllmTagTaskRequest": {
+        "type": "object",
+        "required": [
+          "type",
+          "root_id",
+          "options"
+        ],
+        "properties": {
+          "options": {
+            "$ref": "#/components/schemas/MediaIdsTaskOptions"
+          },
+          "root_id": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/VllmTagTaskType"
+          }
+        }
+      },
+      "VllmTagTaskType": {
+        "type": "string",
+        "enum": [
+          "vllm_tag"
+        ]
+      }
+    }
+  }
+}

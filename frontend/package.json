@@ -1,0 +1,41 @@
+{
+  "name": "danbooru-tool-pro-frontend",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "api:generate": "node scripts/generate-api.mjs",
+    "api:check": "node scripts/generate-api.mjs --check",
+    "dev": "vite",
+    "pretypecheck": "npm run api:check",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:real": "npm run build && node scripts/run-real-e2e.mjs",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.24.0",
+    "pinia": "^4.0.2",
+    "vue": "^3.5.39",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.61.1",
+    "@tailwindcss/vite": "^4.3.2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/vue": "^8.1.0",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^29.1.1",
+    "openapi-typescript": "^7.13.0",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.7"
+  }
+}

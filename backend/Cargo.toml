@@ -1,0 +1,38 @@
+[package]
+name = "danbooru-download-tool-pro"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+futures-core = "0.3"
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "limit", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "socks"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+rayon = "1.10"
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+httpdate = "1"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+mime_guess = "2"
+tempfile = "3"
+walkdir = "2"
+num_cpus = "1"
+base64 = "0.22"
+keyring = "4.1.5"
+utoipa = "5.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
