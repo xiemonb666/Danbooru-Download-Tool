@@ -1,16 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -122,10 +119,13 @@ pub struct TaskEventReplay {
     pub latest_sequence: u64,
 }
 
+const TASK_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+
 pub trait TaskStore: Clone + Send + Sync + 'static {
     fn insert(&self, task: TaskSnapshot) -> Result<(), TaskStoreError>;
     fn get(&self, id: &str) -> Result<Option<TaskSnapshot>, TaskStoreError>;
     fn update(&self, task: TaskSnapshot) -> Result<(), TaskStoreError>;
+    fn delete(&self, id: &str) -> Result<bool, TaskStoreError>;
     fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError>;
 }
 
@@ -156,6 +156,15 @@ impl TaskStore for MemoryTaskStore {
 
     fn update(&self, task: TaskSnapshot) -> Result<(), TaskStoreError> {
         self.insert(task)
+    }
+
+    fn delete(&self, id: &str) -> Result<bool, TaskStoreError> {
+        Ok(self
+            .tasks
+            .lock()
+            .map_err(|_| TaskStoreError::new("task store poisoned"))?
+            .remove(id)
+            .is_some())
     }
 
     fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError> {
@@ -235,6 +244,12 @@ impl TaskStore for SqliteTaskStore {
 
     fn update(&self, task: TaskSnapshot) -> Result<(), TaskStoreError> {
         self.persist_snapshot(&task)
+    }
+
+    fn delete(&self, id: &str) -> Result<bool, TaskStoreError> {
+        self.database
+            .delete_task(id)
+            .map_err(|error| TaskStoreError::new(error.to_string()))
     }
 
     fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError> {
@@ -331,7 +346,9 @@ fn parse_task_status(status: &str) -> Option<TaskStatus> {
 #[derive(Clone)]
 pub struct TaskManager<S: TaskStore> {
     store: S,
+    snapshots: Arc<Mutex<HashMap<String, TaskSnapshot>>>,
     mutations: Arc<Mutex<()>>,
+    progress_persisted_at: Arc<Mutex<HashMap<String, Instant>>>,
     events: tokio::sync::broadcast::Sender<TaskEvent>,
     sequence: Arc<AtomicU64>,
     replay: Arc<Mutex<VecDeque<TaskEvent>>>,
@@ -340,14 +357,20 @@ pub struct TaskManager<S: TaskStore> {
 impl<S: TaskStore> TaskManager<S> {
     pub fn new(store: S) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(1_024);
-        let initial_sequence = store
-            .list()
-            .unwrap_or_default()
-            .into_iter()
+        let initial_tasks = store.list().unwrap_or_default();
+        let initial_sequence = initial_tasks
+            .iter()
             .fold(0_u64, |total, task| total.saturating_add(task.revision));
         Self {
             store,
+            snapshots: Arc::new(Mutex::new(
+                initial_tasks
+                    .into_iter()
+                    .map(|task| (task.id.clone(), task))
+                    .collect(),
+            )),
             mutations: Arc::new(Mutex::new(())),
+            progress_persisted_at: Arc::new(Mutex::new(HashMap::new())),
             events,
             sequence: Arc::new(AtomicU64::new(initial_sequence)),
             replay: Arc::new(Mutex::new(VecDeque::with_capacity(4_096))),
@@ -381,16 +404,50 @@ impl<S: TaskStore> TaskManager<S> {
             error: None,
         };
         self.store.insert(task.clone())?;
+        self.cache_task(&task);
         self.emit("created", &task);
         Ok(task)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<TaskSnapshot>, TaskManagerError> {
-        self.store.get(id).map_err(Into::into)
+        self.load_task(id)
+    }
+
+    /// Removes a terminal task after its owner has safely cleaned up any
+    /// external files. A deleted event carries the final snapshot so all
+    /// connected clients can remove the task without a polling delay.
+    pub fn delete_terminal(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
+        let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
+        let task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
+        if !matches!(
+            task.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return Err(TaskManagerError::InvalidTransition {
+                from: task.status,
+                to: TaskStatus::Cancelled,
+            });
+        }
+        if !self.store.delete(id)? {
+            return Err(TaskManagerError::NotFound);
+        }
+        self.snapshots
+            .lock()
+            .expect("task snapshot cache lock poisoned")
+            .remove(id);
+        self.clear_progress_throttle(id);
+        self.emit("deleted", &task);
+        Ok(task)
     }
 
     pub fn snapshot(&self) -> Result<Vec<TaskSnapshot>, TaskManagerError> {
-        let mut tasks = self.store.list()?;
+        let mut tasks = self
+            .snapshots
+            .lock()
+            .expect("task snapshot cache lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         tasks.sort_by(|left, right| {
             right
                 .updated_at
@@ -408,7 +465,7 @@ impl<S: TaskStore> TaskManager<S> {
     pub fn recover_interrupted(&self) -> Result<Vec<TaskSnapshot>, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
         let mut recovered = Vec::new();
-        for mut task in self.store.list()? {
+        for mut task in self.snapshot()? {
             match task.status {
                 TaskStatus::Pausing => {
                     task.status = TaskStatus::Paused;
@@ -418,7 +475,10 @@ impl<S: TaskStore> TaskManager<S> {
                     task.status = TaskStatus::Cancelled;
                     task.error = None;
                 }
-                TaskStatus::Running if task.kind == "download" => {
+                // Training state is written at safe reporting boundaries by the
+                // telemetry bridge. On application restart it remains
+                // resumable rather than being treated as an unrecoverable job.
+                TaskStatus::Running if matches!(task.kind.as_str(), "download" | "training") => {
                     task.status = TaskStatus::Paused;
                     task.error = None;
                 }
@@ -434,7 +494,7 @@ impl<S: TaskStore> TaskManager<S> {
             }
             task.revision += 1;
             task.updated_at = unix_timestamp();
-            self.store.update(task.clone())?;
+            self.persist_task(&task)?;
             self.emit("recovered", &task);
             recovered.push(task);
         }
@@ -483,12 +543,14 @@ impl<S: TaskStore> TaskManager<S> {
     }
 
     pub fn start(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
-        self.transition(id, &[TaskStatus::Queued], TaskStatus::Running, "started")
+        let task = self.transition(id, &[TaskStatus::Queued], TaskStatus::Running, "started")?;
+        self.clear_progress_throttle(id);
+        Ok(task)
     }
 
     pub fn pause(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         let (target, event) = match task.status {
             TaskStatus::Queued => (TaskStatus::Paused, "paused"),
             TaskStatus::Running => (TaskStatus::Pausing, "pause_requested"),
@@ -502,23 +564,26 @@ impl<S: TaskStore> TaskManager<S> {
         task.status = target;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit(event, &task);
         Ok(task)
     }
 
     pub fn resume(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
-        self.transition(
+        let task = self.transition(
             id,
             &[TaskStatus::Paused, TaskStatus::Pausing],
             TaskStatus::Queued,
             "resumed",
-        )
+        )?;
+        self.clear_progress_throttle(id);
+        Ok(task)
     }
 
     pub fn cancel(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         let (target, event) = match task.status {
             TaskStatus::Running | TaskStatus::Pausing => {
                 (TaskStatus::Cancelling, "cancel_requested")
@@ -536,14 +601,15 @@ impl<S: TaskStore> TaskManager<S> {
         task.status = target;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit(event, &task);
         Ok(task)
     }
 
     pub fn acknowledge_stop(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         let (target, event) = match task.status {
             TaskStatus::Pausing => (TaskStatus::Paused, "paused"),
             TaskStatus::Cancelling => (TaskStatus::Cancelled, "cancelled"),
@@ -559,7 +625,8 @@ impl<S: TaskStore> TaskManager<S> {
         task.eta_seconds = None;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit(event, &task);
         Ok(task)
     }
@@ -573,7 +640,7 @@ impl<S: TaskStore> TaskManager<S> {
         speed_bytes_per_sec: u64,
     ) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if task.status != TaskStatus::Running {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
@@ -597,9 +664,17 @@ impl<S: TaskStore> TaskManager<S> {
         } else {
             None
         };
+        if !self.should_persist_progress(id) {
+            return Ok(task);
+        }
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        if completed_items > 0 || bytes_processed > 0 {
+            self.mark_progress_persisted(id);
+        } else {
+            self.clear_progress_throttle(id);
+        }
         self.emit("progress", &task);
         Ok(task)
     }
@@ -612,26 +687,31 @@ impl<S: TaskStore> TaskManager<S> {
         eta_seconds: Option<u64>,
     ) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if task.status != TaskStatus::Running {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
                 to: TaskStatus::Running,
             });
         }
+        let first_live_transfer = task.bytes_processed == 0 && bytes_processed > 0;
         task.bytes_processed = task.bytes_processed.max(bytes_processed);
         task.speed_bytes_per_sec = speed_bytes_per_sec;
         task.eta_seconds = eta_seconds;
+        if !first_live_transfer && !self.should_persist_progress(id) {
+            return Ok(task);
+        }
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.mark_progress_persisted(id);
         self.emit("progress", &task);
         Ok(task)
     }
 
     pub fn complete(&self, id: &str, result: Value) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if task.status != TaskStatus::Running {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
@@ -648,14 +728,15 @@ impl<S: TaskStore> TaskManager<S> {
         task.error = None;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit("completed", &task);
         Ok(task)
     }
 
     pub fn fail(&self, id: &str, failure: TaskFailure) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if !matches!(task.status, TaskStatus::Queued | TaskStatus::Running) {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
@@ -667,14 +748,15 @@ impl<S: TaskStore> TaskManager<S> {
         task.eta_seconds = None;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit("failed", &task);
         Ok(task)
     }
 
     pub fn retry(&self, id: &str) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         let retryable = task.error.as_ref().is_some_and(|failure| failure.retryable);
         if task.status != TaskStatus::Failed || !retryable {
             return Err(TaskManagerError::InvalidTransition {
@@ -693,7 +775,8 @@ impl<S: TaskStore> TaskManager<S> {
         task.result = None;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit("retried", &task);
         Ok(task)
     }
@@ -704,7 +787,7 @@ impl<S: TaskStore> TaskManager<S> {
         preview: Value,
     ) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if task.status != TaskStatus::Running {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
@@ -715,7 +798,8 @@ impl<S: TaskStore> TaskManager<S> {
         task.preview = Some(preview);
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
         self.emit("confirmation_required", &task);
         Ok(task)
     }
@@ -737,7 +821,7 @@ impl<S: TaskStore> TaskManager<S> {
         event: &str,
     ) -> Result<TaskSnapshot, TaskManagerError> {
         let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
-        let mut task = self.store.get(id)?.ok_or(TaskManagerError::NotFound)?;
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
         if !allowed.contains(&task.status) {
             return Err(TaskManagerError::InvalidTransition {
                 from: task.status,
@@ -747,9 +831,61 @@ impl<S: TaskStore> TaskManager<S> {
         task.status = target;
         task.revision += 1;
         task.updated_at = unix_timestamp();
-        self.store.update(task.clone())?;
+        self.persist_task(&task)?;
         self.emit(event, &task);
         Ok(task)
+    }
+
+    fn load_task(&self, id: &str) -> Result<Option<TaskSnapshot>, TaskManagerError> {
+        if let Some(task) = self
+            .snapshots
+            .lock()
+            .expect("task snapshot cache lock poisoned")
+            .get(id)
+            .cloned()
+        {
+            return Ok(Some(task));
+        }
+        let task = self.store.get(id)?;
+        if let Some(task) = task.as_ref() {
+            self.cache_task(task);
+        }
+        Ok(task)
+    }
+
+    fn persist_task(&self, task: &TaskSnapshot) -> Result<(), TaskManagerError> {
+        self.store.update(task.clone())?;
+        self.cache_task(task);
+        Ok(())
+    }
+
+    fn cache_task(&self, task: &TaskSnapshot) {
+        self.snapshots
+            .lock()
+            .expect("task snapshot cache lock poisoned")
+            .insert(task.id.clone(), task.clone());
+    }
+
+    fn should_persist_progress(&self, id: &str) -> bool {
+        self.progress_persisted_at
+            .lock()
+            .expect("task progress throttle lock poisoned")
+            .get(id)
+            .is_none_or(|last| last.elapsed() >= TASK_PROGRESS_PERSIST_INTERVAL)
+    }
+
+    fn mark_progress_persisted(&self, id: &str) {
+        self.progress_persisted_at
+            .lock()
+            .expect("task progress throttle lock poisoned")
+            .insert(id.to_string(), Instant::now());
+    }
+
+    fn clear_progress_throttle(&self, id: &str) {
+        self.progress_persisted_at
+            .lock()
+            .expect("task progress throttle lock poisoned")
+            .remove(id);
     }
 
     fn emit(&self, event: &str, task: &TaskSnapshot) {
@@ -782,6 +918,7 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
     use std::time::Duration;
 
@@ -801,8 +938,51 @@ mod tests {
             Err(TaskStoreError::new("injected update failure"))
         }
 
+        fn delete(&self, _id: &str) -> Result<bool, TaskStoreError> {
+            Err(TaskStoreError::new("injected delete failure"))
+        }
+
         fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError> {
             Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingTaskStore {
+        inner: MemoryTaskStore,
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingTaskStore {
+        fn reset_get_calls(&self) {
+            self.get_calls.store(0, Ordering::SeqCst);
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl TaskStore for CountingTaskStore {
+        fn insert(&self, task: TaskSnapshot) -> Result<(), TaskStoreError> {
+            self.inner.insert(task)
+        }
+
+        fn get(&self, id: &str) -> Result<Option<TaskSnapshot>, TaskStoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(id)
+        }
+
+        fn update(&self, task: TaskSnapshot) -> Result<(), TaskStoreError> {
+            self.inner.update(task)
+        }
+
+        fn delete(&self, id: &str) -> Result<bool, TaskStoreError> {
+            self.inner.delete(id)
+        }
+
+        fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError> {
+            self.inner.list()
         }
     }
 
@@ -879,6 +1059,10 @@ mod tests {
             }
             drop(control);
             self.inner.update(task)
+        }
+
+        fn delete(&self, id: &str) -> Result<bool, TaskStoreError> {
+            self.inner.delete(id)
         }
 
         fn list(&self) -> Result<Vec<TaskSnapshot>, TaskStoreError> {
@@ -1044,6 +1228,42 @@ mod tests {
     }
 
     #[test]
+    fn stream_progress_uses_the_cached_task_snapshot_between_persist_intervals() {
+        let store = CountingTaskStore::default();
+        let manager = TaskManager::new(store.clone());
+        let task = manager.create("download", serde_json::json!({})).unwrap();
+        manager.start(&task.id).unwrap();
+        store.reset_get_calls();
+
+        manager
+            .stream_progress(&task.id, 128, 128, Some(10))
+            .unwrap();
+        manager
+            .stream_progress(&task.id, 256, 256, Some(5))
+            .unwrap();
+
+        assert_eq!(store.get_calls(), 0);
+    }
+
+    #[test]
+    fn rapid_progress_updates_do_not_flood_task_events() {
+        let manager = TaskManager::new(MemoryTaskStore::default());
+        let mut events = manager.subscribe();
+        let task = manager
+            .create("index_library", serde_json::json!({}))
+            .unwrap();
+        manager.start(&task.id).unwrap();
+        while events.try_recv().is_ok() {}
+
+        manager.progress(&task.id, 1, 100, 0, 0).unwrap();
+        let first_progress = events.try_recv().expect("first progress event");
+        manager.progress(&task.id, 2, 100, 0, 0).unwrap();
+
+        assert_eq!(first_progress.task.completed_items, 1);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
     fn completion_persists_a_terminal_result() {
         let manager = TaskManager::new(MemoryTaskStore::default());
         let task = manager.create("index", serde_json::json!({})).unwrap();
@@ -1116,12 +1336,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_pauses_downloads_and_fails_other_interrupted_tasks() {
+    fn restart_pauses_downloads_and_training_but_fails_other_interrupted_tasks() {
         let store = MemoryTaskStore::default();
         let manager = TaskManager::new(store.clone());
         let download = manager.create("download", serde_json::json!({})).unwrap();
+        let training = manager.create("training", serde_json::json!({})).unwrap();
         let resize = manager.create("resize", serde_json::json!({})).unwrap();
         manager.start(&download.id).unwrap();
+        manager.start(&training.id).unwrap();
         manager.start(&resize.id).unwrap();
 
         let restarted = TaskManager::new(store);
@@ -1129,6 +1351,10 @@ mod tests {
 
         assert_eq!(
             restarted.get(&download.id).unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            restarted.get(&training.id).unwrap().unwrap().status,
             TaskStatus::Paused
         );
         let failed_resize = restarted.get(&resize.id).unwrap().unwrap();

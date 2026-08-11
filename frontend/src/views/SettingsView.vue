@@ -7,6 +7,7 @@ import {
   deleteMediaRoot,
   deleteSecret,
   getMediaRoots,
+  loadVllmModel,
   saveSecret,
   updateMediaRoot,
   type MediaRoot,
@@ -32,6 +33,7 @@ const danbooruSecret = ref('')
 const vllmSecret = ref('')
 const allowedHosts = ref('')
 const credentialSaving = ref<SecretKind | null>(null)
+const vllmLoading = ref(false)
 
 const vllmPromptPresets = {
   danbooru: 'You are a Danbooru image tagging assistant. Return concise, canonical Danbooru tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas, replace spaces inside tags with underscores, and do not include prose or explanations.',
@@ -54,10 +56,10 @@ async function load(): Promise<void> {
   managedRootId.value = roots.value[0]?.id ?? ''
 }
 
-async function saveSettings(): Promise<void> {
+async function saveSettings(): Promise<boolean> {
   if (/[\\/]/.test(config.config.filename_template)) {
     toast.warning('文件名模板不能包含路径分隔符')
-    return
+    return false
   }
   saving.value = true
   try {
@@ -72,10 +74,26 @@ async function saveSettings(): Promise<void> {
     config.config.vllm_allowed_hosts = allowedHosts.value.split(/[,\n]/).map((host) => host.trim()).filter(Boolean)
     await config.save()
     toast.success('设置已保存')
+    return true
   } catch (reason: unknown) {
     toast.error('无法保存设置', reason instanceof Error ? reason.message : '未知错误')
+    return false
   } finally {
     saving.value = false
+  }
+}
+
+async function requestVllmModelLoad(): Promise<void> {
+  if (!(await saveSettings())) return
+  vllmLoading.value = true
+  try {
+    const result = await loadVllmModel()
+    toast.success(result.message)
+    await health.check()
+  } catch (reason: unknown) {
+    toast.error('无法加载 vLLM 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    vllmLoading.value = false
   }
 }
 
@@ -307,6 +325,7 @@ onMounted(() => {
             <div class="credential-row">
               <Server :size="20" :class="health.vllmStatus === 'online' ? 'configured' : 'not-configured'" />
               <span><strong>{{ health.vllmStatus === 'online' ? 'vLLM 正常' : health.vllmStatus === 'offline' ? 'vLLM 离线' : '正在检查 vLLM' }}</strong><small>{{ health.vllmMessage }}</small></span>
+              <button type="button" class="button button-small" :disabled="vllmLoading || health.vllmStatus === 'online'" @click="requestVllmModelLoad">{{ vllmLoading ? '正在请求加载' : health.vllmStatus === 'online' ? '模型已加载' : '加载 vLLM 模型' }}</button>
             </div>
           </div>
         </section>

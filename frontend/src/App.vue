@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted } from 'vue'
-import { Images, ListTodo, Search, Settings, Wrench } from '@lucide/vue'
+import { GraduationCap, Images, ListTodo, Search, Settings, Wrench } from '@lucide/vue'
 import ToastContainer from './components/ToastContainer.vue'
 import { useConfigStore } from './stores/config'
 import { useHealthStore } from './stores/health'
@@ -15,6 +15,7 @@ const navItems = [
   { to: '/tasks', label: '任务', icon: ListTodo },
   { to: '/library', label: '图库', icon: Images },
   { to: '/tools', label: '工具', icon: Wrench },
+  { to: '/training', label: '训练', icon: GraduationCap },
   { to: '/settings', label: '设置', icon: Settings },
 ]
 

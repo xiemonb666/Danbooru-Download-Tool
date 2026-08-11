@@ -1,75 +1,67 @@
 # DanbooruDownload Tool Pro
 
-本项目是一个仅限本机运行的 Danbooru 只读探索、批量下载与本地媒体管理工具。当前代码只有 Rust/Axum 后端与 Vue 3 前端；仓库中不存在旧版 Python/Gradio 实现。
+一个只在本机运行的 Danbooru 素材工作台：从检索与下载，到图库管理、标签处理、训练数据集增广、vLLM 二次打标和 LoRA 训练，都在同一个 Rust + Vue 应用中完成。
 
-## 主要功能
+当前实现是 Rust/Axum 后端与 Vue 3 前端。仓库不包含旧版 Python/Gradio 应用；Python 只作为受 Rust 调度的训练和动漫检测运行时使用。
 
-- `/explore`：使用 Danbooru 原生查询语法搜索、自动补全、数字页或 `a<ID>/b<ID>` 游标分页、帖子详情与媒体预览。
-- `/tasks`：持久任务队列、实时 SSE 状态、暂停/恢复/取消/重试，以及可分页的下载记录和“再次下载”。
-- `/library`：显式注册媒体根后再索引；游标分页、标签搜索、缩略图、原文件/视频 Range 访问。
-- `/tools`：精确 SHA-256 去重、近似图片确认隔离、完整性检查、按精确标签隔离、安全 Resize、HEIC→JPEG、标签规范化与本地 vLLM 图片打标。
-- `/settings`：Windows/Linux 路径映射、系统凭据、代理、下载并发、命名模板、Ugoira 策略及完整 vLLM 执行设置。
+## 能做什么
 
-Questionable、Explicit 和未知分级默认模糊，必须主动揭示；视频不会自动播放。Ugoira 可保存 WebM 与原始 ZIP，SWF 不下载也不执行。
+- **探索**：使用 Danbooru 原生查询语法搜索、标签自动补全、游标分页、帖子详情和受控媒体预览。
+- **下载与任务**：可暂停、恢复、取消和重试的持久任务队列；通过 SSE 实时显示进度、失败项和下载记录。
+- **图库**：先显式注册媒体根，再索引、预览和按标签搜索本地媒体；可按文件夹浏览，根目录图片不会再和子目录图片混在一起。
+- **工具**：完整性检查、精确去重、相似图片检查、隔离式删除、安全缩放、HEIC 转换、标签流水线与本地 vLLM 图片打标。
+- **数据集增广**：原图保护、family 防泄漏切分、GPU 动漫检测/分割/智能裁剪、无损派生图、重新打标门控和训练子集清单。
+- **训练**：受支持的 kohya_ss 训练入口、运行时诊断、GPU 独占队列、实时日志/指标/样图；可把原图和每种已重新打标的派生数据作为独立子集，并分别设置 repeat。
+- **设置**：媒体根的 Windows/WSL 映射、Danbooru/vLLM 凭据、代理、下载命名、vLLM 服务和训练运行时配置。
 
-## 安全边界
+Questionable、Explicit 和未知分级默认模糊，必须主动揭示；视频不会自动播放。Ugoira 可保存为 WebM 和原始 ZIP；SWF 不会下载或执行。
 
-- 服务默认且只允许监听 loopback；`HOST=0.0.0.0` 会被拒绝。
-- 生产模式不开放 CORS；开发模式只允许 `127.0.0.1:5173` 与 `localhost:5173`。
-- API 不接受任意绝对媒体路径，只接受已注册的根目录 ID、媒体 ID 和受校验的相对路径。
-- Danbooru/vLLM 密钥优先写入 Windows Credential Manager 或 Linux Secret Service，配置响应只返回 `*_api_key_configured`，永不回显密钥。
-- 系统凭据库不可用时只允许会话密钥，不会退化为明文持久化。
-- vLLM 默认只允许 loopback；额外 HTTPS 地址必须在设置中显式允许。任务请求不能覆盖 vLLM 地址或密钥。
-- 删除、去重和原地处理先生成预检清单，确认后移入媒体根内的 `.danbooru-quarantine`，不会直接永久删除原文件。
+## 本地安全边界
 
-本工具不实现上传、改标签、投票、收藏、评论或权限绕过。它仍是本地应用，不应通过反向代理或端口转发暴露到局域网/互联网。
+- 服务只监听 `127.0.0.1`；设置 `HOST=0.0.0.0` 会被拒绝。
+- 生产模式不开放 CORS；开发模式只允许 Vite 本地来源。
+- API 只接受已注册媒体根、媒体 ID 和受校验的相对路径，不提供任意绝对路径读写。
+- Danbooru 与 vLLM 密钥优先保存在 Windows Credential Manager 或 Linux Secret Service；配置接口不会回显密钥。系统凭据库不可用时只允许会话密钥。
+- 删除、去重和原地处理先生成预检清单，确认后移入媒体根内的 `.danbooru-quarantine`，而非直接永久删除。
+- 动漫检测 Python worker 只接收 Rust 验证过的图片清单并返回 JSONL；它不拥有媒体目录写权限。
+- vLLM 默认仅允许 loopback 地址；额外 HTTPS 地址必须在设置中显式允许。
+
+这是本地桌面应用，不应通过反向代理、端口转发或公网暴露。
 
 ## 技术栈
 
-- 后端：Rust 2021、Axum 0.8、Tokio、reqwest、rusqlite/SQLite、`image`、Rayon。
+- 后端：Rust 2021、Axum 0.8、Tokio、SQLite、reqwest、`image`、Rayon、utoipa。
 - 前端：Vue 3、TypeScript、Pinia、Vue Router、Tailwind CSS 4、Vite 8。
+- 训练：随应用管理的 kohya_ss v26.0.0 运行时，以及可发现的 Windows、WSL、Conda 和 Python venv 运行时。
+- 动漫裁剪：`dghs-imgutils[gpu]==0.19.0`、`rtmlib==0.0.16`、ONNX Runtime CUDA 与 PyTorch CUDA。
 - 测试：Rust 单元/集成测试、Vitest + Vue Testing Library、Playwright + axe。
 
-## 快速启动
+## 启动
 
-需要 Rust 工具链、Node.js 20.19+ 或 22.12+，以及 npm。默认的一键启动还会尝试启动 vLLM：Linux 需要可用的 conda `vllm` 环境，Windows 需要 WSL2 内的 root 用户拥有该环境。
-HEIC 转换另需在 `PATH` 中提供 `heif-convert`；工具缺失时任务会安全失败并保留/恢复原图。
+需要：Rust 工具链、Node.js **20.19+ 或 22.12+**、npm。首次启动会安装前端依赖、构建前端和 release 后端。
 
-Linux 一键启动：
+Windows：双击 `run.bat`，或在 PowerShell 中运行：
+
+```powershell
+.\run.bat
+```
+
+Linux / WSL：
 
 ```bash
 chmod +x run.sh
 ./run.sh
 ```
 
-Windows 可直接双击 `run.bat`，或在 PowerShell 中运行：
+启动完成后访问 <http://127.0.0.1:8888>。启动脚本从自身位置定位项目，默认不会加载 vLLM 或动漫检测模型，因此不会因为打开应用而占用 GPU 显存。
 
-```powershell
-.\run.bat
-```
-
-两个脚本都会从自身所在目录定位项目，Linux 在后台启动 `start_vllm.sh`，Windows 则通过 WSL2 打开独立可见窗口展示下载和加载进度。随后脚本检查 Node.js/npm/Rust、按锁文件安装前端依赖、构建生产前端与 release 后端，然后直接运行已构建的二进制。vLLM 模型加载与应用构建并行执行，侧栏状态会在模型可用后自动变绿。启动器会验证真实的 `/v1/models` 接口；默认 `8000` 被其他程序占用时会自动选择后续空闲端口，并把同一地址传给后端。已有模型不会重复启动，也不会杀掉占用端口的进程。依赖锁文件未变化时会跳过重复的 `npm ci`。
-
-首次运行可能需要下载约 22GB 的模型权重；权重下载与 GPU 初始化完成前，接口会暂时显示离线。vLLM 启动失败不会阻止下载与图库功能，错误可在项目的 `logs/` 目录查看。如需只启动主应用，可显式关闭自动启动：
-
-```bash
-START_VLLM=0 ./run.sh
-```
-
-```powershell
-$env:START_VLLM = '0'
-.\run.bat
-```
-
-启动后访问 <http://127.0.0.1:8888>。首次构建耗时较长，后续启动会复用 npm 依赖与 Cargo 增量缓存。调试构建对应 `dev.sh` / `dev.bat`。
-
-调试构建：
+调试启动：
 
 ```bash
 ./dev.sh
 ```
 
-需要 Vite 热更新时开两个终端：
+需要 Vite 热更新时，分别运行：
 
 ```bash
 cd backend
@@ -78,61 +70,127 @@ DEV_CORS=1 cargo run
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Vite 地址为 <http://127.0.0.1:5173>，`/api` 会代理到 `127.0.0.1:8888`。
+Vite 服务位于 <http://127.0.0.1:5173>，`/api` 会代理至后端。
 
-### 运行路径
+### 常用运行环境变量
 
-后端不依赖当前工作目录，可通过环境变量覆盖：
-
-| 变量 | 默认值 | 约束 |
+| 变量 | 默认值 | 说明 |
 |---|---|---|
-| `HOST` | `127.0.0.1` | 必须是 loopback IP |
-| `PORT` | `8888` | `1..=65535` |
-| `DATA_DIR` | 项目根目录 | 必须是绝对路径 |
-| `STATIC_DIR` | `frontend/dist` | 必须是绝对路径 |
-| `DEV_CORS` | 未启用 | 仅值 `1` 时允许 Vite 来源 |
-| `APP_ISOLATED_MODE` | 未启用 | 仅测试使用；值 `1` 时跳过旧数据迁移并只使用会话密钥 |
-| `START_VLLM` | `1` | `1` 自动后台启动，`0` 跳过 |
-| `VLLM_PORT` | `8000` | vLLM 本地端口 |
-| `VLLM_HOST` | `127.0.0.1` | 默认仅 loopback |
-| `MODEL_PATH` | `unsloth/Qwen3.6-27B-NVFP4` | 模型路径或模型 ID |
-| `VLLM_CONDA_ENV` | `vllm` | conda 环境名 |
-| `CONDA_SH` | 自动查找 | 可显式指定 `conda.sh` 路径 |
-| `VLLM_TMPDIR` | `/tmp` | vLLM/ZeroMQ 的 WSL 临时目录，不能放在 `/mnt/c` |
+| `HOST` | `127.0.0.1` | 必须为 loopback IP。 |
+| `PORT` | `8888` | 主服务端口。 |
+| `DATA_DIR` | 项目根目录 | 配置、数据库、训练运行记录的绝对目录。 |
+| `STATIC_DIR` | `frontend/dist` | 前端构建产物的绝对目录。 |
+| `DEV_CORS` | 未启用 | 仅 `1` 时允许本地 Vite 来源。 |
+| `START_VLLM` | `0` | 设为 `1` 才会随启动器尝试后台启动 vLLM。 |
+| `VLLM_HOST` / `VLLM_PORT` | `127.0.0.1` / `8000` | 本地 vLLM 地址。 |
+| `MODEL_PATH` | `unsloth/Qwen3.6-27B-NVFP4` | vLLM 模型路径或模型 ID。 |
+| `VLLM_CONDA_ENV` | `vllm` | vLLM conda 环境名。 |
 
-`APP_ISOLATED_MODE=1` 由真实后端 E2E runner 使用，以确保测试不会读取或修改用户的旧 SQLite、配置或系统凭据；日常启动不要设置该变量。
+HEIC 转换另需将 `heif-convert` 放入 `PATH`。缺失时该任务会失败并保留原文件。
 
-## 配置与数据
+## 首次配置
 
-新设置保存在 `DATA_DIR/app_settings.json`，SQLite 位于 `DATA_DIR/danbooru_tool.db`。密钥不写入设置文件。
+1. 打开“设置”，配置 Danbooru 账号/API Key（如需下载）、代理和下载命名规则。
+2. 在“图库”或“设置”注册素材根目录。根目录需要显式确认；应用不会自动扫描、移动或删除你的任意磁盘目录。
+3. Windows 与 WSL 同时使用时，为同一媒体根填写两侧映射，例如：
 
-首次启动以事务方式把 SQLite 升级到 schema v2，并迁移合法的非敏感旧设置；旧相对下载路径会解析为绝对路径建议，只有用户在设置页确认后才可注册，不会自动扫描、移动或删除旧媒体目录。旧 `config.json` / `vllm_config.json` 中的密钥只有在系统凭据库写入并回读成功后才会被清空。
+   ```json
+   {
+     "name": "训练素材",
+     "windows_path": "C:\\datasets\\anime",
+     "linux_path": "/mnt/c/datasets/anime"
+   }
+   ```
 
-媒体根同时保存 Windows 与 Linux/WSL 映射：
+4. 通过任务或图库操作刷新索引。图库会保存受控媒体记录；增广输出也会自动注册，可直接按输出文件夹预览。
 
-```json
-{
-  "name": "训练素材",
-  "windows_path": "C:\\Media\\Danbooru",
-  "linux_path": "/mnt/c/Media/Danbooru"
-}
+设置写入 `DATA_DIR/app_settings.json`，SQLite 数据库位于 `DATA_DIR/danbooru_tool.db`。密钥不写入设置文件。
+
+## 数据集增广与智能裁剪
+
+入口为“工具 → 数据集增广”。该任务在所选媒体根内创建唯一任务文件夹，**绝不覆盖输入图片或输入标签**。默认分辨率门槛为 1.8 MP、长边 1536、短边 768；只处理 PNG、JPEG、WebP 和 BMP 静态图片。
+
+### 输出与训练门控
+
+每个任务大致生成如下结构：
+
+```text
+dataset-expanded/<task-id>/
+├── raw/
+│   ├── images/                 # 保留原格式的原图副本
+│   └── labels/                 # 原图 Caption
+├── derived/
+│   ├── horizontal_flip/images/
+│   ├── portrait/images/
+│   ├── upper_body/images/
+│   └── full_body_tight/images/
+├── ready/
+│   ├── train/ validation/ test/
+│   └── .../<variant>/images/   # 仅可安全训练的派生子集
+├── metadata/
+│   ├── dataset.jsonl
+│   ├── families.jsonl
+│   ├── retagging.jsonl
+│   └── training-subsets.json
+├── splits/
+├── rejected/rejections.jsonl
+└── READY.json
 ```
 
-注册根目录本身、UNC/设备路径、越界符号链接、Windows 重解析点和保留设备名都会被拒绝。
+任务创建时先写入 `INCOMPLETE.json`；只有正常完成才生成 `READY.json`。训练页面会拒绝不完整输出。
+
+- 原图保留原文件和原 Caption，可直接进入 `ready`。
+- 翻转、肖像、上半身与紧凑全身等派生图统一以**无损 PNG**保存，避免二次 JPEG 压缩丢失细节。
+- 派生图不会复制原 Caption，因为构图变化后原标签可能已不匹配。它们会被标记为 `requires_retagging=true`，记录到 `metadata/retagging.jsonl`，且不会进入 `ready`。
+- 可在创建任务时选择“发送派生图到 vLLM 二次打标”。仅 vLLM 真正写入非空新 Caption 的派生图才会进入相应 `ready/<split>/<variant>/images` 子集；失败项保持待打标，不会回退使用原标签。
+- 可选择将原图的 artist / character 标签放在 vLLM 新标签最前，保持逗号分隔并去重。
+- `metadata/dataset.jsonl` 记录原生尺寸、推荐 bucket、切分、来源、family 与重打标状态。bucket 仅作为训练建议，任务不缩放图片来匹配 bucket，更不会非等比拉伸。
+- 通过稳定的 `family_id` 分配 train / validation / test。同源原图、翻转和裁剪始终位于同一 split，不会发生 family 泄漏。
+
+### GPU 动漫检测、分割与裁剪
+
+智能裁剪默认开启，默认运行时为 `conda:lora`、GPU `0`、质量档 `anime-quality`。首次使用在任务配置中点击“安装并预热检测模型”，随后使用“检查运行时”确认环境。
+
+安装器会在所选 Python 环境中安装并锁定 `dghs-imgutils[gpu]==0.19.0` 与 `rtmlib==0.0.16`，然后预热模型。健康检查会验证 Python、CUDA provider、物理 GPU、实际 ONNX CUDA session、模型下载和一次推理；不满足条件时裁剪任务会在写入工作区前失败，**不会静默退回 CPU**。
+
+裁剪证据来自：
+
+- DeepGHS 高精度动漫头部模型 `head_detect_v2.0_x_yv11`；
+- 动漫人物、人脸、半身和手部检测；
+- 单主体可信时使用 ISNet 动漫前景分割作为保护边界；
+- HumanArt 人物检测与 RTMPose，检查躯干、脚踝和人物边缘截断。
+
+Rust 端会关联同一主体的检测结果，最多尝试肖像、上半身、紧凑全身三种构图。候选必须满足原生分辨率、构图比例与明显裁剪幅度，并完整保留高置信脸、头部、手部及相应的完整身体关键点。多人严重重叠、第二人明显进入候选框、主体太小、关键部位可能被切断、姿态不完整或候选接近原图时，系统宁可拒绝，原因会写入 `rejected/rejections.jsonl`。
+
+智能裁剪与 LoRA 训练使用同一 GPU 独占队列。检测预检发现显存不足或有外部进程占用时会提示释放显存；应用不会终止外部 vLLM 或其他进程。
+
+### 推荐的正式 LoRA 工作流
+
+1. 注册并索引原始数据集；先在图库检查分辨率、损坏图片和重复图。
+2. 在“工具 → 数据集增广”选择源目录，保留默认严格门槛，按需要启用翻转和三种裁剪。
+3. 需要派生图时，启用 vLLM 二次打标；想保留身份信息时勾选 artist / character 前置。
+4. 在任务结果中查看 `retagging_pending` 和 `training-subsets.json`。未重新打标的派生图应继续保留在待处理状态，不能作为训练输入。
+5. 在“训练 → 从图库引用”中选择 `ready/train/images` 与需要的 `ready/train/<variant>/images`。每个目录作为独立子集，分别设置 repeat 与 Caption 扩展名；应用会生成多 `[[datasets.subsets]]` 的训练配置，不复制这些文件。
+6. 选择底模、运行时与 GPU，先运行诊断；训练进入 GPU 独占队列后，在训练监控页查看日志、指标、样图与产物。
+
+## vLLM 图片打标
+
+vLLM 是可选功能。可以在“设置 → 本地服务”按需加载，也可设置 `START_VLLM=1` 交给启动器尝试后台加载。默认端点为 `http://127.0.0.1:8000/v1`。
+
+常规图库打标可由设置决定语言、系统提示词、最大标签数、并发、Danbooru 校验以及覆盖/追加写入模式。数据集增广的二次打标始终以覆盖方式写入全新派生 Caption，不引用原 Caption，避免把裁剪前的描述带入新样本。
 
 ## API 概览
 
-成功体：
+成功响应：
 
 ```json
 { "data": {}, "meta": {} }
 ```
 
-错误体：
+错误响应：
 
 ```json
 {
@@ -146,50 +204,53 @@ Vite 地址为 <http://127.0.0.1:5173>，`/api` 会代理到 `127.0.0.1:8888`。
 }
 ```
 
-主要接口：
+常用端点包括：
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/health` | 服务与数据库健康状态 |
-| GET | `/api/vllm/health` | vLLM 与模型健康状态 |
-| GET/PUT | `/api/config` | 读取/保存非敏感设置 |
-| PUT/DELETE | `/api/secrets/{danbooru\|vllm}` | 保存/删除系统凭据 |
-| GET/POST | `/api/library/roots` | 列出/注册媒体根 |
-| PUT | `/api/library/roots/{id}` | 更新媒体根映射 |
-| GET | `/api/library/items` | 本地图库游标分页 |
-| GET | `/api/library/items/{id}` | 独立获取本地媒体详情 |
-| GET | `/api/library/media/{id}/{thumbnail\|file}` | 缩略图或支持 Range 的原媒体 |
-| GET/DELETE | `/api/library/quarantine` | 查看/清空隔离区 |
-| POST | `/api/library/quarantine/{id}/restore` | 恢复隔离文件 |
-| GET/POST | `/api/tasks` | 任务快照/创建任务 |
-| GET | `/api/tasks/{id}` | 任务详情、失败项目与游标分页 |
-| GET | `/api/tasks/events` | 全局 SSE 任务流 |
-| POST | `/api/tasks/{id}/{pause\|resume\|cancel\|retry\|confirm}` | 任务动作 |
-| GET | `/api/downloads/history` | 下载记录游标分页 |
-| GET | `/api/danbooru/posts` | 原生查询与分页 |
-| GET | `/api/danbooru/posts/{id}` | 帖子详情 |
-| GET | `/api/danbooru/posts/{id}/media/{variant}` | 可信媒体代理 |
-| GET | `/api/danbooru/autocomplete` | 标签自动补全 |
-| GET | `/api/danbooru/count` | 查询数量估算 |
+| GET | `/api/health` | 应用与数据库健康状态。 |
+| GET | `/api/vllm/health` | vLLM 模型服务状态。 |
+| GET/POST | `/api/library/roots` | 列出或注册媒体根。 |
+| GET | `/api/library/roots/{id}/directories` | 获取媒体根下可选目录。 |
+| GET | `/api/library/items` | 分页读取图库，支持目录与标签过滤。 |
+| GET/POST | `/api/tasks` | 创建任务与读取任务快照。 |
+| GET | `/api/tasks/events` | 全局 SSE 任务流。 |
+| POST | `/api/tasks/{id}/{pause|resume|cancel|retry|confirm}` | 控制任务。 |
+| GET | `/api/vision-crop/runtime-profiles/{id}/health` | 检查动漫裁剪 CUDA/模型运行时。 |
+| POST | `/api/vision-crop/runtime-profiles/{id}/install` | 安装并预热动漫检测、分割和姿态模型。 |
+| GET | `/api/training/gpus` | 读取可训练 GPU 与进程状态。 |
+| GET/POST | `/api/training/*` | 训练适配器、运行时、预设、数据集预检和训练任务。 |
 
-下载任务示例：
+完整的 OpenAPI 契约由 Rust 导出到 `frontend/openapi.json`，并生成 `frontend/src/api/generated.ts`。
 
-```json
-{
-  "type": "download",
-  "root_id": "registered-root-id",
-  "source": { "type": "query", "query": "1girl rating:g order:score" },
-  "limit": 100,
-  "concurrency": 8,
-  "filename_template": "{id}_score_{score}.{ext}",
-  "skip_existing": true,
-  "media_policy": { "original": true, "ugoira": "webm_and_zip" }
-}
+## 项目结构
+
+```text
+backend/src/
+├── routes/api.rs                 # REST、SSE、任务执行与训练/裁剪调度
+├── services/
+│   ├── danbooru_client.rs
+│   ├── dataset_augmentation.rs   # family、派生图、训练门控与 metadata
+│   ├── image_processor.rs
+│   └── vllm.rs
+├── training.rs                   # 训练适配器、运行时与 dataset TOML
+├── database.rs
+├── media_root.rs
+└── tasks.rs
+
+frontend/src/
+├── views/                        # Explore、Tasks、Library、Tools、Training、Settings
+├── api/                          # Axios 封装与生成的 OpenAPI 类型
+├── stores/
+└── components/
+
+training_runtime/anime_crop_worker.py
+                                # CUDA 动漫检测、分割、RTMPose JSONL worker
 ```
 
-`limit` 表示成功新增数；已存在内容会被跳过并继续翻页补足，范围为 `1..=10000`。下载采用有界并发、`.part`、Range 续传、长度/MD5 校验与原子重命名。
-
 ## 验证命令
+
+前端：
 
 ```bash
 cd frontend
@@ -199,48 +260,15 @@ npm run typecheck
 npm run build
 npm run test:e2e
 npm run test:e2e:real
-npm audit --audit-level=high
 ```
+
+后端：
 
 ```bash
 cd backend
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked -- --test-threads=1
-cargo audit
 ```
 
-`npm run api:generate` 会先从 Rust 导出 `frontend/openapi.json`，再生成 `frontend/src/api/generated.ts`；`typecheck` 会拒绝过期契约。常规测试使用本地 mock，`test:e2e:real` 则启动正式 Rust 二进制与真实临时 SQLite，验证 SPA fallback、健康检查、索引、图库 Range 和下载记录，但不会访问 Danbooru/vLLM。
-
-## 项目结构
-
-```text
-backend/src/
-├── app_paths.rs
-├── config.rs
-├── database.rs
-├── media_root.rs
-├── routes/api.rs
-├── secrets.rs
-├── services/
-│   ├── danbooru_client.rs
-│   ├── image_processor.rs
-│   └── vllm.rs
-└── tasks.rs
-
-frontend/src/
-├── api/
-├── components/
-├── stores/
-├── utils/
-└── views/
-    ├── ExploreView.vue
-    ├── TasksView.vue
-    ├── LibraryView.vue
-    ├── ToolsView.vue
-    └── SettingsView.vue
-```
-
-## License
-
-MIT
+`test:e2e:real` 会启动正式 Rust 二进制和临时 SQLite，以验证 SPA fallback、健康检查、图库 Range、索引和下载记录；它不会访问 Danbooru 或 vLLM。GPU 动漫裁剪须在实际 `conda:lora` 与目标显卡环境中，通过界面的安装/预热与运行时检查验收。

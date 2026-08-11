@@ -73,12 +73,12 @@ describe('production one-click launchers', () => {
     }
   })
 
-  it('starts the bundled vLLM launcher in the background unless explicitly disabled', () => {
-    expect(linuxLauncher).toContain('START_VLLM="${START_VLLM:-1}"')
+  it('keeps the bundled vLLM launcher disabled until the user explicitly loads a model', () => {
+    expect(linuxLauncher).toContain('START_VLLM="${START_VLLM:-0}"')
     expect(linuxLauncher).toContain('"$ROOT_DIR/start_vllm.sh"')
     expect(linuxLauncher).toContain('VLLM_PID_FILE')
 
-    expect(windowsLauncher).toContain('if not defined START_VLLM set "START_VLLM=1"')
+    expect(windowsLauncher).toContain('if not defined START_VLLM set "START_VLLM=0"')
     expect(windowsLauncher).toContain('start "Danbooru Tool vLLM"')
     expect(windowsLauncher).toContain('start_vllm.bat')
   })

@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Bot, ChevronLeft, ChevronRight, Eye, FileImage, FolderPlus, Images, Play, RefreshCw, Search, Tags, X } from '@lucide/vue'
-import { createTask, getLibrary, getLibraryItem, getMediaRoots, libraryMediaUrl, type CreateTaskRequest, type LibraryPage, type LocalMedia, type MediaRoot } from '../api'
+import { Bot, ChevronLeft, ChevronRight, Eye, FileImage, FolderPlus, Images, Play, RefreshCw, Search, Tags, Trash2, X } from '@lucide/vue'
+import { createTask, getLibrary, getLibraryItem, getMediaDirectories, getMediaRoots, libraryMediaUrl, type CreateTaskRequest, type LibraryPage, type LocalMedia, type MediaRoot } from '../api'
 import { useConfigStore } from '../stores/config'
 import { useTasksStore } from '../stores/tasks'
 import { useToastStore } from '../stores/toast'
 import { requiresContentReveal } from '../utils/contentRating'
+import { scrollToPageTop } from '../utils/pageScroll'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,10 +16,15 @@ const tasks = useTasksStore()
 const toast = useToastStore()
 const roots = ref<MediaRoot[]>([])
 const activeRootId = ref('')
+const folderDirectories = ref<string[]>([])
+const activeDirectory = ref('')
 const queryInput = ref('')
+const loadedQuery = ref('')
 const page = ref<LibraryPage | null>(null)
-const cursor = ref<string | undefined>()
-const cursorHistory = ref<Array<string | undefined>>([])
+const currentPage = ref(1)
+const jumpPageInput = ref('1')
+const scoreRangeInput = ref('')
+const resolutionRangeInput = ref('')
 const loading = ref(false)
 const error = ref<string | null>(null)
 const detail = ref<LocalMedia | null>(null)
@@ -27,23 +33,37 @@ const detailPanel = ref<HTMLElement | null>(null)
 const indexing = ref(false)
 const selected = ref<Set<string>>(new Set())
 const selectedMedia = ref<Map<string, LocalMedia>>(new Map())
+const allMatchingSelected = ref(false)
+const allMatchingTotal = ref(0)
+const selectedQuery = ref('')
+const selectedScoreMin = ref<number | undefined>()
+const selectedScoreMax = ref<number | undefined>()
+const selectedResolutionMin = ref<number | undefined>()
+const selectedResolutionMax = ref<number | undefined>()
+const excludedMediaIds = ref<Set<string>>(new Set())
 const revealedMedia = ref<Set<string>>(new Set())
 const fullSizePreviews = ref<Set<string>>(new Set())
 const creatingBatchTask = ref(false)
 const resizeMaxSize = ref(1216)
+const originalPreviewOpen = ref(false)
+const originalPreviewPanel = ref<HTMLElement | null>(null)
 let controller: AbortController | null = null
 let detailController: AbortController | null = null
 let detailOpener: HTMLElement | null = null
+let originalPreviewOpener: HTMLElement | null = null
 
 const activeRoot = computed(() => roots.value.find((root) => root.id === activeRootId.value) ?? null)
-const selectedCount = computed(() => selected.value.size)
-const currentPageIds = computed(() => page.value?.items.map((media) => media.id) ?? [])
-const allCurrentPageSelected = computed(() => currentPageIds.value.length > 0 && currentPageIds.value.every((id) => selected.value.has(id)))
-const someCurrentPageSelected = computed(() => currentPageIds.value.some((id) => selected.value.has(id)) && !allCurrentPageSelected.value)
-const heicSelectionEligible = computed(() => selected.value.size > 0
+const totalPages = computed(() => page.value?.total_pages ?? 0)
+const scoreRanges = computed(() => page.value?.score_ranges ?? [])
+const resolutionRanges = computed(() => page.value?.resolution_ranges ?? [])
+const selectedCount = computed(() => allMatchingSelected.value
+  ? Math.max(0, allMatchingTotal.value - excludedMediaIds.value.size)
+  : selected.value.size)
+const someMatchingSelected = computed(() => selectedCount.value > 0 && !allMatchingSelected.value)
+const heicSelectionEligible = computed(() => !allMatchingSelected.value && selected.value.size > 0
   && selectedMedia.value.size === selected.value.size
   && Array.from(selectedMedia.value.values()).every(isHeicMedia))
-const vllmSelectionEligible = computed(() => selected.value.size > 0
+const vllmSelectionEligible = computed(() => !allMatchingSelected.value && selected.value.size > 0
   && selectedMedia.value.size === selected.value.size
   && Array.from(selectedMedia.value.values()).every(isVllmMedia))
 const detailObscured = computed(() => detail.value !== null
@@ -55,6 +75,18 @@ async function loadRoots(): Promise<void> {
   roots.value = await getMediaRoots()
   const requested = typeof route.query.root === 'string' ? route.query.root : ''
   activeRootId.value = roots.value.some((root) => root.id === requested) ? requested : (roots.value[0]?.id ?? '')
+  activeDirectory.value = typeof route.query.directory === 'string' ? route.query.directory : ''
+  void loadDirectories()
+}
+
+async function loadDirectories(): Promise<void> {
+  folderDirectories.value = []
+  if (!activeRootId.value) return
+  try {
+    folderDirectories.value = (await getMediaDirectories(activeRootId.value)).directories
+  } catch (reason: unknown) {
+    toast.warning('无法读取图库文件夹', reason instanceof Error ? reason.message : '可在刷新图库后重试')
+  }
 }
 
 async function loadPage(): Promise<void> {
@@ -63,36 +95,107 @@ async function loadPage(): Promise<void> {
     return
   }
   controller?.abort()
-  controller = new AbortController()
+  const requestController = new AbortController()
+  controller = requestController
   loading.value = true
   error.value = null
   try {
-    page.value = await getLibrary({ rootId: activeRootId.value, query: queryInput.value.trim(), cursor: cursor.value, limit: 60 }, controller.signal)
+    const query = queryInput.value.trim()
+    const [scoreMin, scoreMax] = parseScoreRange(scoreRangeInput.value)
+    const [resolutionMin, resolutionMax] = parseNumericRange(resolutionRangeInput.value)
+    const response = await getLibrary({
+      rootId: activeRootId.value,
+      query,
+      page: currentPage.value,
+      ...(scoreMin === undefined ? {} : { scoreMin }),
+      ...(scoreMax === undefined ? {} : { scoreMax }),
+      ...(resolutionMin === undefined ? {} : { resolutionMin }),
+      ...(resolutionMax === undefined ? {} : { resolutionMax }),
+      directory: activeDirectory.value,
+      limit: 60,
+    }, requestController.signal)
+    if (controller === requestController) {
+      page.value = response
+      loadedQuery.value = query
+      if (Number.isInteger(response.page) && response.page > 0) {
+        currentPage.value = response.page
+        jumpPageInput.value = String(response.page)
+      }
+    }
   } catch (reason: unknown) {
-    if (!(reason instanceof DOMException && reason.name === 'AbortError')) {
+    if (controller === requestController && !(reason instanceof DOMException && reason.name === 'AbortError')) {
       error.value = reason instanceof Error ? reason.message : '图库加载失败'
       page.value = null
     }
   } finally {
-    loading.value = false
+    if (controller === requestController) loading.value = false
   }
 }
 
 function selectRoot(id: string): void {
   activeRootId.value = id
+  activeDirectory.value = ''
   clearSelection()
-  cursor.value = undefined
-  cursorHistory.value = []
-  void router.replace({ path: '/library', query: { root: id } })
+  resetToFirstPage()
+  void router.replace({ path: '/library', query: { root: id, directory: '' } })
+  void loadDirectories()
   void loadPage()
+}
+
+function selectDirectory(): void {
+  clearSelection()
+  resetToFirstPage()
+  void router.replace({
+    path: '/library',
+    query: { root: activeRootId.value, directory: activeDirectory.value },
+  })
+  void loadPage()
+}
+
+function parseScoreRange(value: string): [number | undefined, number | undefined] {
+  return parseNumericRange(value)
+}
+
+function parseNumericRange(value: string): [number | undefined, number | undefined] {
+  const [minimum, maximum] = value.split(':').map(Number)
+  if (!Number.isInteger(minimum) || !Number.isInteger(maximum) || minimum > maximum) {
+    return [undefined, undefined]
+  }
+  return [minimum, maximum]
+}
+
+function resetToFirstPage(): void {
+  currentPage.value = 1
+  jumpPageInput.value = '1'
 }
 
 function clearSelection(): void {
   selected.value = new Set()
   selectedMedia.value = new Map()
+  allMatchingSelected.value = false
+  allMatchingTotal.value = 0
+  selectedQuery.value = ''
+  selectedScoreMin.value = undefined
+  selectedScoreMax.value = undefined
+  selectedResolutionMin.value = undefined
+  selectedResolutionMax.value = undefined
+  excludedMediaIds.value = new Set()
+}
+
+function isMediaSelected(mediaId: string): boolean {
+  return allMatchingSelected.value
+    ? !excludedMediaIds.value.has(mediaId)
+    : selected.value.has(mediaId)
 }
 
 function toggleMedia(media: LocalMedia): void {
+  if (allMatchingSelected.value) {
+    const nextExcluded = new Set(excludedMediaIds.value)
+    if (nextExcluded.has(media.id)) nextExcluded.delete(media.id)
+    else nextExcluded.add(media.id)
+    excludedMediaIds.value = nextExcluded
+    return
+  }
   const next = new Set(selected.value)
   const nextMedia = new Map(selectedMedia.value)
   if (next.has(media.id)) {
@@ -106,33 +209,44 @@ function toggleMedia(media: LocalMedia): void {
   selectedMedia.value = nextMedia
 }
 
-function toggleCurrentPage(): void {
-  const next = new Set(selected.value)
-  const nextMedia = new Map(selectedMedia.value)
-  if (allCurrentPageSelected.value) {
-    page.value?.items.forEach((media) => {
-      next.delete(media.id)
-      nextMedia.delete(media.id)
-    })
-  } else {
-    page.value?.items.forEach((media) => {
-      next.add(media.id)
-      nextMedia.set(media.id, media)
-    })
+function toggleAllMatching(): void {
+  if (allMatchingSelected.value) {
+    clearSelection()
+    return
   }
-  selected.value = next
-  selectedMedia.value = nextMedia
+  allMatchingSelected.value = true
+  allMatchingTotal.value = page.value?.total ?? 0
+  selectedQuery.value = loadedQuery.value
+  const [scoreMin, scoreMax] = parseScoreRange(scoreRangeInput.value)
+  selectedScoreMin.value = scoreMin
+  selectedScoreMax.value = scoreMax
+  const [resolutionMin, resolutionMax] = parseNumericRange(resolutionRangeInput.value)
+  selectedResolutionMin.value = resolutionMin
+  selectedResolutionMax.value = resolutionMax
+  selected.value = new Set()
+  selectedMedia.value = new Map()
+  excludedMediaIds.value = new Set()
 }
 
-async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' | 'vllm_tag'): Promise<void> {
-  if (!activeRootId.value || !selected.value.size) return
+async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' | 'vllm_tag' | 'delete_selected'): Promise<void> {
+  if (!activeRootId.value || !selectedCount.value) return
   if (type === 'heic_convert' && !heicSelectionEligible.value) return
   if (type === 'vllm_tag' && !vllmSelectionEligible.value) return
   creatingBatchTask.value = true
   const mediaIds = Array.from(selected.value).sort((left, right) => left.localeCompare(right))
+  const selection = allMatchingSelected.value
+    ? {
+        library_query: selectedQuery.value,
+        ...(selectedScoreMin.value === undefined ? {} : { library_score_min: selectedScoreMin.value }),
+        ...(selectedScoreMax.value === undefined ? {} : { library_score_max: selectedScoreMax.value }),
+        ...(selectedResolutionMin.value === undefined ? {} : { library_resolution_min: selectedResolutionMin.value }),
+        ...(selectedResolutionMax.value === undefined ? {} : { library_resolution_max: selectedResolutionMax.value }),
+        excluded_media_ids: Array.from(excludedMediaIds.value).sort((left, right) => left.localeCompare(right)),
+      }
+    : { media_ids: mediaIds }
   const request: CreateTaskRequest = type === 'resize'
-    ? { type, root_id: activeRootId.value, options: { media_ids: mediaIds, max_size: resizeMaxSize.value } }
-    : { type, root_id: activeRootId.value, options: { media_ids: mediaIds } }
+    ? { type, root_id: activeRootId.value, options: { ...selection, max_size: resizeMaxSize.value } }
+    : { type, root_id: activeRootId.value, options: selection }
   try {
     await createTask(request)
     await tasks.loadSnapshot()
@@ -142,8 +256,14 @@ async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' 
       heic_convert: 'HEIC 转换预检已加入队列',
       tag_pipeline: '标签处理预检已加入队列',
       vllm_tag: '视觉模型打标任务已加入队列',
+      delete_selected: '删除任务已加入队列',
     }[type]
-    toast.success(successMessage)
+    if (type === 'delete_selected') {
+      toast.success(successMessage, '请在任务页确认后，所选媒体及同名标签文件会移入隔离区，可在隔离区恢复。')
+      void router.push('/tasks')
+    } else {
+      toast.success(successMessage)
+    }
   } catch (reason: unknown) {
     toast.error('无法创建批处理任务', reason instanceof Error ? reason.message : '未知错误')
   } finally {
@@ -152,22 +272,37 @@ async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' 
 }
 
 function search(): void {
-  cursor.value = undefined
-  cursorHistory.value = []
+  clearSelection()
+  resetToFirstPage()
+  void loadPage()
+}
+
+function applyFilters(): void {
+  clearSelection()
+  resetToFirstPage()
+  void loadPage()
+}
+
+function goToPage(value: number): void {
+  if (!totalPages.value || !Number.isFinite(value)) return
+  currentPage.value = Math.min(totalPages.value, Math.max(1, Math.trunc(value)))
+  jumpPageInput.value = String(currentPage.value)
+  scrollToPageTop()
   void loadPage()
 }
 
 function nextPage(): void {
-  if (!page.value?.next_cursor) return
-  cursorHistory.value.push(cursor.value)
-  cursor.value = page.value.next_cursor
-  void loadPage()
+  if (currentPage.value >= totalPages.value) return
+  goToPage(currentPage.value + 1)
 }
 
 function previousPage(): void {
-  if (!cursorHistory.value.length) return
-  cursor.value = cursorHistory.value.pop()
-  void loadPage()
+  if (currentPage.value <= 1) return
+  goToPage(currentPage.value - 1)
+}
+
+function jumpToPage(): void {
+  goToPage(Number(jumpPageInput.value))
 }
 
 async function refreshLibrary(): Promise<void> {
@@ -233,6 +368,8 @@ async function openDetail(media: LocalMedia): Promise<void> {
   detailOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null
   detail.value = media
   detailRevealed.value = false
+  originalPreviewOpen.value = false
+  originalPreviewOpener = null
   detailController?.abort()
   const requestController = new AbortController()
   detailController = requestController
@@ -256,6 +393,8 @@ async function closeDetail(): Promise<void> {
   const opener = detailOpener
   detailController?.abort()
   detailController = null
+  originalPreviewOpen.value = false
+  originalPreviewOpener = null
   detail.value = null
   detailOpener = null
   await nextTick()
@@ -268,11 +407,42 @@ function onDetailKeydown(event: KeyboardEvent): void {
   void closeDetail()
 }
 
+async function openOriginalPreview(): Promise<void> {
+  if (detailObscured.value) return
+  originalPreviewOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  originalPreviewOpen.value = true
+  await nextTick()
+  originalPreviewPanel.value?.focus()
+}
+
+async function closeOriginalPreview(): Promise<void> {
+  const opener = originalPreviewOpener
+  originalPreviewOpen.value = false
+  originalPreviewOpener = null
+  await nextTick()
+  opener?.focus()
+}
+
+function onOriginalPreviewKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Escape') return
+  event.preventDefault()
+  void closeOriginalPreview()
+}
+
+function appendTagToSearch(tag: string): void {
+  queryInput.value = `${queryInput.value} ${tag}`.trim()
+  search()
+  void closeDetail()
+}
+
 watch(activeRootId, () => {
   detailController?.abort()
   detailController = null
   detail.value = null
+  originalPreviewOpen.value = false
+  originalPreviewOpener = null
   fullSizePreviews.value = new Set()
+  clearSelection()
 })
 
 onMounted(async () => {
@@ -329,14 +499,42 @@ onBeforeUnmount(() => {
         <button type="submit" class="button button-primary search-submit"><Search :size="15" /> 搜索</button>
       </form>
 
+      <div class="inline" style="margin-top: 12px; flex-wrap: wrap; gap: 12px" aria-label="图库筛选">
+        <label class="inline" for="library-directory">
+          <span class="field-help">文件夹</span>
+          <select id="library-directory" v-model="activeDirectory" class="input" aria-label="图库文件夹" @change="selectDirectory">
+            <option value="">根目录（仅本层图片）</option>
+            <option v-for="directory in folderDirectories" :key="directory" :value="directory">{{ directory }}</option>
+          </select>
+        </label>
+        <label class="inline" for="library-score-range">
+          <span class="field-help">评分区间</span>
+          <select id="library-score-range" v-model="scoreRangeInput" class="input" aria-label="评分区间" @change="applyFilters">
+            <option value="">全部评分</option>
+            <option v-for="range in scoreRanges" :key="`${range.score_min}:${range.score_max}`" :value="`${range.score_min}:${range.score_max}`">
+              {{ range.score_min }}–{{ range.score_max }}（{{ range.count.toLocaleString() }} 项）
+            </option>
+          </select>
+        </label>
+        <label class="inline" for="library-resolution-range">
+          <span class="field-help">分辨率区间（短边）</span>
+          <select id="library-resolution-range" v-model="resolutionRangeInput" class="input" aria-label="分辨率区间" @change="applyFilters">
+            <option value="">全部分辨率</option>
+            <option v-for="range in resolutionRanges" :key="`${range.resolution_min}:${range.resolution_max}`" :value="`${range.resolution_min}:${range.resolution_max}`">
+              {{ range.resolution_min }}–{{ range.resolution_max }}px（{{ range.count.toLocaleString() }} 项）
+            </option>
+          </select>
+        </label>
+      </div>
+
       <div class="result-summary">
         <label v-if="page?.items.length" class="page-selection">
           <input
             type="checkbox"
-            aria-label="全选当前页"
-            :checked="allCurrentPageSelected"
-            :indeterminate="someCurrentPageSelected"
-            @change="toggleCurrentPage"
+            aria-label="全选搜索结果"
+            :checked="allMatchingSelected"
+            :indeterminate="someMatchingSelected"
+            @change="toggleAllMatching"
           >
           <span>{{ loading ? '正在读取图库' : `${page?.total.toLocaleString() ?? 0} 项本地媒体` }}</span>
         </label>
@@ -349,12 +547,12 @@ onBeforeUnmount(() => {
         <div><Images :size="30" /><strong>无法加载图库</strong><p>{{ error }}</p><button type="button" class="button" style="margin-top: 16px" @click="loadPage">重试</button></div>
       </div>
       <div v-else-if="page?.items.length" class="library-grid">
-        <article v-for="media in page.items" :key="media.id" class="library-card" :class="{ 'is-selected': selected.has(media.id) }">
+        <article v-for="media in page.items" :key="media.id" class="library-card" :class="{ 'is-selected': isMediaSelected(media.id) }">
           <label class="library-select">
             <input
               type="checkbox"
               :aria-label="`选择 ${media.filename}`"
-              :checked="selected.has(media.id)"
+              :checked="isMediaSelected(media.id)"
               @change="toggleMedia(media)"
             >
           </label>
@@ -371,9 +569,24 @@ onBeforeUnmount(() => {
       <div v-else class="empty-state"><div><Images :size="30" /><strong>没有匹配的媒体</strong><p>尝试减少标签或清空查询。</p></div></div>
 
       <nav v-if="page?.items.length" class="pagination" aria-label="图库分页">
-        <button type="button" class="button button-small" :disabled="!cursorHistory.length" @click="previousPage"><ChevronLeft :size="15" /> 上一页</button>
-        <span class="pagination-info">{{ page.items.length }} 项</span>
-        <button type="button" class="button button-small" :disabled="!page.next_cursor" @click="nextPage">下一页 <ChevronRight :size="15" /></button>
+        <button type="button" class="button button-small" :disabled="currentPage <= 1" @click="previousPage"><ChevronLeft :size="15" /> 上一页</button>
+        <span class="pagination-info">第 {{ currentPage }} / {{ totalPages }} 页 · 共 {{ totalPages }} 页</span>
+        <label class="inline" for="library-page-jump">
+          <span class="sr-only">跳转至页码</span>
+          <input
+            id="library-page-jump"
+            v-model="jumpPageInput"
+            class="input"
+            style="width: 76px"
+            type="number"
+            min="1"
+            :max="totalPages || 1"
+            aria-label="跳转至页码"
+            @keyup.enter="jumpToPage"
+          >
+          <button type="button" class="button button-small" :disabled="!totalPages" @click="jumpToPage">跳转</button>
+        </label>
+        <button type="button" class="button button-small" :disabled="currentPage >= totalPages" @click="nextPage">下一页 <ChevronRight :size="15" /></button>
       </nav>
 
       <Transition name="toast">
@@ -391,6 +604,9 @@ onBeforeUnmount(() => {
             </button>
             <button type="button" class="button" :disabled="creatingBatchTask" aria-label="标签处理所选" @click="createBatchTask('tag_pipeline')">
               <Tags :size="16" /> 标签处理
+            </button>
+            <button type="button" class="button button-danger" :disabled="creatingBatchTask" aria-label="删除所选" @click="createBatchTask('delete_selected')">
+              <Trash2 :size="16" /> 删除所选
             </button>
             <button
               type="button"
@@ -426,7 +642,16 @@ onBeforeUnmount(() => {
         <div class="detail-content">
           <div class="detail-media">
             <video v-if="isVideo(detail)" :src="libraryMediaUrl(detail.id)" controls preload="metadata" :class="{ 'media-obscured': detailObscured }" />
-            <img v-else :src="libraryMediaUrl(detail.id)" :alt="detail.filename" :class="{ 'media-obscured': detailObscured }">
+            <button
+              v-else
+              type="button"
+              class="detail-media-button"
+              :disabled="detailObscured"
+              :aria-label="`放大查看本地图片 ${detail.filename}`"
+              @click="openOriginalPreview"
+            >
+              <img :src="libraryMediaUrl(detail.id)" :alt="detail.filename" :class="{ 'media-obscured': detailObscured }">
+            </button>
             <button v-if="detailObscured" type="button" class="reveal-button" :aria-label="`显示详情 ${detail.filename}`" @click="detailRevealed = true">
               <Eye :size="16" /> 显示内容
             </button>
@@ -436,10 +661,24 @@ onBeforeUnmount(() => {
             <div class="detail-stat"><small>尺寸</small><strong>{{ detail.width && detail.height ? `${detail.width} × ${detail.height}` : '未知' }}</strong></div>
             <div class="detail-stat"><small>帖子</small><strong>{{ detail.post_id ? `#${detail.post_id}` : '本地文件' }}</strong></div>
           </div>
-          <div class="tag-section"><h3>精确标签</h3><div class="tag-list"><button v-for="tag in detail.tags" :key="tag" type="button" class="tag" @click="queryInput = tag; search(); closeDetail()">{{ tag }}</button></div></div>
+          <div class="tag-section"><h3>精确标签</h3><div class="tag-list"><button v-for="tag in detail.tags" :key="tag" type="button" class="tag" @click="appendTagToSearch(tag)">{{ tag }}</button></div></div>
           <div class="tag-section"><h3>相对路径</h3><code style="font-size: 11px; color: var(--text-secondary); word-break: break-all">{{ detail.relative_path }}</code></div>
         </div>
       </aside>
+      <div
+        v-if="originalPreviewOpen"
+        ref="originalPreviewPanel"
+        class="original-preview"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="`原图预览 ${detail.filename}`"
+        tabindex="-1"
+        @click.self="closeOriginalPreview"
+        @keydown="onOriginalPreviewKeydown"
+      >
+        <button type="button" class="button icon-button original-preview-close" aria-label="关闭原图预览" @click="closeOriginalPreview"><X :size="20" /></button>
+        <img :src="libraryMediaUrl(detail.id)" :alt="`${detail.filename} 原图`">
+      </div>
     </template>
   </div>
 </template>

@@ -1,4 +1,4 @@
-import { fireEvent, render, within } from '@testing-library/vue'
+import { fireEvent, render, waitFor, within } from '@testing-library/vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ToolsView from './ToolsView.vue'
 
@@ -7,6 +7,14 @@ const mocks = vi.hoisted(() => ({
   getMediaDirectories: vi.fn(),
   getMediaRoots: vi.fn(),
   getQuarantine: vi.fn(),
+  getTrainingAdapters: vi.fn(),
+  getTrainingPresets: vi.fn(),
+  getTrainingRuntimeProfiles: vi.fn(),
+  getVisionCropRuntimeHealth: vi.fn(),
+  exportTrainingPreset: vi.fn(),
+  importTrainingPreset: vi.fn(),
+  updateTrainingPresetToml: vi.fn(),
+  installVisionCropRuntime: vi.fn(),
   push: vi.fn(),
   info: vi.fn(),
   warning: vi.fn(),
@@ -19,6 +27,14 @@ vi.mock('../api', () => ({
   getMediaDirectories: mocks.getMediaDirectories,
   getMediaRoots: mocks.getMediaRoots,
   getQuarantine: mocks.getQuarantine,
+  getTrainingAdapters: mocks.getTrainingAdapters,
+  getTrainingPresets: mocks.getTrainingPresets,
+  getTrainingRuntimeProfiles: mocks.getTrainingRuntimeProfiles,
+  getVisionCropRuntimeHealth: mocks.getVisionCropRuntimeHealth,
+  exportTrainingPreset: mocks.exportTrainingPreset,
+  importTrainingPreset: mocks.importTrainingPreset,
+  updateTrainingPresetToml: mocks.updateTrainingPresetToml,
+  installVisionCropRuntime: mocks.installVisionCropRuntime,
   purgeQuarantine: vi.fn(),
   restoreQuarantine: vi.fn(),
 }))
@@ -57,6 +73,10 @@ describe('ToolsView media selection boundary', () => {
     mocks.getMediaRoots.mockResolvedValue([root])
     mocks.getMediaDirectories.mockResolvedValue({ directories: ['portraits/2025', 'portraits/2026'], truncated: false })
     mocks.getQuarantine.mockResolvedValue([])
+    mocks.getTrainingAdapters.mockResolvedValue([{ id: 'sdxl-lora', version: 'test', label: 'SDXL LoRA', trainer: 'trainer.py', groups: [], fields: [] }])
+    mocks.getTrainingRuntimeProfiles.mockResolvedValue([{ id: 'conda:lora', label: 'Conda · lora', kind: 'conda', managed: false, installed: true, installing: false, runtime_root: 'D:/runtime', python_path: 'C:/Python/python.exe' }])
+    mocks.getTrainingPresets.mockResolvedValue([])
+    mocks.exportTrainingPreset.mockResolvedValue({ name: 'Odette', toml: 'output_name = "odette"\n' })
   })
 
   it('opens directory configuration for vLLM without creating an ID-less task', async () => {
@@ -74,6 +94,59 @@ describe('ToolsView media selection boundary', () => {
     expect(view.getByRole('dialog')).toBeVisible()
     expect(mocks.push).not.toHaveBeenCalled()
     expect(mocks.createTask).not.toHaveBeenCalled()
+  })
+
+  it('moves versioned training presets and Lora-scripts TOML management into tools', async () => {
+    const view = render(ToolsView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    expect(await view.findByRole('heading', { name: '训练预设与 TOML' })).toBeVisible()
+    expect(view.getByLabelText('训练预设')).toBeVisible()
+    expect(view.getByText(/在工具页管理版本化预设/)).toBeVisible()
+  })
+
+  it('paginates a large quarantine instead of rendering every recoverable file at once', async () => {
+    mocks.getQuarantine.mockResolvedValue(Array.from({ length: 51 }, (_, index) => ({
+      id: `quarantine-${index}`,
+      original_relative_path: `characters/entry-${index}.png`,
+      size_bytes: 1024,
+      reason: 'test',
+    })))
+    const view = render(ToolsView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    expect(await view.findByText('characters/entry-0.png')).toBeVisible()
+    expect(view.queryByText('characters/entry-50.png')).not.toBeInTheDocument()
+    expect(view.getByText(/第 1 \/ 2 页/)).toBeVisible()
+    await fireEvent.click(view.getByRole('button', { name: '下一页' }))
+    expect(await view.findByText('characters/entry-50.png')).toBeVisible()
+  })
+
+  it('edits a selected preset TOML and saves it as a new server version', async () => {
+    mocks.getTrainingPresets.mockResolvedValue([{
+      id: 'preset-1', name: 'Odette', created_at: 1, updated_at: 1, version_count: 1,
+      training: { adapter_id: 'sdxl-lora', runtime_profile_id: 'conda:lora', gpu_ids: ['0'], parameters: { output_name: 'odette' } },
+    }])
+    mocks.updateTrainingPresetToml.mockResolvedValue({
+      id: 'preset-1', name: 'Odette', created_at: 1, updated_at: 2, version_count: 2,
+      training: { adapter_id: 'sdxl-lora', runtime_profile_id: 'conda:lora', gpu_ids: ['0'], parameters: { output_name: 'odette-v2' } },
+    })
+    const view = render(ToolsView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await view.findByRole('option', { name: 'Odette · v1' })
+    const selector = view.getByLabelText('训练预设') as HTMLSelectElement
+    await fireEvent.update(selector, 'preset-1')
+    await waitFor(() => expect(view.getByLabelText('Lora-scripts TOML')).toHaveValue('output_name = "odette"\n'))
+    await fireEvent.update(view.getByLabelText('Lora-scripts TOML'), 'output_name = "odette-v2"\n')
+    await fireEvent.click(view.getByRole('button', { name: '保存新版本' }))
+
+    await waitFor(() => expect(mocks.updateTrainingPresetToml).toHaveBeenCalledWith('preset-1', expect.objectContaining({
+      name: 'Odette', adapter_id: 'sdxl-lora', runtime_profile_id: 'conda:lora', gpu_ids: ['0'], toml: 'output_name = "odette-v2"\n',
+    })))
   })
 
   it('opens directory configuration for HEIC conversion', async () => {
@@ -138,6 +211,7 @@ describe('ToolsView media selection boundary', () => {
     })
 
     await view.findByRole('heading', { name: '完整性检查' })
+    expect(view.getByRole('heading', { name: '数据集增广' })).toBeVisible()
     expect(view.getByRole('heading', { name: 'HEIC 转换' })).toBeVisible()
     expect(view.getByRole('heading', { name: '标签处理' })).toBeVisible()
     expect(view.getByText('支持的图片格式会进行完整解码；其他媒体容器仅执行基础文件检查。')).toBeVisible()
@@ -171,6 +245,69 @@ describe('ToolsView media selection boundary', () => {
         quality: 92,
       },
     })
+  })
+
+  it('creates an immutable dataset-augmentation task with family split settings', async () => {
+    const view = render(ToolsView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+    const heading = await view.findByRole('heading', { name: '数据集增广' })
+    const card = heading.closest('article')
+    if (!card) throw new Error('Tool card is missing')
+
+    await fireEvent.click(within(card).getByRole('button', { name: '配置任务' }))
+    const dialog = view.getByRole('dialog')
+    await fireEvent.update(within(dialog).getByLabelText('输出文件夹'), 'training/dataset-expanded')
+    await fireEvent.click(within(dialog).getByLabelText('生成水平翻转副本（需要重新打标）'))
+    await fireEvent.click(within(dialog).getByRole('button', { name: '创建任务' }))
+
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'dataset_augmentation',
+      root_id: root.id,
+      options: {
+        relative_directory: '.',
+        output_directory: 'training/dataset-expanded',
+        min_megapixels: 1.8,
+        min_long_side: 1536,
+        min_short_side: 768,
+        horizontal_flip: true,
+        train_percent: 90,
+        validation_percent: 5,
+        test_percent: 5,
+        smart_crop: {
+          enabled: true,
+          runtime_profile_id: 'conda:lora',
+          gpu_id: '0',
+          quality_profile: 'anime-quality',
+          portrait: true,
+          upper_body: true,
+          full_body_tight: true,
+          max_derived_per_family: 3,
+        },
+        retagging: {
+          send_to_vllm: false,
+          preserve_artist_character_tags: true,
+        },
+      },
+    })
+  })
+
+  it('enables quality smart crops in dataset augmentation by default', async () => {
+    const view = render(ToolsView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+    const heading = await view.findByRole('heading', { name: '数据集增广' })
+    const card = heading.closest('article')
+    if (!card) throw new Error('Tool card is missing')
+
+    await fireEvent.click(within(card).getByRole('button', { name: '配置任务' }))
+    const dialog = view.getByRole('dialog')
+    expect(within(dialog).getByText('智能裁剪')).toBeVisible()
+    expect(within(dialog).getByLabelText('生成肖像裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('生成上半身裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('生成紧凑全身裁剪')).toBeChecked()
   })
 
   it('offers existing library folders instead of requiring users to remember relative paths', async () => {

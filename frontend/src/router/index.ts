@@ -9,6 +9,7 @@ const router = createRouter({
     { path: '/tasks', name: 'tasks', component: () => import('../views/TasksView.vue') },
     { path: '/library', name: 'library', component: () => import('../views/LibraryView.vue') },
     { path: '/tools', name: 'tools', component: () => import('../views/ToolsView.vue') },
+    { path: '/training', name: 'training', component: () => import('../views/TrainingView.vue') },
     { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue') },
     { path: '/download', redirect: '/explore' },
     { path: '/process', redirect: '/tools' },

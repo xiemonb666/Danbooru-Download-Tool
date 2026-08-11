@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apiClient, getDanbooruPosts, getDownloadHistory, getLibraryItem, getTaskDetails, saveSecret } from './index'
+import { analyzeLoraSvd, apiClient, getDanbooruPosts, getDownloadHistory, getLibraryItem, getTaskDetails, saveSecret } from './index'
 
 describe('apiClient', () => {
   afterEach(() => vi.unstubAllGlobals())
@@ -110,6 +110,34 @@ describe('apiClient', () => {
     const result = await saveSecret('danbooru', 'secret-value')
 
     expect(result.storage).toBe('session')
+  })
+
+  it('starts a LoRA SVD analysis with an explicit runtime and auto device selection', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ data: { id: 'analysis-1', reports: [] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await analyzeLoraSvd({
+      runtime_profile_id: 'conda:lora',
+      files: [{ path: 'D:/models/one.safetensors', label: 'epoch 1' }],
+      device: 'auto',
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/training/lora-svd/analyses',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          runtime_profile_id: 'conda:lora',
+          files: [{ path: 'D:/models/one.safetensors', label: 'epoch 1' }],
+          device: 'auto',
+        }),
+      }),
+    )
   })
 
   it('normalizes missing or unexpected Danbooru ratings to unknown', async () => {

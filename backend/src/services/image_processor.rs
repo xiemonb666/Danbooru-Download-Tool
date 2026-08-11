@@ -192,6 +192,7 @@ pub enum ToolOperation {
     NearDedup,
     IntegrityCheck,
     DeleteByTag,
+    DeleteSelected,
     TagPipeline,
     HeicConvert,
 }
@@ -1008,6 +1009,27 @@ pub fn plan_delete_by_tag(root: &VerifiedMediaRoot, tag: &str) -> Result<ToolMan
     plan_delete_by_tag_selected(root, tag, &media_files)
 }
 
+pub fn plan_delete_selected(
+    root: &VerifiedMediaRoot,
+    media_files: &[PathBuf],
+) -> Result<ToolManifest, ToolError> {
+    let media_files = validate_selected_media_files(root, media_files)?;
+    let mut candidates = Vec::with_capacity(media_files.len());
+    for relative_path in &media_files {
+        let media_path = root.resolve_existing_file(relative_path)?;
+        let size = fs::metadata(media_path).map_err(ToolError::Io)?.len();
+        candidates.push(ToolCandidate {
+            relative_path: relative_path.clone(),
+            companion_paths: Vec::new(),
+            reason: "selected_by_user".to_string(),
+            size,
+            sha256: None,
+        });
+    }
+    attach_orphaned_sidecars(root, &media_files, &mut candidates)?;
+    new_manifest(root, ToolOperation::DeleteSelected, candidates)
+}
+
 pub fn plan_delete_by_tag_selected(
     root: &VerifiedMediaRoot,
     tag: &str,
@@ -1738,11 +1760,6 @@ fn validate_selected_media_files(
     root: &VerifiedMediaRoot,
     media_files: &[PathBuf],
 ) -> Result<Vec<PathBuf>, ToolError> {
-    if media_files.len() > 10_000 {
-        return Err(ToolError::InvalidManifest(
-            "目录批处理单批最多 10000 项".to_string(),
-        ));
-    }
     let mut selected = BTreeSet::new();
     for relative in media_files {
         let relative =
@@ -1951,6 +1968,37 @@ mod tests {
             manifest.candidates[0].relative_path,
             PathBuf::from("selected.jpg")
         );
+    }
+
+    #[test]
+    fn delete_selected_moves_the_selected_media_and_its_sidecar_to_quarantine() {
+        let directory = tempfile::tempdir().expect("temp root");
+        fs::write(directory.path().join("selected.jpg"), b"media").unwrap();
+        fs::write(directory.path().join("selected.txt"), b"tag_a, tag_b").unwrap();
+        fs::write(directory.path().join("outside.jpg"), b"outside").unwrap();
+        let root = VerifiedMediaRoot::open(directory.path()).expect("valid root");
+
+        let manifest = plan_delete_selected(&root, &[PathBuf::from("selected.jpg")])
+            .expect("selected delete preflight");
+        let result = apply_quarantine(&root, &manifest).expect("selected delete apply");
+
+        assert_eq!(manifest.operation, ToolOperation::DeleteSelected);
+        assert_eq!(result.moved, 2);
+        assert!(!directory.path().join("selected.jpg").exists());
+        assert!(!directory.path().join("selected.txt").exists());
+        assert!(directory.path().join("outside.jpg").exists());
+        assert!(directory
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(&manifest.batch_id)
+            .join("selected.jpg")
+            .exists());
+        assert!(directory
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(&manifest.batch_id)
+            .join("selected.txt")
+            .exists());
     }
 
     #[test]

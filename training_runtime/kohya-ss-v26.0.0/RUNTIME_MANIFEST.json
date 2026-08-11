@@ -1,0 +1,22 @@
+{
+  "runtime_id": "kohya-ss-v26.0.0",
+  "upstream_repository": "https://github.com/bmaltais/kohya_ss",
+  "upstream_tag": "v26.0.0",
+  "upstream_revision": "486c00f065b0f69d19a9f92575785bdbbbd3f651",
+  "sd_scripts_repository": "https://github.com/kohya-ss/sd-scripts",
+  "sd_scripts_revision": "6721028c79ee85a78b3a06dfd8954dae310a1cce",
+  "source_scope": "sd-scripts headless training runtime plus upstream license and attribution",
+  "entrypoints": [
+    "sd-scripts/train_network.py", "sd-scripts/sdxl_train_network.py", "sd-scripts/sd3_train_network.py", "sd-scripts/flux_train_network.py",
+    "sd-scripts/lumina_train_network.py", "sd-scripts/anima_train_network.py", "sd-scripts/hunyuan_image_train_network.py",
+    "sd-scripts/train_db.py", "sd-scripts/fine_tune.py", "sd-scripts/sdxl_train.py", "sd-scripts/sd3_train.py", "sd-scripts/flux_train.py", "sd-scripts/lumina_train.py",
+    "sd-scripts/anima_train.py", "sd-scripts/train_textual_inversion.py", "sd-scripts/sdxl_train_textual_inversion.py",
+    "sd-scripts/train_leco.py", "sd-scripts/sdxl_train_leco.py"
+  ],
+  "license": "Apache-2.0",
+  "local_modifications": [
+    "The desktop invokes upstream entrypoints through ../telemetry_launcher.py.",
+    "The desktop uses adapter_inspector.py for parser-only schema discovery.",
+    "No upstream training source files are patched by the desktop runtime."
+  ]
+}

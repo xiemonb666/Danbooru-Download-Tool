@@ -335,6 +335,438 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/training/adapters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_adapters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/datasets/gallery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_gallery_dataset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/gpus": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_gpus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/lora-svd/analyses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_lora_svd_analysis"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/lora-svd/analyses/{id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["export_lora_svd_analysis"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/lora-svd/analyses/{id}/modules/{module_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["lora_svd_module"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/paths": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_path_browser"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/presets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_training_presets"];
+        put?: never;
+        post: operations["create_training_preset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/presets/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["import_training_preset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/presets/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_training_preset"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/presets/{id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["export_training_preset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/presets/{id}/toml": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_training_preset_from_toml"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["training_preview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_queue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/runtime-profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_runtime_profiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/runtime-profiles/{id}/diagnostics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_runtime_diagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/runtime-profiles/{id}/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["install_training_runtime"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["delete_training_task"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_artifacts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/artifacts/{artifact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_artifact_file"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/cleanup-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_cleanup_preview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/tasks/{id}/metrics/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_metrics_overview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vision-crop/runtime-profiles/{id}/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["vision_crop_runtime_health"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vision-crop/runtime-profiles/{id}/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["install_vision_crop_runtime"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/vllm/health": {
         parameters: {
             query?: never;
@@ -345,6 +777,22 @@ export interface paths {
         get: operations["vllm_health"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vllm/load": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["vllm_load"];
         delete?: never;
         options?: never;
         head?: never;
@@ -470,7 +918,13 @@ export interface components {
                 items: components["schemas"]["LocalMedia"][];
                 next_cursor?: string | null;
                 /** Format: int64 */
+                page: number;
+                resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
+                score_ranges: components["schemas"]["LibraryScoreRange"][];
+                /** Format: int64 */
                 total: number;
+                /** Format: int64 */
+                total_pages: number;
             };
             meta?: {
                 [key: string]: unknown;
@@ -496,6 +950,46 @@ export interface components {
                 tags: string[];
                 /** Format: int32 */
                 width?: number | null;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_LoraSvdAnalysisResult: {
+            data: {
+                comparison?: null | components["schemas"]["LoraSvdComparison"];
+                execution: components["schemas"]["LoraSvdExecution"];
+                /** Format: int64 */
+                expires_at: number;
+                id: string;
+                reports: components["schemas"]["LoraSvdModelReport"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_LoraSvdModule: {
+            data: {
+                /** Format: double */
+                alpha: number;
+                component: string;
+                effective_rank: components["schemas"]["LoraSvdThresholdRanks"];
+                /** Format: double */
+                energy: number;
+                flag?: string | null;
+                id: string;
+                /** Format: int64 */
+                numerical_rank: number;
+                /** Format: int64 */
+                rank: number;
+                /** Format: double */
+                scale: number;
+                /** @description Returned from the module detail/export endpoints; omitted from the initial summary. */
+                singular_values?: number[] | null;
+                /** Format: double */
+                stable_rank: number;
+                /** Format: double */
+                tail_energy_20: number;
             };
             meta?: {
                 [key: string]: unknown;
@@ -607,7 +1101,159 @@ export interface components {
                 revision: number;
                 status: components["schemas"]["TaskStatus"];
                 title: string;
+                training?: null | components["schemas"]["TrainingTaskSummary"];
                 updated_at: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingArtifactsResponse: {
+            data: {
+                artifacts: components["schemas"]["TrainingArtifact"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingCleanupPreviewResponse: {
+            data: {
+                deletable: components["schemas"]["TrainingCleanupPath"][];
+                retained: components["schemas"]["TrainingCleanupPath"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingCleanupResponse: {
+            data: {
+                deleted: components["schemas"]["TrainingCleanupPath"][];
+                retained: components["schemas"]["TrainingCleanupPath"][];
+                task_id: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingGalleryDatasetResponse: {
+            data: {
+                /** Format: int64 */
+                caption_count: number;
+                caption_extension: string;
+                /** Format: int64 */
+                effective_image_count: number;
+                /** Format: int64 */
+                image_count: number;
+                image_dir: string;
+                relative_directory: string;
+                /** Format: int32 */
+                repeats: number;
+                root_id: string;
+                root_name: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingLogsResponse: {
+            data: {
+                text: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingMetricsOverviewResponse: {
+            data: {
+                /** Format: int64 */
+                cursor: number;
+                series: components["schemas"]["TrainingMetricSeriesSummary"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingMetricsResponse: {
+            data: {
+                /** Format: int64 */
+                cursor: number;
+                metrics: components["schemas"]["TrainingMetric"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingPathBrowserResponse: {
+            data: {
+                current_path: string;
+                directories: components["schemas"]["TrainingPathEntry"][];
+                files: components["schemas"]["TrainingPathEntry"][];
+                parent_path?: string | null;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingPresetExportResponse: {
+            data: {
+                name: string;
+                toml: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingPresetResponse: {
+            data: {
+                /** Format: int64 */
+                created_at: number;
+                id: string;
+                name: string;
+                training: components["schemas"]["TrainingRunRequest"];
+                /** Format: int64 */
+                updated_at: number;
+                version_count: number;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingPreviewResponse: {
+            data: {
+                toml: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingQueueResponse: {
+            data: {
+                entries: components["schemas"]["TrainingQueueEntry"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingRuntimeDiagnostics: {
+            data: {
+                checks: components["schemas"]["TrainingRuntimeCheck"][];
+                profile: components["schemas"]["TrainingRuntimeProfile"];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingRuntimeProfile: {
+            data: {
+                id: string;
+                installed: boolean;
+                installing: boolean;
+                kind: string;
+                label: string;
+                last_error?: string | null;
+                managed: boolean;
+                python_path: string;
+                runtime_root: string;
             };
             meta?: {
                 [key: string]: unknown;
@@ -655,11 +1301,113 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        ApiSuccess_Vec_TrainingAdapterResponse: {
+            data: {
+                family: string;
+                family_label: string;
+                fields: components["schemas"]["TrainingAdapterField"][];
+                groups: components["schemas"]["TrainingAdapterGroup"][];
+                id: string;
+                label: string;
+                trainer: string;
+                training_type: string;
+                training_type_label: string;
+                version: string;
+            }[];
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_Vec_TrainingGpu: {
+            data: {
+                external_processes: components["schemas"]["TrainingGpuExternalProcess"][];
+                /** Format: int64 */
+                fan_speed_percent?: number | null;
+                /** Format: int64 */
+                graphics_clock_mhz?: number | null;
+                id: string;
+                /** Format: int64 */
+                memory_clock_mhz?: number | null;
+                /** Format: int64 */
+                memory_total_mib: number;
+                /** Format: int64 */
+                memory_used_mib: number;
+                name: string;
+                /** Format: double */
+                power_draw_w?: number | null;
+                /** Format: double */
+                power_limit_w?: number | null;
+                /** Format: int64 */
+                temperature_c?: number | null;
+                /** Format: int64 */
+                utilization_percent: number;
+            }[];
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_Vec_TrainingPresetResponse: {
+            data: {
+                /** Format: int64 */
+                created_at: number;
+                id: string;
+                name: string;
+                training: components["schemas"]["TrainingRunRequest"];
+                /** Format: int64 */
+                updated_at: number;
+                version_count: number;
+            }[];
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_Vec_TrainingRuntimeProfile: {
+            data: {
+                id: string;
+                installed: boolean;
+                installing: boolean;
+                kind: string;
+                label: string;
+                last_error?: string | null;
+                managed: boolean;
+                python_path: string;
+                runtime_root: string;
+            }[];
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_VisionCropRuntimeHealth: {
+            data: {
+                gpu_id: string;
+                gpu_name?: string | null;
+                installing: boolean;
+                last_error?: string | null;
+                message: string;
+                models_ready: boolean;
+                providers: string[];
+                python_path: string;
+                ready: boolean;
+                runtime_profile_id: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
         ApiSuccess_VllmHealthStatus: {
             data: {
                 available: boolean;
                 message: string;
                 models: string[];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_VllmLoadStatus: {
+            data: {
+                message: string;
+                state: string;
             };
             meta?: {
                 [key: string]: unknown;
@@ -701,7 +1449,7 @@ export interface components {
         CreateMediaDirectoryRequest: {
             relative_path: string;
         };
-        CreateTaskRequest: components["schemas"]["DownloadTaskRequest"] | components["schemas"]["IndexLibraryTaskRequest"] | components["schemas"]["IntegrityScanTaskRequest"] | components["schemas"]["ExactDedupTaskRequest"] | components["schemas"]["NearDedupTaskRequest"] | components["schemas"]["ResizeTaskRequest"] | components["schemas"]["HeicConvertTaskRequest"] | components["schemas"]["DeleteByTagTaskRequest"] | components["schemas"]["TagPipelineTaskRequest"] | components["schemas"]["VllmTagTaskRequest"];
+        CreateTaskRequest: components["schemas"]["DownloadTaskRequest"] | components["schemas"]["IndexLibraryTaskRequest"] | components["schemas"]["IntegrityScanTaskRequest"] | components["schemas"]["ExactDedupTaskRequest"] | components["schemas"]["NearDedupTaskRequest"] | components["schemas"]["ResizeTaskRequest"] | components["schemas"]["HeicConvertTaskRequest"] | components["schemas"]["DeleteByTagTaskRequest"] | components["schemas"]["DeleteSelectedTaskRequest"] | components["schemas"]["TagPipelineTaskRequest"] | components["schemas"]["VllmTagTaskRequest"] | components["schemas"]["DatasetAugmentationTaskRequest"] | components["schemas"]["TrainingTaskRequest"];
         DanbooruCount: {
             /** Format: int64 */
             count: number;
@@ -747,6 +1495,41 @@ export interface components {
         };
         /** @enum {string} */
         DatabaseHealthState: "ok";
+        DatasetAugmentationTaskOptions: {
+            excluded_media_ids?: string[] | null;
+            horizontal_flip?: boolean | null;
+            /** Format: int32 */
+            jpeg_quality?: number | null;
+            library_query?: string | null;
+            media_ids?: string[] | null;
+            /** Format: int32 */
+            min_long_side?: number | null;
+            /** Format: double */
+            min_megapixels?: number | null;
+            /** Format: int32 */
+            min_short_side?: number | null;
+            output_directory?: string | null;
+            relative_directory?: string | null;
+            retagging?: null | components["schemas"]["DerivedRetaggingTaskOptions"];
+            smart_crop?: null | components["schemas"]["SmartCropTaskOptions"];
+            /** Format: int32 */
+            test_percent?: number | null;
+            /** Format: int32 */
+            train_percent?: number | null;
+            /** Format: int32 */
+            validation_percent?: number | null;
+        };
+        DatasetAugmentationTaskRequest: {
+            options: components["schemas"]["DatasetAugmentationTaskOptions"];
+            root_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "dataset_augmentation";
+        };
+        /** @enum {string} */
+        DatasetAugmentationTaskType: "dataset_augmentation";
         DeleteByTagTaskOptions: {
             preflight?: boolean | null;
             relative_directory?: string | null;
@@ -763,6 +1546,21 @@ export interface components {
         };
         /** @enum {string} */
         DeleteByTagTaskType: "delete_by_tag";
+        DeleteSelectedTaskRequest: {
+            options: components["schemas"]["MediaIdsTaskOptions"];
+            root_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "delete_selected";
+        };
+        /** @enum {string} */
+        DeleteSelectedTaskType: "delete_selected";
+        DerivedRetaggingTaskOptions: {
+            preserve_artist_character_tags?: boolean | null;
+            send_to_vllm?: boolean | null;
+        };
         DownloadHistoryPage: {
             items: components["schemas"]["DownloadHistoryRecord"][];
             next_cursor?: string | null;
@@ -880,7 +1678,29 @@ export interface components {
             items: components["schemas"]["LocalMedia"][];
             next_cursor?: string | null;
             /** Format: int64 */
+            page: number;
+            resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
+            score_ranges: components["schemas"]["LibraryScoreRange"][];
+            /** Format: int64 */
             total: number;
+            /** Format: int64 */
+            total_pages: number;
+        };
+        LibraryResolutionRange: {
+            /** Format: int64 */
+            count: number;
+            /** Format: int64 */
+            resolution_max: number;
+            /** Format: int64 */
+            resolution_min: number;
+        };
+        LibraryScoreRange: {
+            /** Format: int64 */
+            count: number;
+            /** Format: int64 */
+            score_max: number;
+            /** Format: int64 */
+            score_min: number;
         };
         LocalMedia: {
             created_at: string;
@@ -902,6 +1722,141 @@ export interface components {
             /** Format: int32 */
             width?: number | null;
         };
+        LoraSvdAnalysisFileRequest: {
+            label?: string | null;
+            path: string;
+        };
+        LoraSvdAnalysisRequest: {
+            /** @description Currently only `auto` is accepted. */
+            device: string;
+            files: components["schemas"]["LoraSvdAnalysisFileRequest"][];
+            runtime_profile_id: string;
+        };
+        LoraSvdAnalysisResult: {
+            comparison?: null | components["schemas"]["LoraSvdComparison"];
+            execution: components["schemas"]["LoraSvdExecution"];
+            /** Format: int64 */
+            expires_at: number;
+            id: string;
+            reports: components["schemas"]["LoraSvdModelReport"][];
+        };
+        LoraSvdComparison: {
+            checkpoints: components["schemas"]["LoraSvdComparisonCheckpoint"][];
+            comparable: boolean;
+            reason: string;
+        };
+        LoraSvdComparisonCheckpoint: {
+            effective_rank: components["schemas"]["LoraSvdThresholdRanks"];
+            id: string;
+            label: string;
+            /** Format: double */
+            rank_utilization: number;
+            /** Format: int64 */
+            step?: number | null;
+            /** Format: double */
+            tail_energy_20: number;
+        };
+        LoraSvdCoverage: {
+            /** Format: int64 */
+            analyzed_modules: number;
+            /** Format: int64 */
+            candidate_modules: number;
+            /** Format: int64 */
+            unsupported_modules: number;
+        };
+        LoraSvdExcludedModule: {
+            id: string;
+            reason: string;
+        };
+        LoraSvdExecution: {
+            device: string;
+            /** Format: int64 */
+            duration_ms: number;
+            fallback: boolean;
+            reason: string;
+            selection_reason?: string | null;
+        };
+        LoraSvdModelReport: {
+            architecture: string;
+            coverage: components["schemas"]["LoraSvdCoverage"];
+            /** Format: double */
+            current_rank_energy: number;
+            effective_rank: components["schemas"]["LoraSvdThresholdRanks"];
+            excluded: components["schemas"]["LoraSvdExcludedModule"][];
+            /** Format: int64 */
+            file_size_bytes: number;
+            format: string;
+            global_cumulative_energy: number[];
+            /**
+             * Format: int64
+             * @description Full point count before the initial response is reduced for interactive rendering.
+             */
+            global_cumulative_energy_count?: number | null;
+            global_singular_values: number[];
+            /**
+             * Format: int64
+             * @description Full point count before the initial response is reduced for interactive rendering.
+             */
+            global_singular_values_count?: number | null;
+            id: string;
+            label: string;
+            metadata: {
+                [key: string]: string;
+            };
+            /** Format: int64 */
+            modified_at: number;
+            modules: components["schemas"]["LoraSvdModule"][];
+            path: string;
+            rank_distribution: components["schemas"]["LoraSvdRankDistribution"];
+            sha256: string;
+            /** Format: int64 */
+            step?: number | null;
+            /** @description Whether a standard LoRA factor-pair QR-SVD is mathematically applicable. */
+            svd_applicable: boolean;
+            /** Format: double */
+            tail_energy_20: number;
+            verdict: string;
+            verdict_message: string;
+        };
+        LoraSvdModule: {
+            /** Format: double */
+            alpha: number;
+            component: string;
+            effective_rank: components["schemas"]["LoraSvdThresholdRanks"];
+            /** Format: double */
+            energy: number;
+            flag?: string | null;
+            id: string;
+            /** Format: int64 */
+            numerical_rank: number;
+            /** Format: int64 */
+            rank: number;
+            /** Format: double */
+            scale: number;
+            /** @description Returned from the module detail/export endpoints; omitted from the initial summary. */
+            singular_values?: number[] | null;
+            /** Format: double */
+            stable_rank: number;
+            /** Format: double */
+            tail_energy_20: number;
+        };
+        LoraSvdRankDistribution: {
+            /** Format: int64 */
+            maximum: number;
+            /** Format: int64 */
+            minimum: number;
+            /** Format: int64 */
+            modal: number;
+            uniform: boolean;
+        };
+        LoraSvdThresholdRanks: {
+            /** Format: int64 */
+            energy_95: number;
+            /** Format: int64 */
+            energy_99: number;
+            /** Format: int64 */
+            energy_999: number;
+        };
         MediaDirectory: {
             relative_path: string;
         };
@@ -910,6 +1865,8 @@ export interface components {
             truncated: boolean;
         };
         MediaIdsTaskOptions: {
+            excluded_media_ids?: string[] | null;
+            library_query?: string | null;
             media_ids?: string[] | null;
             relative_directory?: string | null;
         };
@@ -968,6 +1925,8 @@ export interface components {
             size_bytes: number;
         };
         ResizeTaskOptions: {
+            excluded_media_ids?: string[] | null;
+            library_query?: string | null;
             /** Format: int32 */
             max_size?: number | null;
             media_ids?: string[] | null;
@@ -1003,10 +1962,23 @@ export interface components {
         };
         /** @enum {string} */
         SecretStorage: "system" | "session" | "none";
+        SmartCropTaskOptions: {
+            enabled?: boolean | null;
+            full_body_tight?: boolean | null;
+            gpu_id?: string | null;
+            /** Format: int32 */
+            max_derived_per_family?: number | null;
+            portrait?: boolean | null;
+            quality_profile?: string | null;
+            runtime_profile_id?: string | null;
+            upper_body?: boolean | null;
+        };
         /** @enum {string} */
         TagCategory: "general" | "artist" | "copyright" | "character" | "meta" | "query";
         TagPipelineTaskOptions: {
             artist_prefix?: null | components["schemas"]["ArtistPrefix"];
+            excluded_media_ids?: string[] | null;
+            library_query?: string | null;
             media_ids?: string[] | null;
             relative_directory?: string | null;
         };
@@ -1045,7 +2017,7 @@ export interface components {
             task_id: string;
         };
         /** @enum {string} */
-        TaskEventType: "created" | "updated";
+        TaskEventType: "created" | "updated" | "deleted";
         TaskFailure: {
             code: string;
             item_id?: string | null;
@@ -1082,7 +2054,7 @@ export interface components {
         /** @enum {string} */
         TaskItemStatus: "queued" | "completed" | "skipped" | "failed";
         /** @enum {string} */
-        TaskKind: "download" | "index_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "tag_pipeline" | "vllm_tag";
+        TaskKind: "download" | "index_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training";
         TaskPreview: {
             candidates?: components["schemas"]["TaskPreviewCandidate"][] | null;
             pairs?: components["schemas"]["NearDuplicatePair"][] | null;
@@ -1127,8 +2099,281 @@ export interface components {
             revision: number;
             status: components["schemas"]["TaskStatus"];
             title: string;
+            training?: null | components["schemas"]["TrainingTaskSummary"];
             updated_at: string;
         };
+        TrainingAdapterField: {
+            advanced: boolean;
+            choices: string[];
+            default: unknown;
+            group: string;
+            help: string;
+            key: string;
+            kind: string;
+            label: string;
+            required: boolean;
+        };
+        TrainingAdapterGroup: {
+            description: string;
+            id: string;
+            label: string;
+        };
+        TrainingAdapterResponse: {
+            family: string;
+            family_label: string;
+            fields: components["schemas"]["TrainingAdapterField"][];
+            groups: components["schemas"]["TrainingAdapterGroup"][];
+            id: string;
+            label: string;
+            trainer: string;
+            training_type: string;
+            training_type_label: string;
+            version: string;
+        };
+        TrainingArtifact: {
+            id: string;
+            kind: string;
+            /** Format: int64 */
+            modified_at: number;
+            name: string;
+            path: string;
+            /** Format: int64 */
+            size_bytes: number;
+            /** Format: int64 */
+            step?: number | null;
+            url: string;
+        };
+        TrainingArtifactsResponse: {
+            artifacts: components["schemas"]["TrainingArtifact"][];
+        };
+        TrainingCleanupPath: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            file_count: number;
+            kind: string;
+            path: string;
+            reason?: string | null;
+        };
+        TrainingCleanupPreviewResponse: {
+            deletable: components["schemas"]["TrainingCleanupPath"][];
+            retained: components["schemas"]["TrainingCleanupPath"][];
+        };
+        TrainingCleanupResponse: {
+            deleted: components["schemas"]["TrainingCleanupPath"][];
+            retained: components["schemas"]["TrainingCleanupPath"][];
+            task_id: string;
+        };
+        TrainingGalleryDataset: {
+            caption_extension?: string | null;
+            relative_directory: string;
+            /** Format: int32 */
+            repeats: number;
+            root_id: string;
+        };
+        TrainingGalleryDatasetResponse: {
+            /** Format: int64 */
+            caption_count: number;
+            caption_extension: string;
+            /** Format: int64 */
+            effective_image_count: number;
+            /** Format: int64 */
+            image_count: number;
+            image_dir: string;
+            relative_directory: string;
+            /** Format: int32 */
+            repeats: number;
+            root_id: string;
+            root_name: string;
+        };
+        TrainingGpu: {
+            external_processes: components["schemas"]["TrainingGpuExternalProcess"][];
+            /** Format: int64 */
+            fan_speed_percent?: number | null;
+            /** Format: int64 */
+            graphics_clock_mhz?: number | null;
+            id: string;
+            /** Format: int64 */
+            memory_clock_mhz?: number | null;
+            /** Format: int64 */
+            memory_total_mib: number;
+            /** Format: int64 */
+            memory_used_mib: number;
+            name: string;
+            /** Format: double */
+            power_draw_w?: number | null;
+            /** Format: double */
+            power_limit_w?: number | null;
+            /** Format: int64 */
+            temperature_c?: number | null;
+            /** Format: int64 */
+            utilization_percent: number;
+        };
+        TrainingGpuExternalProcess: {
+            /** Format: int64 */
+            memory_used_mib: number;
+            /** Format: int64 */
+            pid: number;
+            process_name: string;
+        };
+        TrainingLogsResponse: {
+            text: string;
+        };
+        TrainingMetric: {
+            series: string;
+            /** Format: int64 */
+            step: number;
+            /** Format: int64 */
+            timestamp: number;
+            /** Format: double */
+            value: number;
+        };
+        TrainingMetricSeriesSummary: {
+            /** Format: int64 */
+            count: number;
+            first: components["schemas"]["TrainingMetric"];
+            latest: components["schemas"]["TrainingMetric"];
+            maximum: components["schemas"]["TrainingMetric"];
+            minimum: components["schemas"]["TrainingMetric"];
+            series: string;
+        };
+        TrainingMetricsOverviewResponse: {
+            /** Format: int64 */
+            cursor: number;
+            series: components["schemas"]["TrainingMetricSeriesSummary"][];
+        };
+        TrainingMetricsResponse: {
+            /** Format: int64 */
+            cursor: number;
+            metrics: components["schemas"]["TrainingMetric"][];
+        };
+        TrainingPathBrowserResponse: {
+            current_path: string;
+            directories: components["schemas"]["TrainingPathEntry"][];
+            files: components["schemas"]["TrainingPathEntry"][];
+            parent_path?: string | null;
+        };
+        TrainingPathEntry: {
+            name: string;
+            path: string;
+        };
+        TrainingPresetExportResponse: {
+            name: string;
+            toml: string;
+        };
+        TrainingPresetImportRequest: {
+            adapter_id?: string | null;
+            gpu_ids?: string[] | null;
+            name: string;
+            runtime_profile_id?: string | null;
+            toml: string;
+        };
+        TrainingPresetInput: {
+            name: string;
+            training: components["schemas"]["TrainingRunRequest"];
+        };
+        TrainingPresetResponse: {
+            /** Format: int64 */
+            created_at: number;
+            id: string;
+            name: string;
+            training: components["schemas"]["TrainingRunRequest"];
+            /** Format: int64 */
+            updated_at: number;
+            version_count: number;
+        };
+        TrainingPreviewRequest: {
+            adapter_id: string;
+            parameters: unknown;
+        };
+        TrainingPreviewResponse: {
+            toml: string;
+        };
+        TrainingQueueEntry: {
+            adapter_id: string;
+            assigned_gpu_ids: string[];
+            blocked_gpu_ids: string[];
+            blocking_task_ids: string[];
+            /** Format: int64 */
+            estimated_wait_seconds?: number | null;
+            gpu_ids: string[];
+            /** Format: int64 */
+            queue_position?: number | null;
+            runtime_profile_id: string;
+            status: string;
+            task_id: string;
+            wait_reason?: string | null;
+        };
+        TrainingQueueResponse: {
+            entries: components["schemas"]["TrainingQueueEntry"][];
+        };
+        TrainingRunRequest: {
+            adapter_id: string;
+            gallery_dataset?: null | components["schemas"]["TrainingGalleryDataset"];
+            gallery_datasets: components["schemas"]["TrainingGalleryDataset"][];
+            gpu_ids: string[];
+            parameters: unknown;
+            runtime_profile_id: string;
+            sample?: null | components["schemas"]["TrainingSampleSettings"];
+        };
+        TrainingRuntimeCheck: {
+            detail: string;
+            id: string;
+            ok: boolean;
+        };
+        TrainingRuntimeDiagnostics: {
+            checks: components["schemas"]["TrainingRuntimeCheck"][];
+            profile: components["schemas"]["TrainingRuntimeProfile"];
+        };
+        TrainingRuntimeProfile: {
+            id: string;
+            installed: boolean;
+            installing: boolean;
+            kind: string;
+            label: string;
+            last_error?: string | null;
+            managed: boolean;
+            python_path: string;
+            runtime_root: string;
+        };
+        /** @enum {string} */
+        TrainingSamplePromptSource: "manual" | "dataset_captions";
+        TrainingSampleSettings: {
+            /** Format: int32 */
+            dataset_caption_count: number;
+            enabled: boolean;
+            /** Format: int32 */
+            every_n_epochs: number;
+            /** Format: int32 */
+            height: number;
+            negative_prompt: string;
+            prompt: string;
+            prompt_source: components["schemas"]["TrainingSamplePromptSource"];
+            /** Format: int32 */
+            steps: number;
+            /** Format: int32 */
+            width: number;
+        };
+        TrainingTaskRequest: {
+            root_id: string;
+            training: components["schemas"]["TrainingRunRequest"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "training";
+        };
+        TrainingTaskSummary: {
+            adapter_id: string;
+            gpu_ids: string[];
+            model_path?: string | null;
+            output_dir?: string | null;
+            output_name?: string | null;
+            runtime_profile_id: string;
+            train_data_dir?: string | null;
+        };
+        /** @enum {string} */
+        TrainingTaskType: "training";
         /** @enum {string} */
         UgoiraPolicy: "webm_and_zip" | "webm_only" | "zip_only";
         UpdateConfigRequest: {
@@ -1150,6 +2395,18 @@ export interface components {
             vllm_tag_mode: components["schemas"]["VllmTagMode"];
             vllm_verify_danbooru: boolean;
         };
+        VisionCropRuntimeHealth: {
+            gpu_id: string;
+            gpu_name?: string | null;
+            installing: boolean;
+            last_error?: string | null;
+            message: string;
+            models_ready: boolean;
+            providers: string[];
+            python_path: string;
+            ready: boolean;
+            runtime_profile_id: string;
+        };
         VllmHealthStatus: {
             available: boolean;
             message: string;
@@ -1157,6 +2414,10 @@ export interface components {
         };
         /** @enum {string} */
         VllmLanguage: "zh" | "en" | "danbooru";
+        VllmLoadStatus: {
+            message: string;
+            state: string;
+        };
         /** @enum {string} */
         VllmTagMode: "overwrite" | "append";
         VllmTagTaskRequest: {
@@ -1448,6 +2709,13 @@ export interface operations {
                 root_id: string;
                 q?: string;
                 cursor?: string;
+                page?: number;
+                score_min?: number;
+                score_max?: number;
+                min_resolution?: number;
+                resolution_min?: number;
+                resolution_max?: number;
+                directory?: string;
                 limit?: number;
             };
             header?: never;
@@ -2008,6 +3276,787 @@ export interface operations {
             };
         };
     };
+    training_adapters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_Vec_TrainingAdapterResponse"];
+                };
+            };
+        };
+    };
+    training_gallery_dataset: {
+        parameters: {
+            query: {
+                root_id: string;
+                relative_directory?: string;
+                repeats: number;
+                caption_extension?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingGalleryDatasetResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_gpus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_Vec_TrainingGpu"];
+                };
+            };
+        };
+    };
+    create_lora_svd_analysis: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoraSvdAnalysisRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_LoraSvdAnalysisResult"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    export_lora_svd_analysis: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_LoraSvdAnalysisResult"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    lora_svd_module: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                module_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_LoraSvdModule"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_path_browser: {
+        parameters: {
+            query: {
+                kind: string;
+                path?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPathBrowserResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    list_training_presets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_Vec_TrainingPresetResponse"];
+                };
+            };
+        };
+    };
+    create_training_preset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPresetInput"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPresetResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    import_training_preset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPresetImportRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPresetResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    update_training_preset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPresetInput"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPresetResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    export_training_preset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPresetExportResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    update_training_preset_from_toml: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPresetImportRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPresetResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_preview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingPreviewRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPreviewResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_queue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingQueueResponse"];
+                };
+            };
+        };
+    };
+    training_runtime_profiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_Vec_TrainingRuntimeProfile"];
+                };
+            };
+        };
+    };
+    training_runtime_diagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingRuntimeDiagnostics"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    install_training_runtime: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingRuntimeProfile"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    delete_training_task: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingCleanupResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_artifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingArtifactsResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_artifact_file: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                artifact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_cleanup_preview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingCleanupPreviewResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_events: {
+        parameters: {
+            query?: {
+                after?: number;
+            };
+            header?: {
+                "Last-Event-ID"?: number | null;
+            };
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+        };
+    };
+    training_logs: {
+        parameters: {
+            query?: {
+                tail?: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingLogsResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    training_metrics: {
+        parameters: {
+            query: {
+                series: string[];
+                max_points?: number;
+                from_step?: number;
+                to_step?: number;
+                from_timestamp?: number;
+                to_timestamp?: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingMetricsResponse"];
+                };
+            };
+        };
+    };
+    training_metrics_overview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingMetricsOverviewResponse"];
+                };
+            };
+        };
+    };
+    vision_crop_runtime_health: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_VisionCropRuntimeHealth"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    install_vision_crop_runtime: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_VisionCropRuntimeHealth"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
     vllm_health: {
         parameters: {
             query?: never;
@@ -2026,6 +4075,41 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    vllm_load: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_VllmLoadStatus"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

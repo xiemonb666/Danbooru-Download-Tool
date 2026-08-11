@@ -1,23 +1,35 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, type Component } from 'vue'
-import { ArchiveRestore, Bot, FileCheck2, FileImage, Images, ScanSearch, Tags, Trash2 } from '@lucide/vue'
+import { ArchiveRestore, Bot, FileCode2, FileCheck2, FileImage, Images, ScanSearch, Tags, Trash2, WandSparkles } from '@lucide/vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import {
   createTask,
+  exportTrainingPreset,
   getMediaDirectories,
   getMediaRoots,
   getQuarantine,
+  getTrainingAdapters,
+  getTrainingPresets,
+  getTrainingRuntimeProfiles,
+  getVisionCropRuntimeHealth,
+  importTrainingPreset,
+  installVisionCropRuntime,
   purgeQuarantine,
   restoreQuarantine,
+  updateTrainingPresetToml,
   type MediaRoot,
   type QuarantineEntry,
   type RootTaskRequest,
+  type TrainingAdapter,
+  type TrainingPreset,
+  type TrainingRuntimeProfile,
+  type VisionCropRuntimeHealth,
 } from '../api'
 import { useTasksStore } from '../stores/tasks'
 import { useToastStore } from '../stores/toast'
 
 interface ToolDefinition {
-  type: RootTaskRequest['type']
+  type: Exclude<RootTaskRequest['type'], 'delete_selected'>
   title: string
   description: string
   action: string
@@ -34,11 +46,13 @@ const definitions: ToolDefinition[] = [
   { type: 'delete_by_tag', title: '按标签隔离', description: '规范化标签 token 后精确匹配，将匹配项移入可恢复隔离区。', action: '配置任务', icon: Trash2, preflight: true },
   { type: 'tag_pipeline', title: '标签处理', description: '恢复分类排序、过滤和 artist:/@ 前缀规则，预检后原子替换。', action: '配置任务', icon: Tags, preflight: true },
   { type: 'vllm_tag', title: '视觉模型打标', description: '可按相对目录批量打标；语言、提示词、联网校验和并发由设置控制。', action: '配置任务', icon: Bot, preflight: false },
+  { type: 'dataset_augmentation', title: '数据集增广', description: '创建独立训练数据集：原图不覆盖、严格不拉伸、按 family 防泄漏切分，并输出 JSONL metadata。', action: '配置任务', icon: WandSparkles, preflight: false },
 ]
 
 const roots = ref<MediaRoot[]>([])
 const rootId = ref('')
 const quarantine = ref<QuarantineEntry[]>([])
+const quarantinePage = ref(1)
 const loading = ref(false)
 const creating = ref(false)
 const selectedTool = ref<ToolDefinition | null>(null)
@@ -53,12 +67,46 @@ const directoryLoadError = ref(false)
 const manualDirectory = ref(false)
 const resizeMaxSize = ref(1216)
 const resizeQuality = ref(90)
+const datasetOutputDirectory = ref('dataset-expanded')
+const datasetMinMegapixels = ref(1.8)
+const datasetMinLongSide = ref(1536)
+const datasetMinShortSide = ref(768)
+const datasetHorizontalFlip = ref(false)
+const datasetTrainPercent = ref(90)
+const datasetValidationPercent = ref(5)
+const datasetTestPercent = ref(5)
+const datasetSmartCropEnabled = ref(true)
+const datasetSmartCropRuntimeProfileId = ref('conda:lora')
+const datasetSmartCropGpuId = ref('0')
+const datasetSmartCropPortrait = ref(true)
+const datasetSmartCropUpperBody = ref(true)
+const datasetSmartCropFullBody = ref(true)
+const datasetRetagWithVllm = ref(false)
+const datasetPreserveArtistCharacterTags = ref(true)
+const visionCropHealth = ref<VisionCropRuntimeHealth | null>(null)
+const visionCropBusy = ref(false)
 const artistPrefix = ref<'artist' | 'at'>('artist')
+const trainingAdapters = ref<TrainingAdapter[]>([])
+const trainingProfiles = ref<TrainingRuntimeProfile[]>([])
+const trainingPresets = ref<TrainingPreset[]>([])
+const trainingPresetId = ref('')
+const trainingPresetName = ref('')
+const trainingPresetAdapterId = ref('sdxl-lora')
+const trainingPresetRuntimeProfileId = ref('windows')
+const trainingPresetToml = ref('')
+const trainingPresetLoading = ref(false)
 const tasks = useTasksStore()
 const toast = useToastStore()
-const boundedSelectionTasks = new Set<RootTaskRequest['type']>(['resize', 'heic_convert', 'tag_pipeline', 'vllm_tag'])
+const boundedSelectionTasks = new Set<RootTaskRequest['type']>(['resize', 'heic_convert', 'tag_pipeline', 'vllm_tag', 'dataset_augmentation'])
 
 const activeRoot = computed(() => roots.value.find((root) => root.id === rootId.value) ?? null)
+const selectedTrainingPreset = computed(() => trainingPresets.value.find((preset) => preset.id === trainingPresetId.value))
+const QUARANTINE_PAGE_SIZE = 50
+const quarantinePageCount = computed(() => Math.max(1, Math.ceil(quarantine.value.length / QUARANTINE_PAGE_SIZE)))
+const visibleQuarantine = computed(() => {
+  const start = (quarantinePage.value - 1) * QUARANTINE_PAGE_SIZE
+  return quarantine.value.slice(start, start + QUARANTINE_PAGE_SIZE)
+})
 
 function formatDirectory(path: string): string {
   return path.split('/').join(' / ')
@@ -89,16 +137,116 @@ async function changeRoot(): Promise<void> {
 async function loadQuarantine(): Promise<void> {
   if (!rootId.value) {
     quarantine.value = []
+    quarantinePage.value = 1
     return
   }
   loading.value = true
   try {
     quarantine.value = await getQuarantine(rootId.value)
+    quarantinePage.value = 1
   } catch (reason: unknown) {
     toast.error('无法读取隔离区', reason instanceof Error ? reason.message : '未知错误')
   } finally {
     loading.value = false
   }
+}
+
+async function refreshTrainingPresetTools(): Promise<void> {
+  try {
+    const [adapters, profiles, presets] = await Promise.all([
+      getTrainingAdapters(),
+      getTrainingRuntimeProfiles(),
+      getTrainingPresets(),
+    ])
+    trainingAdapters.value = adapters
+    trainingProfiles.value = profiles
+    trainingPresets.value = presets
+    if (!adapters.some((adapter) => adapter.id === trainingPresetAdapterId.value)) trainingPresetAdapterId.value = adapters[0]?.id ?? ''
+    if (!profiles.some((profile) => profile.id === trainingPresetRuntimeProfileId.value)) trainingPresetRuntimeProfileId.value = profiles[0]?.id ?? ''
+  } catch (reason: unknown) {
+    toast.error('无法读取训练预设', reason instanceof Error ? reason.message : '请检查本地训练服务')
+  }
+}
+
+async function selectTrainingPreset(): Promise<void> {
+  const preset = selectedTrainingPreset.value
+  if (!preset) {
+    trainingPresetName.value = ''
+    trainingPresetToml.value = ''
+    return
+  }
+  trainingPresetName.value = preset.name
+  trainingPresetAdapterId.value = preset.training.adapter_id
+  trainingPresetRuntimeProfileId.value = preset.training.runtime_profile_id
+  trainingPresetLoading.value = true
+  try {
+    trainingPresetToml.value = (await exportTrainingPreset(preset.id)).toml
+  } catch (reason: unknown) {
+    toast.error('无法读取预设 TOML', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    trainingPresetLoading.value = false
+  }
+}
+
+async function downloadTrainingPresetToml(): Promise<void> {
+  const preset = selectedTrainingPreset.value
+  if (!preset) return
+  trainingPresetLoading.value = true
+  try {
+    const exported = await exportTrainingPreset(preset.id)
+    const blob = new Blob([exported.toml], { type: 'application/toml;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${exported.name.replace(/[\\/:*?"<>|]/g, '_') || 'lora-preset'}.toml`
+    anchor.click()
+    URL.revokeObjectURL(url)
+    toast.success('已导出 Lora-scripts TOML')
+  } catch (reason: unknown) {
+    toast.error('无法导出预设', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    trainingPresetLoading.value = false
+  }
+}
+
+async function saveTrainingPresetToml(): Promise<void> {
+  const name = trainingPresetName.value.trim()
+  if (!name) {
+    toast.warning('请输入预设名称')
+    return
+  }
+  if (!trainingPresetToml.value.trim()) {
+    toast.warning('请粘贴或读取 Lora-scripts TOML')
+    return
+  }
+  trainingPresetLoading.value = true
+  try {
+    const input = {
+      name,
+      adapter_id: trainingPresetAdapterId.value,
+      runtime_profile_id: trainingPresetRuntimeProfileId.value,
+      gpu_ids: selectedTrainingPreset.value?.training.gpu_ids ?? [],
+      toml: trainingPresetToml.value,
+    }
+    const preset = selectedTrainingPreset.value
+      ? await updateTrainingPresetToml(selectedTrainingPreset.value.id, input)
+      : await importTrainingPreset(input)
+    trainingPresetId.value = preset.id
+    await refreshTrainingPresetTools()
+    toast.success(preset.version_count > 1 ? '预设已保存为新版本' : '已导入训练预设', `当前保留 ${preset.version_count} 个版本。`)
+  } catch (reason: unknown) {
+    toast.error('无法保存训练预设', reason instanceof Error ? reason.message : '请确认 TOML 与所选模型适配器匹配')
+  } finally {
+    trainingPresetLoading.value = false
+  }
+}
+
+function openTrainingWithPreset(): void {
+  if (!trainingPresetId.value) {
+    toast.warning('请先选择一个训练预设')
+    return
+  }
+  window.location.assign(`/training?tab=setup&preset=${encodeURIComponent(trainingPresetId.value)}`)
 }
 
 function chooseTool(tool: ToolDefinition): void {
@@ -107,6 +255,31 @@ function chooseTool(tool: ToolDefinition): void {
     return
   }
   selectedTool.value = tool
+}
+
+async function checkVisionCropRuntime(): Promise<void> {
+  visionCropBusy.value = true
+  try {
+    visionCropHealth.value = await getVisionCropRuntimeHealth(datasetSmartCropRuntimeProfileId.value)
+    if (!visionCropHealth.value.ready) toast.warning('智能裁剪运行时未就绪', visionCropHealth.value.message)
+  } catch (reason: unknown) {
+    visionCropHealth.value = null
+    toast.error('无法检查智能裁剪运行时', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    visionCropBusy.value = false
+  }
+}
+
+async function installVisionCropModels(): Promise<void> {
+  visionCropBusy.value = true
+  try {
+    visionCropHealth.value = await installVisionCropRuntime(datasetSmartCropRuntimeProfileId.value)
+    toast.success('已开始安装并预热检测模型', '完成后请点击“检查运行时”确认 GPU 与模型状态。')
+  } catch (reason: unknown) {
+    toast.error('无法安装智能裁剪模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    visionCropBusy.value = false
+  }
 }
 
 async function createSelectedTask(): Promise<void> {
@@ -135,6 +308,36 @@ async function createSelectedTask(): Promise<void> {
     request = { type: kind, root_id: rootId.value, options: { relative_directory, max_size: resizeMaxSize.value, quality: resizeQuality.value } }
   } else if (kind === 'heic_convert' || kind === 'vllm_tag') {
     request = { type: kind, root_id: rootId.value, options: { relative_directory } }
+  } else if (kind === 'dataset_augmentation') {
+    request = {
+      type: kind,
+      root_id: rootId.value,
+      options: {
+        relative_directory,
+        output_directory: datasetOutputDirectory.value.trim(),
+        min_megapixels: datasetMinMegapixels.value,
+        min_long_side: datasetMinLongSide.value,
+        min_short_side: datasetMinShortSide.value,
+        horizontal_flip: datasetHorizontalFlip.value,
+        train_percent: datasetTrainPercent.value,
+        validation_percent: datasetValidationPercent.value,
+        test_percent: datasetTestPercent.value,
+        smart_crop: {
+          enabled: datasetSmartCropEnabled.value,
+          runtime_profile_id: datasetSmartCropRuntimeProfileId.value.trim(),
+          gpu_id: datasetSmartCropGpuId.value.trim(),
+          quality_profile: 'anime-quality',
+          portrait: datasetSmartCropPortrait.value,
+          upper_body: datasetSmartCropUpperBody.value,
+          full_body_tight: datasetSmartCropFullBody.value,
+          max_derived_per_family: 3,
+        },
+        retagging: {
+          send_to_vllm: datasetRetagWithVllm.value,
+          preserve_artist_character_tags: datasetPreserveArtistCharacterTags.value,
+        },
+      },
+    }
   } else {
     request = { type: kind, root_id: rootId.value, options: { relative_directory, artist_prefix: artistPrefix.value } }
   }
@@ -154,6 +357,7 @@ async function restore(entry: QuarantineEntry): Promise<void> {
   try {
     await restoreQuarantine(entry.id)
     quarantine.value = quarantine.value.filter((item) => item.id !== entry.id)
+    quarantinePage.value = Math.min(quarantinePage.value, quarantinePageCount.value)
     toast.success('文件已恢复', '发生路径冲突时服务器不会覆盖现有文件。')
   } catch (reason: unknown) {
     toast.error('无法恢复文件', reason instanceof Error ? reason.message : '未知错误')
@@ -166,6 +370,7 @@ async function purge(): Promise<void> {
   try {
     const result = await purgeQuarantine(rootId.value)
     quarantine.value = []
+    quarantinePage.value = 1
     confirmingPurge.value = false
     toast.success(`已永久清理 ${result.purged} 项`)
   } catch (reason: unknown) {
@@ -187,6 +392,7 @@ onMounted(async () => {
   } catch (reason: unknown) {
     toast.error('工具初始化失败', reason instanceof Error ? reason.message : '未知错误')
   }
+  void refreshTrainingPresetTools()
 })
 </script>
 
@@ -209,7 +415,7 @@ onMounted(async () => {
     </div>
 
     <template v-else>
-      <div class="notice warning" style="margin-bottom: 18px">预检任务不会删除文件。每个工具都可处理整个 {{ activeRoot?.name }}，或递归处理根目录内的相对目录；也可继续在图库中精确勾选媒体。</div>
+      <div class="notice warning" style="margin-bottom: 18px">预检任务不会删除文件。每个工具都可处理整个 {{ activeRoot?.name }}，或递归处理根目录内的相对目录；也可继续在图库中精确勾选媒体。数据集增广始终新建输出目录，不会改写输入图片。</div>
       <section class="tool-grid" aria-label="处理工具">
         <article v-for="tool in definitions" :key="tool.type" class="tool-card">
           <div class="tool-heading"><span><component :is="tool.icon" :size="18" /></span><h2>{{ tool.title }}</h2></div>
@@ -226,15 +432,31 @@ onMounted(async () => {
         <div class="surface-body">
           <div v-if="loading" class="section-copy">正在读取隔离区</div>
           <div v-else-if="quarantine.length" class="stack">
-            <div v-for="entry in quarantine" :key="entry.id" class="root-card">
+            <div v-for="entry in visibleQuarantine" :key="entry.id" class="root-card">
               <div class="root-card-header"><strong>{{ entry.original_relative_path }}</strong><button type="button" class="button button-small" @click="restore(entry)"><ArchiveRestore :size="14" /> 恢复</button></div>
               <div class="path-row"><span>{{ formatBytes(entry.size_bytes) }}</span><code>{{ entry.reason }}</code></div>
             </div>
+            <nav v-if="quarantinePageCount > 1" class="quarantine-pagination" aria-label="隔离区分页"><span>第 {{ quarantinePage }} / {{ quarantinePageCount }} 页 · 共 {{ quarantine.length }} 项</span><div><button type="button" class="button button-small" :disabled="quarantinePage <= 1" @click="quarantinePage -= 1">上一页</button><button type="button" class="button button-small" :disabled="quarantinePage >= quarantinePageCount" @click="quarantinePage += 1">下一页</button></div></nav>
           </div>
           <div v-else class="section-copy">隔离区为空。应用不会自动清空之后加入的内容。</div>
         </div>
       </section>
     </template>
+
+    <section class="surface training-preset-tool" aria-label="训练预设与 TOML">
+      <header>
+        <div><FileCode2 :size="18" /><span><h2 class="section-title">训练预设与 TOML</h2><p class="section-copy">在工具页管理版本化预设、导入或导出 lora-scripts TOML；训练配置页保持专注于本次实验。</p></span></div>
+        <small>{{ trainingPresets.length ? `${trainingPresets.length} 个服务端预设` : '尚未保存预设' }}</small>
+      </header>
+      <div class="training-preset-tool-grid">
+        <label>预设名称<input v-model="trainingPresetName" placeholder="例如：Odette · 1024 · LoCon" /></label>
+        <label>模型适配器<select v-model="trainingPresetAdapterId"><option v-for="adapter in trainingAdapters" :key="adapter.id" :value="adapter.id">{{ adapter.label }} · {{ adapter.version }}</option></select></label>
+        <label>运行时<select v-model="trainingPresetRuntimeProfileId"><option v-for="profile in trainingProfiles" :key="profile.id" :value="profile.id">{{ profile.label }}</option></select></label>
+        <label class="wide">训练预设<select v-model="trainingPresetId" aria-label="训练预设" :disabled="trainingPresetLoading" @change="selectTrainingPreset"><option value="">新建预设</option><option v-for="preset in trainingPresets" :key="preset.id" :value="preset.id">{{ preset.name }} · v{{ preset.version_count }}</option></select></label>
+      </div>
+      <div class="training-preset-tool-actions"><button class="button" type="button" :disabled="!trainingPresetId || trainingPresetLoading" @click="selectTrainingPreset">读取 TOML</button><button class="button" type="button" :disabled="!trainingPresetId || trainingPresetLoading" @click="downloadTrainingPresetToml">导出 TOML</button><button class="button button-primary" type="button" :disabled="!trainingPresetId" @click="openTrainingWithPreset">{{ trainingPresetId ? '在训练中加载' : '选择预设后加载' }}</button></div>
+      <details class="training-preset-toml" open><summary>{{ trainingPresetId ? '编辑 TOML 后保存为新版本' : '导入 lora-scripts TOML 为新预设' }}</summary><textarea v-model="trainingPresetToml" rows="9" aria-label="Lora-scripts TOML" placeholder="粘贴原始 lora-scripts TOML 参数…" /><div><button class="button button-primary" type="button" :disabled="trainingPresetLoading || !trainingPresetToml.trim()" @click="saveTrainingPresetToml">{{ trainingPresetId ? '保存新版本' : '导入并版本化保存' }}</button><small v-if="selectedTrainingPreset">当前预设已保留 {{ selectedTrainingPreset.version_count }} 个版本；保存不会覆盖旧版本。</small></div></details>
+    </section>
 
     <ConfirmDialog
       :open="selectedTool !== null"
@@ -282,6 +504,83 @@ onMounted(async () => {
         <div class="field">
           <label class="field-label" for="resize-quality">JPEG 质量</label>
           <input id="resize-quality" v-model.number="resizeQuality" class="input" type="number" min="1" max="100">
+        </div>
+      </template>
+      <template v-if="selectedTool?.type === 'dataset_augmentation'">
+        <div class="notice" style="margin-top: 12px">输出包含 raw、derived、metadata、splits 与 ready。仅原图及其现有标签会进入 ready 训练目录；所有翻转、裁剪派生图均不复制原标签，会写入 metadata/retagging.jsonl，完成重新打标前绝不会进入训练集。Bucket 只写入 metadata；图片不会为匹配尺寸而拉伸。</div>
+        <div class="notice" style="margin-top: 12px">
+          <strong>智能裁剪</strong> 会在原图保留的前提下，使用本地动漫检测模型生成自然构图；低置信或可能切断主体的候选会被拒绝。
+        </div>
+        <div class="field">
+          <label class="checkbox-row" for="dataset-smart-crop-enabled"><input id="dataset-smart-crop-enabled" v-model="datasetSmartCropEnabled" type="checkbox"> 启用 GPU 动漫智能裁剪（默认）</label>
+          <span class="field-help">使用 dghs-imgutils ONNX 动漫检测、HumanArt/RTMPose 与 ISNet 前景保护；不会回退到 CPU。</span>
+        </div>
+        <div v-if="datasetSmartCropEnabled" class="inline">
+          <div class="field">
+            <label class="field-label" for="dataset-smart-crop-runtime">Python 运行时</label>
+            <select id="dataset-smart-crop-runtime" v-model="datasetSmartCropRuntimeProfileId" class="select">
+              <option value="conda:lora">conda:lora（推荐）</option>
+              <option v-for="profile in trainingProfiles" :key="profile.id" :value="profile.id">{{ profile.label }}</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="dataset-smart-crop-gpu">GPU 编号</label>
+            <input id="dataset-smart-crop-gpu" v-model="datasetSmartCropGpuId" class="input" inputmode="numeric" pattern="[0-9]*">
+          </div>
+        </div>
+        <div v-if="datasetSmartCropEnabled" class="field">
+          <div class="inline">
+            <button class="button button-small" type="button" :disabled="visionCropBusy" @click="checkVisionCropRuntime">检查运行时</button>
+            <button class="button button-small" type="button" :disabled="visionCropBusy" @click="installVisionCropModels">安装并预热检测模型</button>
+          </div>
+          <span v-if="visionCropHealth" class="field-help">
+            {{ visionCropHealth.ready ? `已就绪：${visionCropHealth.gpu_name ?? 'GPU'}；${visionCropHealth.providers.join(', ')}` : visionCropHealth.message }}
+          </span>
+          <span v-else class="field-help">质量档：anime-quality。任务开始前会再次检查 CUDA provider、GPU 可用显存与模型状态。</span>
+        </div>
+        <div class="field">
+          <label class="checkbox-row" for="dataset-smart-crop-portrait"><input id="dataset-smart-crop-portrait" v-model="datasetSmartCropPortrait" type="checkbox"> 生成肖像裁剪</label>
+          <label class="checkbox-row" for="dataset-smart-crop-upper-body"><input id="dataset-smart-crop-upper-body" v-model="datasetSmartCropUpperBody" type="checkbox"> 生成上半身裁剪</label>
+          <label class="checkbox-row" for="dataset-smart-crop-full-body"><input id="dataset-smart-crop-full-body" v-model="datasetSmartCropFullBody" type="checkbox"> 生成紧凑全身裁剪</label>
+        </div>
+        <div class="field">
+          <label class="checkbox-row" for="dataset-retag-vllm"><input id="dataset-retag-vllm" v-model="datasetRetagWithVllm" type="checkbox"> 增广完成后发送派生图到 vLLM 二次打标</label>
+          <label v-if="datasetRetagWithVllm" class="checkbox-row" for="dataset-retag-identity"><input id="dataset-retag-identity" v-model="datasetPreserveArtistCharacterTags" type="checkbox"> 将原图 artist / character 标签置于新标签最前（逗号分隔）</label>
+          <span class="field-help">未勾选时派生图保持无标签并被排除训练；勾选后只有 vLLM 成功写入的新 Caption 才会加入对应的 ready 子集。</span>
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-output-directory">输出文件夹</label>
+          <input id="dataset-output-directory" v-model="datasetOutputDirectory" class="input" placeholder="例如：dataset-expanded" autocomplete="off">
+          <span class="field-help">相对于媒体库；每次任务会在该目录创建独立的任务子目录。</span>
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-min-megapixels">最小像素数（MP）</label>
+          <input id="dataset-min-megapixels" v-model.number="datasetMinMegapixels" class="input" type="number" min="0.1" max="1000" step="0.1">
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-min-long-side">最小长边像素</label>
+          <input id="dataset-min-long-side" v-model.number="datasetMinLongSide" class="input" type="number" min="1" max="100000">
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-min-short-side">最小原生短边像素</label>
+          <input id="dataset-min-short-side" v-model.number="datasetMinShortSide" class="input" type="number" min="1" max="100000">
+        </div>
+        <div class="field">
+          <label class="checkbox-row" for="dataset-horizontal-flip"><input id="dataset-horizontal-flip" v-model="datasetHorizontalFlip" type="checkbox"> 生成水平翻转副本（需要重新打标）</label>
+        </div>
+        <div class="field-help">派生图保存为无损 PNG，不会因增广重新 JPEG 压缩而损失细节；原图始终以原始文件保留。</div>
+        <div class="field">
+          <label class="field-label" for="dataset-train-percent">训练集比例</label>
+          <input id="dataset-train-percent" v-model.number="datasetTrainPercent" class="input" type="number" min="0" max="100">
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-validation-percent">验证集比例</label>
+          <input id="dataset-validation-percent" v-model.number="datasetValidationPercent" class="input" type="number" min="0" max="100">
+        </div>
+        <div class="field">
+          <label class="field-label" for="dataset-test-percent">测试集比例</label>
+          <input id="dataset-test-percent" v-model.number="datasetTestPercent" class="input" type="number" min="0" max="100">
+          <span class="field-help">三项必须合计 100；同一 family 及 SHA-256 相同来源会始终进入同一个切分。</span>
         </div>
       </template>
       <div v-if="selectedTool?.type === 'tag_pipeline'" class="field">

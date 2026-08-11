@@ -50,6 +50,7 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
   }))
   let online = true
   let createdTask: object | null = null
+  let visibleTasks = [...initialTasks]
   const createdTaskRequests: Array<Record<string, unknown>> = []
   let quarantineEntries = [{
     id: 'q-1', root_id: 'root-1', original_relative_path: 'duplicates/cat.jpg',
@@ -98,12 +99,65 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
         }
         await route.fulfill({ json: { data: createdTask } })
       } else {
-        await route.fulfill({ json: { data: { tasks: createdTask ? [createdTask] : initialTasks, last_event_id: 0 } } })
+        await route.fulfill({ json: { data: { tasks: createdTask ? [createdTask] : visibleTasks, last_event_id: 0 } } })
       }
       return
     }
     if (path === '/api/tasks/events') {
       await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' })
+      return
+    }
+    if (path === '/api/training/adapters') {
+      await route.fulfill({ json: { data: [{ id: 'sdxl-lora', label: 'SDXL LoRA', version: 'fixture', trainer: 'train.py', groups: [], fields: [] }] } })
+      return
+    }
+    if (path === '/api/training/runtime-profiles') {
+      await route.fulfill({ json: { data: [{ id: 'windows', label: 'Windows', kind: 'windows', managed: true, installed: true, installing: false, runtime_root: 'C:/runtime', python_path: 'C:/runtime/python.exe' }] } })
+      return
+    }
+    if (path === '/api/training/gpus') {
+      await route.fulfill({ json: { data: [] } })
+      return
+    }
+    if (path === '/api/training/queue') {
+      await route.fulfill({ json: { data: { entries: [] } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/metrics\/overview$/.test(path)) {
+      await route.fulfill({ json: { data: { cursor: 240, series: [
+        { series: 'loss', count: 3, first: { series: 'loss', step: 1, timestamp: 1_700_000_000, value: 0.9 }, latest: { series: 'loss', step: 3, timestamp: 1_700_000_020, value: 0.6 }, minimum: { series: 'loss', step: 3, timestamp: 1_700_000_020, value: 0.6 }, maximum: { series: 'loss', step: 1, timestamp: 1_700_000_000, value: 0.9 } },
+        { series: 'train.max_steps', count: 1, first: { series: 'train.max_steps', step: 0, timestamp: 1_700_000_000, value: 10 }, latest: { series: 'train.max_steps', step: 0, timestamp: 1_700_000_000, value: 10 }, minimum: { series: 'train.max_steps', step: 0, timestamp: 1_700_000_000, value: 10 }, maximum: { series: 'train.max_steps', step: 0, timestamp: 1_700_000_000, value: 10 } },
+      ] } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/metrics$/.test(path)) {
+      await route.fulfill({ json: { data: { cursor: 240, metrics: [
+        { series: 'loss', step: 1, timestamp: 1_700_000_000, value: 0.9 },
+        { series: 'loss', step: 2, timestamp: 1_700_000_010, value: 0.72 },
+        { series: 'loss', step: 3, timestamp: 1_700_000_020, value: 0.6 },
+      ] } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/events$/.test(path)) {
+      await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/artifacts$/.test(path)) {
+      await route.fulfill({ json: { data: { artifacts: [] } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/logs$/.test(path)) {
+      await route.fulfill({ json: { data: { text: 'fixture training log' } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+\/cleanup-preview$/.test(path)) {
+      await route.fulfill({ json: { data: { deletable: [{ kind: 'owned_output', path: 'C:/outputs/training-1', file_count: 4, bytes: 4096 }], retained: [] } } })
+      return
+    }
+    if (/^\/api\/training\/tasks\/[^/]+$/.test(path) && route.request().method() === 'DELETE') {
+      const id = path.split('/').slice(-1)[0]
+      visibleTasks = visibleTasks.filter((task) => (task as { id?: string }).id !== id)
+      await route.fulfill({ json: { data: { task_id: id, deleted: [{ kind: 'owned_output', path: 'C:/outputs/training-1', file_count: 4, bytes: 4096 }], retained: [] } } })
       return
     }
     if (path === '/api/library/roots') {
@@ -274,18 +328,21 @@ test('legacy-style tag conditions enqueue a bounded batch download', async ({ pa
   await page.getByLabel('最大下载数量').fill('250')
   await page.getByRole('checkbox', { name: /评分优先排序/ }).check()
   await page.getByLabel('库内文件夹').selectOption('项目/角色图')
-  await expect(page.getByText('cat_ears solo -animated -lowres score:>=15 order:score')).toBeVisible()
+  // Priorities are applied locally by the downloader so broad Danbooru queries do
+  // not depend on the expensive remote `order:score` metatag.
+  await expect(page.getByText('cat_ears solo -animated -lowres score:>=15')).toBeVisible()
 
   await page.getByRole('button', { name: '开始批量下载' }).click()
 
   await expect.poll(() => backend.createdTaskRequests.length).toBe(1)
   expect(backend.createdTaskRequests[0]).toMatchObject({
     type: 'download',
-    source: { type: 'query', query: 'cat_ears solo -animated -lowres score:>=15 order:score' },
+    source: { type: 'query', query: 'cat_ears solo -animated -lowres score:>=15' },
     root_id: 'root-1',
     relative_directory: '项目/角色图',
     limit: 250,
     skip_existing: true,
+    prioritize_score: true,
   })
 })
 
@@ -374,4 +431,34 @@ test('two concurrent tasks remain independently visible', async ({ page }) => {
   await expect(page.getByText('下载 landscape')).toBeVisible()
   await expect(page.getByText('下载 character')).toBeVisible()
   await expect(page.getByText('500.0 KB/s')).toHaveCount(2)
+})
+
+test('training monitor renders Canvas curves without overflow and permanently removes a completed run after preview', async ({ page }) => {
+  const browserErrors: string[] = []
+  page.on('pageerror', (error) => browserErrors.push(error.message))
+  await mockApi(page, { initialTasks: [{
+    id: 'training-1', kind: 'training', status: 'completed', revision: 3, title: 'Odette LoRA',
+    progress: { completed: 10, total: 10, bytes_downloaded: 0, speed_bytes_per_sec: 0 }, failures: [],
+    created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T01:00:00Z',
+    training: { adapter_id: 'sdxl-lora', output_name: 'odette', gpu_ids: ['0'] },
+  }] })
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await page.goto('/training?tab=monitor')
+
+  await expect(page.getByText('研究摘要')).toBeVisible()
+  await expect(page.locator('.training-echarts-canvas canvas')).toHaveCount(1)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  const smoothing = page.getByLabel('曲线平滑程度')
+  await smoothing.evaluate((element) => {
+    const input = element as HTMLInputElement
+    input.value = '100'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await expect(page.getByText('100%', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '删除当前运行' }).click()
+  await expect(page.getByRole('dialog', { name: '永久删除训练运行' })).toBeVisible()
+  await expect(page.getByText('C:/outputs/training-1')).toBeVisible()
+  await page.getByRole('button', { name: '永久删除' }).click()
+  await expect(page.getByText('尚无训练记录。创建训练任务后，实时指标会出现在这里。')).toBeVisible()
+  expect(browserErrors).toEqual([])
 })

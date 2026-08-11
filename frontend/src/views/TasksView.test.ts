@@ -9,8 +9,9 @@ const mocks = vi.hoisted(() => ({
   getDownloadHistory: vi.fn(),
   getTaskDetails: vi.fn(),
   createTask: vi.fn(),
+  scrollTo: vi.fn(),
   taskStatus: 'awaiting_confirmation',
-  taskKind: 'exact_dedup' as 'exact_dedup' | 'near_dedup' | 'download' | 'resize' | 'vllm_tag',
+  taskKind: 'exact_dedup' as 'exact_dedup' | 'near_dedup' | 'download' | 'resize' | 'vllm_tag' | 'dataset_augmentation',
   taskRevision: 3,
 }))
 
@@ -53,6 +54,8 @@ describe('TasksView destructive preflight', () => {
     mocks.taskKind = 'exact_dedup'
     mocks.taskRevision = 3
     mocks.getTaskDetails.mockReset()
+    mocks.scrollTo.mockReset()
+    vi.unstubAllGlobals()
   })
 
   it('shows the candidate list and requires a second confirmation before applying it', async () => {
@@ -184,6 +187,30 @@ describe('TasksView destructive preflight', () => {
     expect(view.getByText('1024 × 683')).toBeVisible()
   })
 
+  it('shows dataset output and family-split counts for an augmentation task', async () => {
+    mocks.taskKind = 'dataset_augmentation'
+    mocks.taskStatus = 'completed'
+    mocks.getTaskDetails.mockResolvedValue({
+      task: { id: 'task-1' },
+      result: {
+        generated: 120,
+        rejected: 3,
+        derived_relative_directory: 'dataset-expanded/task-1/derived',
+      },
+      item_counts: { total: 0, queued: 0, completed: 0, skipped: 0, failed: 0, retryable_failed: 0 },
+      items: [],
+    })
+    const view = render(TasksView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await fireEvent.click(view.getByRole('button', { name: '查看详情' }))
+
+    expect(await view.findByText('已生成 120 项')).toBeVisible()
+    expect(view.getByText('已拒绝 3 项')).toBeVisible()
+    expect(view.getByText('训练目录 dataset-expanded/task-1/derived')).toBeVisible()
+  })
+
   it('shows and paginates complete failure items for a non-download task', async () => {
     mocks.taskKind = 'resize'
     mocks.taskStatus = 'failed'
@@ -223,6 +250,7 @@ describe('TasksView destructive preflight', () => {
   })
 
   it('replaces the current item page when following the next cursor', async () => {
+    vi.stubGlobal('scrollTo', mocks.scrollTo)
     mocks.taskKind = 'download'
     mocks.taskStatus = 'completed'
     const counts = { total: 51, queued: 0, completed: 51, skipped: 0, failed: 0, retryable_failed: 0 }
@@ -244,6 +272,7 @@ describe('TasksView destructive preflight', () => {
     expect(await view.findByText('Post #1')).toBeVisible()
     await fireEvent.click(view.getByRole('button', { name: '下一页' }))
 
+    expect(mocks.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' })
     expect(mocks.getTaskDetails).toHaveBeenLastCalledWith(
       'task-1', { itemCursor: 'page-2', itemLimit: 50 }, expect.any(AbortSignal),
     )

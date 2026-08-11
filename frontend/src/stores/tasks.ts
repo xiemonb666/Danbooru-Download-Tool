@@ -1,6 +1,9 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { getTasks, taskAction, type TaskEvent, type TaskStatus, type TaskSummary } from '../api'
+
+const ACTIVE_TASK_SNAPSHOT_INTERVAL_MS = 5_000
+const TASK_PROGRESS_FLUSH_INTERVAL_MS = 250
 
 function isTaskEvent(value: unknown): value is TaskEvent {
   if (typeof value !== 'object' || value === null) return false
@@ -9,7 +12,7 @@ function isTaskEvent(value: unknown): value is TaskEvent {
   return typeof Reflect.get(value, 'sequence') === 'number'
     && typeof Reflect.get(value, 'task_id') === 'string'
     && typeof Reflect.get(value, 'revision') === 'number'
-    && (eventType === 'created' || eventType === 'updated')
+    && (eventType === 'created' || eventType === 'updated' || eventType === 'deleted')
     && typeof task === 'object'
     && task !== null
 }
@@ -23,22 +26,52 @@ export const useTasksStore = defineStore('tasks', () => {
   let source: EventSource | null = null
   let syncing: Promise<void> | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let snapshotTimer: ReturnType<typeof setInterval> | null = null
+  let progressTimer: ReturnType<typeof setTimeout> | null = null
   let shouldConnect = false
+  const pendingProgressEvents = new Map<string, TaskEvent>()
 
   const activeCount = computed(() => tasks.value.filter((task) =>
     ['queued', 'running', 'pausing', 'paused', 'cancelling', 'awaiting_confirmation'].includes(task.status),
   ).length)
 
+  function updateSnapshotPolling(): void {
+    const shouldPoll = shouldConnect && activeCount.value > 0
+    if (shouldPoll && snapshotTimer === null) {
+      snapshotTimer = setInterval(() => { void loadSnapshot(true) }, ACTIVE_TASK_SNAPSHOT_INTERVAL_MS)
+    } else if (!shouldPoll && snapshotTimer !== null) {
+      clearInterval(snapshotTimer)
+      snapshotTimer = null
+    }
+  }
+
+  watch(activeCount, updateSnapshotPolling, { flush: 'sync' })
+
   function sortedTasks(): TaskSummary[] {
     return [...tasks.value].sort((a, b) => b.updated_at.localeCompare(a.updated_at))
   }
 
-  function loadSnapshot(): Promise<void> {
+  function mergeSnapshot(snapshotTasks: TaskSummary[]): TaskSummary[] {
+    const currentTasks = new Map(tasks.value.map((task) => [task.id, task]))
+    const snapshotIds = new Set(snapshotTasks.map((task) => task.id))
+    const merged = snapshotTasks.map((task) => {
+      const current = currentTasks.get(task.id)
+      return current && current.revision > task.revision ? current : task
+    })
+    for (const task of tasks.value) {
+      if (!snapshotIds.has(task.id)) merged.push(task)
+    }
+    return merged
+  }
+
+  function loadSnapshot(silent = false): Promise<void> {
     if (syncing) return syncing
-    loading.value = true
+    if (!silent) loading.value = true
     syncing = getTasks()
       .then((snapshot) => {
-        tasks.value = snapshot.tasks
+        if (snapshot.last_event_id < lastEventId.value) return
+        pendingProgressEvents.clear()
+        tasks.value = mergeSnapshot(snapshot.tasks)
         lastEventId.value = snapshot.last_event_id
         error.value = null
       })
@@ -48,9 +81,28 @@ export const useTasksStore = defineStore('tasks', () => {
       })
       .finally(() => {
         syncing = null
-        loading.value = false
+        if (!silent) loading.value = false
       })
     return syncing
+  }
+
+  function applyTaskEvent(event: TaskEvent): void {
+    const index = tasks.value.findIndex((task) => task.id === event.task_id)
+    if (index === -1) tasks.value.unshift(event.task)
+    else if (event.revision >= tasks.value[index].revision) tasks.value[index] = event.task
+  }
+
+  function flushProgressEvents(): void {
+    progressTimer = null
+    const events = [...pendingProgressEvents.values()]
+    pendingProgressEvents.clear()
+    for (const event of events) applyTaskEvent(event)
+  }
+
+  function queueProgressEvent(event: TaskEvent): void {
+    pendingProgressEvents.set(event.task_id, event)
+    if (progressTimer !== null) return
+    progressTimer = setTimeout(flushProgressEvents, TASK_PROGRESS_FLUSH_INTERVAL_MS)
   }
 
   function applyEvent(event: TaskEvent): void {
@@ -61,9 +113,17 @@ export const useTasksStore = defineStore('tasks', () => {
       return
     }
     lastEventId.value = event.sequence
-    const index = tasks.value.findIndex((task) => task.id === event.task_id)
-    if (index === -1) tasks.value.unshift(event.task)
-    else if (event.revision >= tasks.value[index].revision) tasks.value[index] = event.task
+    if (event.event_type === 'deleted') {
+      pendingProgressEvents.delete(event.task_id)
+      tasks.value = tasks.value.filter((task) => task.id !== event.task_id)
+      return
+    }
+    if (event.task.status === 'running') {
+      queueProgressEvent(event)
+      return
+    }
+    pendingProgressEvents.delete(event.task_id)
+    applyTaskEvent(event)
   }
 
   function scheduleReconnect(): void {
@@ -76,6 +136,7 @@ export const useTasksStore = defineStore('tasks', () => {
 
   async function connect(): Promise<void> {
     shouldConnect = true
+    updateSnapshotPolling()
     if (source) return
     connection.value = 'connecting'
     await loadSnapshot()
@@ -104,10 +165,14 @@ export const useTasksStore = defineStore('tasks', () => {
 
   function disconnect(): void {
     shouldConnect = false
+    updateSnapshotPolling()
     if (retryTimer) clearTimeout(retryTimer)
     retryTimer = null
     source?.close()
     source = null
+    if (progressTimer) clearTimeout(progressTimer)
+    progressTimer = null
+    pendingProgressEvents.clear()
     connection.value = 'idle'
   }
 

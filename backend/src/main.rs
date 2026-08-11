@@ -8,6 +8,7 @@ mod routes;
 mod secrets;
 mod services;
 mod tasks;
+mod training;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};

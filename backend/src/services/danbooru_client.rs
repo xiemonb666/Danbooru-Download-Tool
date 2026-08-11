@@ -21,6 +21,8 @@ pub const DEFAULT_REQUESTS_PER_SECOND: u32 = 8;
 pub const MAX_POSTS_PER_PAGE: u16 = 200;
 pub const MAX_MEDIA_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_FILENAME_TEMPLATE: &str = "{id}_score_{score}.{ext}";
+const MAX_RATE_LIMIT_RETRIES: usize = 4;
+const MAX_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
 pub const SUPPORTED_MEDIA_EXTENSIONS: &[&str] =
     &["jpg", "png", "webp", "gif", "avif", "mp4", "webm"];
 
@@ -139,8 +141,14 @@ impl fmt::Debug for DanbooruClientConfig {
 
 #[derive(Debug)]
 struct RateLimiter {
-    next_request: Mutex<Instant>,
+    state: Mutex<RateLimiterState>,
     interval: Duration,
+}
+
+#[derive(Debug)]
+struct RateLimiterState {
+    next_request: Instant,
+    cooldown_until: Instant,
 }
 
 impl RateLimiter {
@@ -153,23 +161,42 @@ impl RateLimiter {
             ));
         }
         Ok(Self {
-            next_request: Mutex::new(Instant::now()),
+            state: Mutex::new(RateLimiterState {
+                next_request: Instant::now(),
+                cooldown_until: Instant::now(),
+            }),
             interval: Duration::from_secs_f64(1.0 / f64::from(requests_per_second)),
         })
     }
 
     async fn acquire(&self) {
-        let scheduled = {
-            let mut next = self.next_request.lock().await;
+        loop {
+            let scheduled = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let scheduled = state.next_request.max(state.cooldown_until).max(now);
+                state.next_request = scheduled + self.interval;
+                scheduled
+            };
             let now = Instant::now();
-            let scheduled = (*next).max(now);
-            *next = scheduled + self.interval;
-            scheduled
-        };
-        let now = Instant::now();
-        if scheduled > now {
-            sleep(scheduled - now).await;
+            if scheduled > now {
+                sleep(scheduled - now).await;
+            }
+            let cooldown_active = {
+                let state = self.state.lock().await;
+                state.cooldown_until > Instant::now()
+            };
+            if !cooldown_active {
+                return;
+            }
         }
+    }
+
+    async fn defer(&self, delay: Duration) {
+        let deadline = Instant::now() + delay;
+        let mut state = self.state.lock().await;
+        state.cooldown_until = state.cooldown_until.max(deadline);
+        state.next_request = state.next_request.max(state.cooldown_until);
     }
 }
 
@@ -965,7 +992,7 @@ impl DanbooruClient {
         url.query_pairs_mut()
             .extend_pairs(params.iter().map(|(key, value)| (key, value)));
 
-        let mut retried_rate_limit = false;
+        let mut rate_limit_retries = 0;
         loop {
             self.rate_limiter.acquire().await;
             let mut request = self.client.get(url.clone());
@@ -981,11 +1008,14 @@ impl DanbooruClient {
                 )
                 .with_status(response.status()));
             }
-            if response.status() == StatusCode::TOO_MANY_REQUESTS && !retried_rate_limit {
-                let delay = retry_after(&response).unwrap_or(Duration::from_secs(1));
-                if delay <= Duration::from_secs(60) {
-                    retried_rate_limit = true;
-                    sleep(delay).await;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+            {
+                if let Some(delay) =
+                    rate_limit_retry_delay(retry_after(&response), rate_limit_retries)
+                {
+                    rate_limit_retries += 1;
+                    self.rate_limiter.defer(delay).await;
                     continue;
                 }
             }
@@ -1037,7 +1067,7 @@ impl DanbooruClient {
     ) -> Result<Response, DanbooruError> {
         const MAX_REDIRECTS: usize = 5;
         let mut redirect_count = 0;
-        let mut retried_rate_limit = false;
+        let mut rate_limit_retries = 0;
         loop {
             self.validate_media_url(url.as_str())?;
             self.rate_limiter.acquire().await;
@@ -1046,11 +1076,14 @@ impl DanbooruClient {
                 request = request.header(RANGE, range);
             }
             let response = request.send().await.map_err(network_error)?;
-            if response.status() == StatusCode::TOO_MANY_REQUESTS && !retried_rate_limit {
-                let delay = retry_after(&response).unwrap_or(Duration::from_secs(1));
-                if delay <= Duration::from_secs(60) {
-                    retried_rate_limit = true;
-                    sleep(delay).await;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+            {
+                if let Some(delay) =
+                    rate_limit_retry_delay(retry_after(&response), rate_limit_retries)
+                {
+                    rate_limit_retries += 1;
+                    self.rate_limiter.defer(delay).await;
                     continue;
                 }
             }
@@ -1094,7 +1127,6 @@ impl DanbooruClient {
             })?;
             self.validate_media_url(url.as_str())?;
             redirect_count += 1;
-            retried_rate_limit = false;
         }
     }
 }
@@ -1197,6 +1229,12 @@ fn retry_after(response: &Response) -> Option<Duration> {
             .duration_since(SystemTime::now())
             .unwrap_or_default()
     })
+}
+
+fn rate_limit_retry_delay(retry_after: Option<Duration>, retry_count: usize) -> Option<Duration> {
+    let fallback_seconds = 1_u64 << retry_count.min(5);
+    let delay = retry_after.unwrap_or(Duration::from_secs(fallback_seconds));
+    (delay <= MAX_RATE_LIMIT_RETRY_DELAY).then_some(delay)
 }
 
 fn map_status(status: StatusCode, retry_after: Option<Duration>) -> DanbooruError {
@@ -2070,6 +2108,24 @@ mod tests {
         Json(Vec::<Post>::new()).into_response()
     }
 
+    async fn rate_limited_post_three_times(
+        State(counter): State<Arc<AtomicUsize>>,
+    ) -> AxumResponse {
+        if counter.fetch_add(1, Ordering::SeqCst) < 3 {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(RETRY_AFTER, "0")],
+                "slow down",
+            )
+                .into_response();
+        }
+        Json(Post {
+            id: 11_778_514,
+            ..Post::default()
+        })
+        .into_response()
+    }
+
     async fn serve_oversized_json() -> AxumResponse {
         let padding = "x".repeat(8 * 1024 * 1024);
         axum::http::Response::builder()
@@ -2447,6 +2503,27 @@ mod tests {
 
         assert!(page.posts.is_empty());
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn post_request_retries_transient_rate_limits_until_it_succeeds() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/posts/11778514.json", get(rate_limited_post_three_times))
+            .with_state(counter.clone());
+        let (base_url, server) = spawn_server(router).await;
+        let client = DanbooruClient::new(DanbooruClientConfig {
+            base_url,
+            requests_per_second: 1_000,
+            ..DanbooruClientConfig::default()
+        })
+        .unwrap();
+
+        let post = client.post(11_778_514).await.unwrap();
+
+        assert_eq!(post.id, 11_778_514);
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
         server.abort();
     }
 

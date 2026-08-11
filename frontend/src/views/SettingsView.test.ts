@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   deleteMediaRoot: vi.fn(),
   deleteSecret: vi.fn(),
   getMediaRoots: vi.fn(),
+  loadVllmModel: vi.fn(),
   getMediaDirectories: vi.fn(),
   createMediaDirectory: vi.fn(),
   saveSecret: vi.fn(),
@@ -25,6 +26,7 @@ vi.mock('../api', () => ({
   deleteMediaRoot: mocks.deleteMediaRoot,
   deleteSecret: mocks.deleteSecret,
   getMediaRoots: mocks.getMediaRoots,
+  loadVllmModel: mocks.loadVllmModel,
   getMediaDirectories: mocks.getMediaDirectories,
   createMediaDirectory: mocks.createMediaDirectory,
   saveSecret: mocks.saveSecret,
@@ -62,7 +64,13 @@ vi.mock('../stores/config', () => ({
 }))
 
 vi.mock('../stores/health', () => ({
-  useHealthStore: () => ({ status: 'online', message: '本地服务正常', check: mocks.healthCheck }),
+  useHealthStore: () => ({
+    status: 'online',
+    message: '本地服务正常',
+    vllmStatus: 'offline',
+    vllmMessage: 'vLLM 未加载',
+    check: mocks.healthCheck,
+  }),
 }))
 
 vi.mock('../stores/toast', () => ({
@@ -193,6 +201,18 @@ describe('SettingsView media root mapping', () => {
 
     expect(verify.closest('label')).toHaveClass('setting-check')
     expect(reference.closest('label')).toHaveClass('setting-check')
+  })
+
+  it('saves the selected vLLM settings and requests model loading on demand', async () => {
+    mocks.loadVllmModel.mockResolvedValue({ state: 'started', message: '模型正在加载' })
+    const view = render(SettingsView)
+
+    await fireEvent.click(await view.findByRole('button', { name: '加载 vLLM 模型' }))
+
+    await vi.waitFor(() => expect(mocks.loadVllmModel).toHaveBeenCalledOnce())
+    expect(mocks.saveConfig).toHaveBeenCalledOnce()
+    expect(mocks.success).toHaveBeenCalledWith('模型正在加载')
+    expect(mocks.healthCheck).toHaveBeenCalledOnce()
   })
 
   it('lets the user disable sensitive-media blur and persists the choice', async () => {

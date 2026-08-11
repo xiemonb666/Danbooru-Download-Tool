@@ -12,7 +12,9 @@ export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-8888}"
 export DATA_DIR="${DATA_DIR:-$ROOT_DIR}"
 export STATIC_DIR="${STATIC_DIR:-$FRONTEND_DIR/dist}"
-START_VLLM="${START_VLLM:-1}"
+# The application starts without allocating GPU memory.  Set START_VLLM=1 only
+# for unattended launches; normal interactive loading is done from Settings.
+START_VLLM="${START_VLLM:-0}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_PID_FILE="${VLLM_PID_FILE:-$DATA_DIR/vllm.pid}"
 VLLM_LOG_DIR="${VLLM_LOG_DIR:-$DATA_DIR/logs}"
@@ -103,8 +105,8 @@ command -v npm    &>/dev/null || err "npm not found"
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); const supported = (major === 20 && minor >= 19) || (major >= 22 && (major > 22 || minor >= 12)); process.exit(supported ? 0 : 1)' \
     || err "Node.js 20.19+ or 22.12+ is required"
 
-# Start model loading while the application builds. The health indicator will
-# become green when /v1/models is ready.
+# START_VLLM defaults to 0 so opening the application never starts a model.
+# It remains available for unattended launches through START_VLLM=1.
 start_vllm_background
 
 # ── Frontend ────────────────────────────────────────────────────────────────

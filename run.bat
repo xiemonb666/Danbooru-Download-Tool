@@ -11,7 +11,9 @@ if not defined HOST set "HOST=127.0.0.1"
 if not defined PORT set "PORT=8888"
 if not defined DATA_DIR set "DATA_DIR=%ROOT_DIR%"
 if not defined STATIC_DIR set "STATIC_DIR=%FRONTEND_DIR%\dist"
-if not defined START_VLLM set "START_VLLM=1"
+rem The application starts without allocating GPU memory. Set START_VLLM=1 only
+rem for unattended launches; normal interactive loading is done from Settings.
+if not defined START_VLLM set "START_VLLM=0"
 if not defined VLLM_PORT set "VLLM_PORT=8000"
 set "VLLM_PREFERRED_PORT=%VLLM_PORT%"
 set "VLLM_STATE_FILE=%ROOT_DIR%logs\vllm.state.json"

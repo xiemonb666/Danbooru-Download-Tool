@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use utoipa::{OpenApi, ToSchema};
 
@@ -52,6 +52,12 @@ pub struct HealthStatus {
 pub struct VllmHealthStatus {
     pub available: bool,
     pub models: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VllmLoadStatus {
+    pub state: String,
     pub message: String,
 }
 
@@ -215,6 +221,24 @@ pub struct LibraryPage {
     pub items: Vec<LocalMedia>,
     pub next_cursor: Option<String>,
     pub total: u64,
+    pub page: u64,
+    pub total_pages: u64,
+    pub score_ranges: Vec<LibraryScoreRange>,
+    pub resolution_ranges: Vec<LibraryResolutionRange>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LibraryScoreRange {
+    pub score_min: i64,
+    pub score_max: i64,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LibraryResolutionRange {
+    pub resolution_min: i64,
+    pub resolution_max: i64,
+    pub count: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -244,8 +268,11 @@ pub enum TaskKind {
     Resize,
     HeicConvert,
     DeleteByTag,
+    DeleteSelected,
     TagPipeline,
     VllmTag,
+    DatasetAugmentation,
+    Training,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -312,6 +339,7 @@ pub struct TaskSummary {
     pub progress: TaskProgress,
     pub failures: Vec<TaskFailure>,
     pub preview: Option<TaskPreview>,
+    pub training: Option<TrainingTaskSummary>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -327,6 +355,7 @@ pub struct TaskSnapshot {
 pub enum TaskEventType {
     Created,
     Updated,
+    Deleted,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -441,13 +470,18 @@ literal_task_type!(NearDedupTaskType, NearDedup);
 literal_task_type!(ResizeTaskType, Resize);
 literal_task_type!(HeicConvertTaskType, HeicConvert);
 literal_task_type!(DeleteByTagTaskType, DeleteByTag);
+literal_task_type!(DeleteSelectedTaskType, DeleteSelected);
 literal_task_type!(TagPipelineTaskType, TagPipeline);
 literal_task_type!(VllmTagTaskType, VllmTag);
+literal_task_type!(DatasetAugmentationTaskType, DatasetAugmentation);
+literal_task_type!(TrainingTaskType, Training);
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MediaIdsTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
+    pub library_query: Option<String>,
+    pub excluded_media_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -460,6 +494,8 @@ pub struct PreflightTaskOptions {
 pub struct ResizeTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
+    pub library_query: Option<String>,
+    pub excluded_media_ids: Option<Vec<String>>,
     pub max_size: Option<u32>,
     pub quality: Option<u8>,
 }
@@ -489,7 +525,46 @@ pub enum ArtistPrefix {
 pub struct TagPipelineTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
+    pub library_query: Option<String>,
+    pub excluded_media_ids: Option<Vec<String>>,
     pub artist_prefix: Option<ArtistPrefix>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DatasetAugmentationTaskOptions {
+    pub media_ids: Option<Vec<String>>,
+    pub relative_directory: Option<String>,
+    pub library_query: Option<String>,
+    pub excluded_media_ids: Option<Vec<String>>,
+    pub output_directory: Option<String>,
+    pub min_megapixels: Option<f64>,
+    pub min_long_side: Option<u32>,
+    pub min_short_side: Option<u32>,
+    pub horizontal_flip: Option<bool>,
+    pub train_percent: Option<u8>,
+    pub validation_percent: Option<u8>,
+    pub test_percent: Option<u8>,
+    pub jpeg_quality: Option<u8>,
+    pub smart_crop: Option<SmartCropTaskOptions>,
+    pub retagging: Option<DerivedRetaggingTaskOptions>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SmartCropTaskOptions {
+    pub enabled: Option<bool>,
+    pub runtime_profile_id: Option<String>,
+    pub gpu_id: Option<String>,
+    pub quality_profile: Option<String>,
+    pub portrait: Option<bool>,
+    pub upper_body: Option<bool>,
+    pub full_body_tight: Option<bool>,
+    pub max_derived_per_family: Option<u8>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DerivedRetaggingTaskOptions {
+    pub send_to_vllm: Option<bool>,
+    pub preserve_artist_character_tags: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -548,6 +623,14 @@ pub struct DeleteByTagTaskRequest {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteSelectedTaskRequest {
+    #[serde(rename = "type")]
+    pub task_type: DeleteSelectedTaskType,
+    pub root_id: String,
+    pub options: MediaIdsTaskOptions,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TagPipelineTaskRequest {
     #[serde(rename = "type")]
     pub task_type: TagPipelineTaskType,
@@ -564,6 +647,457 @@ pub struct VllmTagTaskRequest {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct DatasetAugmentationTaskRequest {
+    #[serde(rename = "type")]
+    pub task_type: DatasetAugmentationTaskType,
+    pub root_id: String,
+    pub options: DatasetAugmentationTaskOptions,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingGalleryDataset {
+    pub root_id: String,
+    pub relative_directory: String,
+    pub repeats: u32,
+    pub caption_extension: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingSamplePromptSource {
+    Manual,
+    DatasetCaptions,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingSampleSettings {
+    pub enabled: bool,
+    pub prompt_source: TrainingSamplePromptSource,
+    pub prompt: String,
+    pub negative_prompt: String,
+    pub dataset_caption_count: u32,
+    pub steps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub every_n_epochs: u32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingRunRequest {
+    pub adapter_id: String,
+    pub runtime_profile_id: String,
+    pub parameters: Value,
+    pub gpu_ids: Vec<String>,
+    pub gallery_dataset: Option<TrainingGalleryDataset>,
+    pub gallery_datasets: Vec<TrainingGalleryDataset>,
+    pub sample: Option<TrainingSampleSettings>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingTaskRequest {
+    #[serde(rename = "type")]
+    pub task_type: TrainingTaskType,
+    pub root_id: String,
+    pub training: TrainingRunRequest,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingTaskSummary {
+    pub adapter_id: String,
+    pub runtime_profile_id: String,
+    pub gpu_ids: Vec<String>,
+    pub model_path: Option<String>,
+    pub train_data_dir: Option<String>,
+    pub output_dir: Option<String>,
+    pub output_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingAdapterField {
+    pub key: String,
+    pub label: String,
+    pub group: String,
+    pub kind: String,
+    pub default: Value,
+    pub choices: Vec<String>,
+    pub required: bool,
+    pub advanced: bool,
+    pub help: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingAdapterGroup {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingAdapterResponse {
+    pub id: String,
+    pub version: String,
+    pub label: String,
+    pub family: String,
+    pub family_label: String,
+    pub training_type: String,
+    pub training_type_label: String,
+    pub trainer: String,
+    pub fields: Vec<TrainingAdapterField>,
+    pub groups: Vec<TrainingAdapterGroup>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingRuntimeProfile {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub managed: bool,
+    pub installed: bool,
+    pub installing: bool,
+    pub last_error: Option<String>,
+    pub runtime_root: String,
+    pub python_path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingRuntimeCheck {
+    pub id: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingRuntimeDiagnostics {
+    pub profile: TrainingRuntimeProfile,
+    pub checks: Vec<TrainingRuntimeCheck>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VisionCropRuntimeHealth {
+    pub runtime_profile_id: String,
+    pub python_path: String,
+    pub ready: bool,
+    pub installing: bool,
+    pub gpu_id: String,
+    pub providers: Vec<String>,
+    pub gpu_name: Option<String>,
+    pub models_ready: bool,
+    pub message: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingGpuExternalProcess {
+    pub pid: u64,
+    pub process_name: String,
+    pub memory_used_mib: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingGpu {
+    pub id: String,
+    pub name: String,
+    pub memory_total_mib: u64,
+    pub memory_used_mib: u64,
+    pub utilization_percent: u64,
+    pub graphics_clock_mhz: Option<u64>,
+    pub memory_clock_mhz: Option<u64>,
+    pub power_draw_w: Option<f64>,
+    pub power_limit_w: Option<f64>,
+    pub temperature_c: Option<u64>,
+    pub fan_speed_percent: Option<u64>,
+    pub external_processes: Vec<TrainingGpuExternalProcess>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingMetric {
+    pub step: u64,
+    pub timestamp: u64,
+    pub series: String,
+    pub value: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingMetricsResponse {
+    pub metrics: Vec<TrainingMetric>,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingMetricSeriesSummary {
+    pub series: String,
+    pub count: u64,
+    pub first: TrainingMetric,
+    pub latest: TrainingMetric,
+    pub minimum: TrainingMetric,
+    pub maximum: TrainingMetric,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingMetricsOverviewResponse {
+    pub cursor: u64,
+    pub series: Vec<TrainingMetricSeriesSummary>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingCleanupPath {
+    pub kind: String,
+    pub path: String,
+    pub file_count: u64,
+    pub bytes: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingCleanupPreviewResponse {
+    pub deletable: Vec<TrainingCleanupPath>,
+    pub retained: Vec<TrainingCleanupPath>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingCleanupResponse {
+    pub task_id: String,
+    pub deleted: Vec<TrainingCleanupPath>,
+    pub retained: Vec<TrainingCleanupPath>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingLogsResponse {
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingQueueEntry {
+    pub task_id: String,
+    pub status: String,
+    pub adapter_id: String,
+    pub runtime_profile_id: String,
+    pub gpu_ids: Vec<String>,
+    pub assigned_gpu_ids: Vec<String>,
+    pub queue_position: Option<u64>,
+    pub blocking_task_ids: Vec<String>,
+    pub blocked_gpu_ids: Vec<String>,
+    pub estimated_wait_seconds: Option<u64>,
+    pub wait_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingQueueResponse {
+    pub entries: Vec<TrainingQueueEntry>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingGalleryDatasetResponse {
+    pub root_id: String,
+    pub root_name: String,
+    pub relative_directory: String,
+    pub image_dir: String,
+    pub caption_extension: String,
+    pub image_count: u64,
+    pub caption_count: u64,
+    pub repeats: u32,
+    pub effective_image_count: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPathEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPathBrowserResponse {
+    pub current_path: String,
+    pub parent_path: Option<String>,
+    pub directories: Vec<TrainingPathEntry>,
+    pub files: Vec<TrainingPathEntry>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPresetInput {
+    pub name: String,
+    pub training: TrainingRunRequest,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPresetResponse {
+    pub id: String,
+    pub name: String,
+    pub training: TrainingRunRequest,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version_count: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPresetImportRequest {
+    pub name: String,
+    pub adapter_id: Option<String>,
+    pub runtime_profile_id: Option<String>,
+    pub gpu_ids: Option<Vec<String>>,
+    pub toml: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPresetExportResponse {
+    pub name: String,
+    pub toml: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingArtifact {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_at: u64,
+    pub step: Option<u64>,
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingArtifactsResponse {
+    pub artifacts: Vec<TrainingArtifact>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPreviewRequest {
+    pub adapter_id: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPreviewResponse {
+    pub toml: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdAnalysisFileRequest {
+    pub path: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdAnalysisRequest {
+    pub runtime_profile_id: String,
+    pub files: Vec<LoraSvdAnalysisFileRequest>,
+    /// Currently only `auto` is accepted.
+    pub device: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdThresholdRanks {
+    pub energy_95: u64,
+    pub energy_99: u64,
+    pub energy_999: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdCoverage {
+    pub analyzed_modules: u64,
+    pub candidate_modules: u64,
+    pub unsupported_modules: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdRankDistribution {
+    pub minimum: u64,
+    pub maximum: u64,
+    pub modal: u64,
+    pub uniform: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdExcludedModule {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdModule {
+    pub id: String,
+    pub component: String,
+    pub rank: u64,
+    pub alpha: f64,
+    pub scale: f64,
+    pub numerical_rank: u64,
+    pub stable_rank: f64,
+    pub tail_energy_20: f64,
+    pub effective_rank: LoraSvdThresholdRanks,
+    pub energy: f64,
+    pub flag: Option<String>,
+    /// Returned from the module detail/export endpoints; omitted from the initial summary.
+    pub singular_values: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdModelReport {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    pub file_size_bytes: u64,
+    pub sha256: String,
+    pub modified_at: u64,
+    pub step: Option<u64>,
+    pub architecture: String,
+    pub format: String,
+    /// Whether a standard LoRA factor-pair QR-SVD is mathematically applicable.
+    pub svd_applicable: bool,
+    pub coverage: LoraSvdCoverage,
+    pub rank_distribution: LoraSvdRankDistribution,
+    pub effective_rank: LoraSvdThresholdRanks,
+    pub current_rank_energy: f64,
+    pub tail_energy_20: f64,
+    pub verdict: String,
+    pub verdict_message: String,
+    pub metadata: BTreeMap<String, String>,
+    pub excluded: Vec<LoraSvdExcludedModule>,
+    pub modules: Vec<LoraSvdModule>,
+    /// Full point count before the initial response is reduced for interactive rendering.
+    pub global_singular_values_count: Option<u64>,
+    pub global_singular_values: Vec<f64>,
+    /// Full point count before the initial response is reduced for interactive rendering.
+    pub global_cumulative_energy_count: Option<u64>,
+    pub global_cumulative_energy: Vec<f64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdExecution {
+    pub device: String,
+    pub reason: String,
+    pub selection_reason: Option<String>,
+    pub duration_ms: u64,
+    pub fallback: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdComparisonCheckpoint {
+    pub id: String,
+    pub label: String,
+    pub step: Option<u64>,
+    pub effective_rank: LoraSvdThresholdRanks,
+    pub rank_utilization: f64,
+    pub tail_energy_20: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdComparison {
+    pub comparable: bool,
+    pub reason: String,
+    pub checkpoints: Vec<LoraSvdComparisonCheckpoint>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoraSvdAnalysisResult {
+    pub id: String,
+    pub reports: Vec<LoraSvdModelReport>,
+    pub comparison: Option<LoraSvdComparison>,
+    pub execution: LoraSvdExecution,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
 #[schema(discriminator(
     property_name = "type",
@@ -576,8 +1110,11 @@ pub struct VllmTagTaskRequest {
         ("resize" = "#/components/schemas/ResizeTaskRequest"),
         ("heic_convert" = "#/components/schemas/HeicConvertTaskRequest"),
         ("delete_by_tag" = "#/components/schemas/DeleteByTagTaskRequest"),
+        ("delete_selected" = "#/components/schemas/DeleteSelectedTaskRequest"),
         ("tag_pipeline" = "#/components/schemas/TagPipelineTaskRequest"),
-        ("vllm_tag" = "#/components/schemas/VllmTagTaskRequest")
+        ("vllm_tag" = "#/components/schemas/VllmTagTaskRequest"),
+        ("dataset_augmentation" = "#/components/schemas/DatasetAugmentationTaskRequest"),
+        ("training" = "#/components/schemas/TrainingTaskRequest")
     )
 ))]
 pub enum CreateTaskRequest {
@@ -589,8 +1126,11 @@ pub enum CreateTaskRequest {
     Resize(ResizeTaskRequest),
     HeicConvert(HeicConvertTaskRequest),
     DeleteByTag(DeleteByTagTaskRequest),
+    DeleteSelected(DeleteSelectedTaskRequest),
     TagPipeline(TagPipelineTaskRequest),
     VllmTag(VllmTagTaskRequest),
+    DatasetAugmentation(DatasetAugmentationTaskRequest),
+    Training(TrainingTaskRequest),
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -689,6 +1229,9 @@ mod paths {
     #[utoipa::path(get, path = "/api/vllm/health", responses((status = 200, body = ApiSuccess<VllmHealthStatus>), (status = 400, body = ApiFailure)))]
     pub async fn vllm_health() {}
 
+    #[utoipa::path(post, path = "/api/vllm/load", responses((status = 200, body = ApiSuccess<VllmLoadStatus>), (status = 400, body = ApiFailure), (status = 500, body = ApiFailure)))]
+    pub async fn vllm_load() {}
+
     #[utoipa::path(get, path = "/api/config", responses((status = 200, body = ApiSuccess<AppConfig>)))]
     pub async fn get_config() {}
 
@@ -719,7 +1262,7 @@ mod paths {
     #[utoipa::path(post, path = "/api/library/roots/{id}/directories", request_body = CreateMediaDirectoryRequest, params(("id" = String, Path)), responses((status = 201, body = ApiSuccess<MediaDirectory>), (status = 400, body = ApiFailure), (status = 404, body = ApiFailure)))]
     pub async fn create_root_directory() {}
 
-    #[utoipa::path(get, path = "/api/library/items", params(("root_id" = String, Query), ("q" = Option<String>, Query), ("cursor" = Option<String>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<LibraryPage>), (status = 400, body = ApiFailure)))]
+    #[utoipa::path(get, path = "/api/library/items", params(("root_id" = String, Query), ("q" = Option<String>, Query), ("cursor" = Option<String>, Query), ("page" = Option<usize>, Query), ("score_min" = Option<i64>, Query), ("score_max" = Option<i64>, Query), ("min_resolution" = Option<i64>, Query), ("resolution_min" = Option<i64>, Query), ("resolution_max" = Option<i64>, Query), ("directory" = Option<String>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<LibraryPage>), (status = 400, body = ApiFailure)))]
     pub async fn list_library_items() {}
 
     #[utoipa::path(get, path = "/api/library/items/{id}", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<LocalMedia>), (status = 404, body = ApiFailure)))]
@@ -752,6 +1295,90 @@ mod paths {
     #[utoipa::path(get, path = "/api/tasks/events", params(("after" = Option<u64>, Query), ("Last-Event-ID" = Option<u64>, Header)), responses((status = 200, body = String, content_type = "text/event-stream")))]
     pub async fn task_events() {}
 
+    #[utoipa::path(get, path = "/api/training/adapters", responses((status = 200, body = ApiSuccess<Vec<TrainingAdapterResponse>>)))]
+    pub async fn training_adapters() {}
+
+    #[utoipa::path(get, path = "/api/training/runtime-profiles", responses((status = 200, body = ApiSuccess<Vec<TrainingRuntimeProfile>>)))]
+    pub async fn training_runtime_profiles() {}
+
+    #[utoipa::path(get, path = "/api/training/runtime-profiles/{id}/diagnostics", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingRuntimeDiagnostics>), (status = 400, body = ApiFailure)))]
+    pub async fn training_runtime_diagnostics() {}
+
+    #[utoipa::path(post, path = "/api/training/runtime-profiles/{id}/install", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingRuntimeProfile>), (status = 409, body = ApiFailure)))]
+    pub async fn install_training_runtime() {}
+
+    #[utoipa::path(get, path = "/api/vision-crop/runtime-profiles/{id}/health", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<VisionCropRuntimeHealth>), (status = 400, body = ApiFailure)))]
+    pub async fn vision_crop_runtime_health() {}
+
+    #[utoipa::path(post, path = "/api/vision-crop/runtime-profiles/{id}/install", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<VisionCropRuntimeHealth>), (status = 409, body = ApiFailure)))]
+    pub async fn install_vision_crop_runtime() {}
+
+    #[utoipa::path(get, path = "/api/training/gpus", responses((status = 200, body = ApiSuccess<Vec<TrainingGpu>>)))]
+    pub async fn training_gpus() {}
+
+    #[utoipa::path(get, path = "/api/training/queue", responses((status = 200, body = ApiSuccess<TrainingQueueResponse>)))]
+    pub async fn training_queue() {}
+
+    #[utoipa::path(get, path = "/api/training/datasets/gallery", params(("root_id" = String, Query), ("relative_directory" = Option<String>, Query), ("repeats" = u32, Query), ("caption_extension" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<TrainingGalleryDatasetResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_gallery_dataset() {}
+
+    #[utoipa::path(get, path = "/api/training/paths", params(("kind" = String, Query), ("path" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<TrainingPathBrowserResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_path_browser() {}
+
+    #[utoipa::path(get, path = "/api/training/presets", responses((status = 200, body = ApiSuccess<Vec<TrainingPresetResponse>>)))]
+    pub async fn list_training_presets() {}
+
+    #[utoipa::path(post, path = "/api/training/presets", request_body = TrainingPresetInput, responses((status = 201, body = ApiSuccess<TrainingPresetResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn create_training_preset() {}
+
+    #[utoipa::path(post, path = "/api/training/presets/import", request_body = TrainingPresetImportRequest, responses((status = 201, body = ApiSuccess<TrainingPresetResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn import_training_preset() {}
+
+    #[utoipa::path(put, path = "/api/training/presets/{id}", params(("id" = String, Path)), request_body = TrainingPresetInput, responses((status = 200, body = ApiSuccess<TrainingPresetResponse>), (status = 404, body = ApiFailure)))]
+    pub async fn update_training_preset() {}
+
+    #[utoipa::path(put, path = "/api/training/presets/{id}/toml", params(("id" = String, Path)), request_body = TrainingPresetImportRequest, responses((status = 200, body = ApiSuccess<TrainingPresetResponse>), (status = 400, body = ApiFailure), (status = 404, body = ApiFailure)))]
+    pub async fn update_training_preset_from_toml() {}
+
+    #[utoipa::path(get, path = "/api/training/presets/{id}/export", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingPresetExportResponse>), (status = 404, body = ApiFailure)))]
+    pub async fn export_training_preset() {}
+
+    #[utoipa::path(post, path = "/api/training/preview", request_body = TrainingPreviewRequest, responses((status = 200, body = ApiSuccess<TrainingPreviewResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_preview() {}
+
+    #[utoipa::path(post, path = "/api/training/lora-svd/analyses", request_body = LoraSvdAnalysisRequest, responses((status = 200, body = ApiSuccess<LoraSvdAnalysisResult>), (status = 400, body = ApiFailure)))]
+    pub async fn create_lora_svd_analysis() {}
+
+    #[utoipa::path(get, path = "/api/training/lora-svd/analyses/{id}/modules/{module_id}", params(("id" = String, Path), ("module_id" = String, Path)), responses((status = 200, body = ApiSuccess<LoraSvdModule>), (status = 404, body = ApiFailure)))]
+    pub async fn lora_svd_module() {}
+
+    #[utoipa::path(get, path = "/api/training/lora-svd/analyses/{id}/export", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<LoraSvdAnalysisResult>), (status = 404, body = ApiFailure)))]
+    pub async fn export_lora_svd_analysis() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/logs", params(("id" = String, Path), ("tail" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<TrainingLogsResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_logs() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/metrics", params(("id" = String, Path), ("series" = Vec<String>, Query), ("max_points" = Option<usize>, Query), ("from_step" = Option<u64>, Query), ("to_step" = Option<u64>, Query), ("from_timestamp" = Option<u64>, Query), ("to_timestamp" = Option<u64>, Query)), responses((status = 200, body = ApiSuccess<TrainingMetricsResponse>)))]
+    pub async fn training_metrics() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/metrics/overview", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingMetricsOverviewResponse>)))]
+    pub async fn training_metrics_overview() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/cleanup-preview", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingCleanupPreviewResponse>), (status = 409, body = ApiFailure)))]
+    pub async fn training_cleanup_preview() {}
+
+    #[utoipa::path(delete, path = "/api/training/tasks/{id}", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingCleanupResponse>), (status = 409, body = ApiFailure)))]
+    pub async fn delete_training_task() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/events", params(("id" = String, Path), ("after" = Option<u64>, Query), ("Last-Event-ID" = Option<u64>, Header)), responses((status = 200, body = String, content_type = "text/event-stream")))]
+    pub async fn training_events() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/artifacts", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<TrainingArtifactsResponse>), (status = 404, body = ApiFailure)))]
+    pub async fn training_artifacts() {}
+
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/artifacts/{artifact_id}", params(("id" = String, Path), ("artifact_id" = String, Path)), responses((status = 200, content_type = "application/octet-stream"), (status = 404, body = ApiFailure)))]
+    pub async fn training_artifact_file() {}
+
     #[utoipa::path(get, path = "/api/downloads/history", params(("cursor" = Option<String>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<DownloadHistoryPage>), (status = 400, body = ApiFailure)))]
     pub async fn download_history() {}
 
@@ -777,6 +1404,7 @@ mod paths {
     paths(
         paths::health,
         paths::vllm_health,
+        paths::vllm_load,
         paths::get_config,
         paths::update_config,
         paths::put_secret,
@@ -798,6 +1426,34 @@ mod paths {
         paths::task_detail,
         paths::task_action,
         paths::task_events,
+        paths::training_adapters,
+        paths::training_runtime_profiles,
+        paths::training_runtime_diagnostics,
+        paths::install_training_runtime,
+        paths::vision_crop_runtime_health,
+        paths::install_vision_crop_runtime,
+        paths::training_gpus,
+        paths::training_queue,
+        paths::training_gallery_dataset,
+        paths::training_path_browser,
+        paths::list_training_presets,
+        paths::create_training_preset,
+        paths::import_training_preset,
+        paths::update_training_preset,
+        paths::update_training_preset_from_toml,
+        paths::export_training_preset,
+        paths::training_preview,
+        paths::create_lora_svd_analysis,
+        paths::lora_svd_module,
+        paths::export_lora_svd_analysis,
+        paths::training_logs,
+        paths::training_metrics,
+        paths::training_metrics_overview,
+        paths::training_cleanup_preview,
+        paths::delete_training_task,
+        paths::training_events,
+        paths::training_artifacts,
+        paths::training_artifact_file,
         paths::download_history,
         paths::danbooru_posts,
         paths::danbooru_post,
@@ -817,6 +1473,8 @@ mod paths {
         MediaDirectory,
         LocalMedia,
         LibraryPage,
+        LibraryScoreRange,
+        LibraryResolutionRange,
         QuarantineEntry,
         TaskSummary,
         TaskSnapshot,
@@ -825,6 +1483,58 @@ mod paths {
         TaskItemCounts,
         TaskDetails,
         CreateTaskRequest,
+        DatasetAugmentationTaskRequest,
+        DatasetAugmentationTaskOptions,
+        SmartCropTaskOptions,
+        DerivedRetaggingTaskOptions,
+        TrainingGalleryDataset,
+        TrainingSamplePromptSource,
+        TrainingSampleSettings,
+        TrainingRunRequest,
+        TrainingTaskRequest,
+        TrainingTaskSummary,
+        TrainingAdapterField,
+        TrainingAdapterGroup,
+        TrainingAdapterResponse,
+        TrainingRuntimeProfile,
+        TrainingRuntimeCheck,
+        TrainingRuntimeDiagnostics,
+        VisionCropRuntimeHealth,
+        TrainingGpuExternalProcess,
+        TrainingGpu,
+        TrainingMetric,
+        TrainingMetricsResponse,
+        TrainingMetricSeriesSummary,
+        TrainingMetricsOverviewResponse,
+        TrainingCleanupPath,
+        TrainingCleanupPreviewResponse,
+        TrainingCleanupResponse,
+        TrainingLogsResponse,
+        TrainingQueueEntry,
+        TrainingQueueResponse,
+        TrainingGalleryDatasetResponse,
+        TrainingPathEntry,
+        TrainingPathBrowserResponse,
+        TrainingPresetInput,
+        TrainingPresetResponse,
+        TrainingPresetImportRequest,
+        TrainingPresetExportResponse,
+        TrainingArtifact,
+        TrainingArtifactsResponse,
+        TrainingPreviewRequest,
+        TrainingPreviewResponse,
+        LoraSvdAnalysisFileRequest,
+        LoraSvdAnalysisRequest,
+        LoraSvdThresholdRanks,
+        LoraSvdCoverage,
+        LoraSvdRankDistribution,
+        LoraSvdExcludedModule,
+        LoraSvdModule,
+        LoraSvdModelReport,
+        LoraSvdExecution,
+        LoraSvdComparisonCheckpoint,
+        LoraSvdComparison,
+        LoraSvdAnalysisResult,
         DownloadHistoryRecord,
         DownloadHistoryPage,
         DanbooruPost,
@@ -833,6 +1543,7 @@ mod paths {
         TagSuggestion,
         HealthStatus,
         VllmHealthStatus,
+        VllmLoadStatus,
         ApiFailure,
     ))
 )]
@@ -861,7 +1572,9 @@ mod tests {
     #[test]
     fn exported_contract_covers_every_public_router_operation() {
         let document = document();
-        assert_eq!(document.paths.paths.len(), 22);
+        // Training runtime discovery, diagnostics, installation and live logs
+        // are public API operations and must stay represented in the contract.
+        assert_eq!(document.paths.paths.len(), 50);
         let operation_count = document
             .paths
             .paths
@@ -882,7 +1595,32 @@ mod tests {
                 .count()
             })
             .sum::<usize>();
-        assert_eq!(operation_count, 29);
+        assert_eq!(operation_count, 58);
+        for path in [
+            "/api/training/runtime-profiles",
+            "/api/training/runtime-profiles/{id}/diagnostics",
+            "/api/training/runtime-profiles/{id}/install",
+            "/api/vision-crop/runtime-profiles/{id}/health",
+            "/api/vision-crop/runtime-profiles/{id}/install",
+            "/api/training/queue",
+            "/api/training/datasets/gallery",
+            "/api/training/paths",
+            "/api/training/presets",
+            "/api/training/presets/{id}/toml",
+            "/api/training/lora-svd/analyses",
+            "/api/training/lora-svd/analyses/{id}/modules/{module_id}",
+            "/api/training/lora-svd/analyses/{id}/export",
+            "/api/training/tasks/{id}/logs",
+            "/api/training/tasks/{id}/artifacts",
+            "/api/training/tasks/{id}/metrics/overview",
+            "/api/training/tasks/{id}/cleanup-preview",
+            "/api/training/tasks/{id}",
+        ] {
+            assert!(
+                document.paths.paths.contains_key(path),
+                "缺少 OpenAPI 路径 {path}"
+            );
+        }
     }
 
     #[test]
@@ -930,12 +1668,20 @@ mod tests {
             "#/components/schemas/VllmTagTaskRequest"
         );
         assert_eq!(
+            mapping["dataset_augmentation"],
+            "#/components/schemas/DatasetAugmentationTaskRequest"
+        );
+        assert_eq!(
             schemas["ResizeTaskRequest"]["properties"]["options"]["$ref"],
             "#/components/schemas/ResizeTaskOptions"
         );
         assert_eq!(
             schemas["VllmTagTaskRequest"]["properties"]["options"]["$ref"],
             "#/components/schemas/MediaIdsTaskOptions"
+        );
+        assert_eq!(
+            schemas["DatasetAugmentationTaskRequest"]["properties"]["options"]["$ref"],
+            "#/components/schemas/DatasetAugmentationTaskOptions"
         );
         assert!(schemas.get("RootTaskRequest").is_none());
     }

@@ -6,12 +6,15 @@ const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
   getLibrary: vi.fn(),
   getLibraryItem: vi.fn(),
+  getMediaDirectories: vi.fn(),
   getMediaRoots: vi.fn(),
   loadSnapshot: vi.fn(),
   replace: vi.fn(),
   push: vi.fn(),
+  scrollTo: vi.fn(),
   success: vi.fn(),
   error: vi.fn(),
+  warning: vi.fn(),
   blurSensitiveMedia: true,
 }))
 
@@ -19,6 +22,7 @@ vi.mock('../api', () => ({
   createTask: mocks.createTask,
   getLibrary: mocks.getLibrary,
   getLibraryItem: mocks.getLibraryItem,
+  getMediaDirectories: mocks.getMediaDirectories,
   getMediaRoots: mocks.getMediaRoots,
   libraryMediaUrl: (id: string, variant = 'file') => `/media/${id}/${variant}`,
 }))
@@ -36,7 +40,7 @@ vi.mock('../stores/config', () => ({
 }))
 
 vi.mock('../stores/toast', () => ({
-  useToastStore: () => ({ success: mocks.success, error: mocks.error }),
+  useToastStore: () => ({ success: mocks.success, error: mocks.error, warning: mocks.warning }),
 }))
 
 vi.mock('vue-router', () => ({
@@ -81,26 +85,29 @@ const items = [
 describe('LibraryView batch actions', () => {
   beforeEach(() => {
     mocks.blurSensitiveMedia = true
+    mocks.getLibrary.mockReset()
+    mocks.getMediaDirectories.mockReset()
     mocks.getMediaRoots.mockResolvedValue([root])
+    mocks.getMediaDirectories.mockResolvedValue({ directories: [], truncated: false })
     mocks.getLibrary.mockResolvedValue({ items, total: items.length })
     mocks.getLibraryItem.mockReset()
     mocks.getLibraryItem.mockImplementation(async (id: string) => items.find((item) => item.id === id))
     mocks.error.mockReset()
+    mocks.scrollTo.mockReset()
+    vi.stubGlobal('scrollTo', mocks.scrollTo)
     mocks.createTask.mockResolvedValue(undefined)
     mocks.loadSnapshot.mockResolvedValue(undefined)
   })
 
-  it('selects the current page and creates a resize task from media IDs', async () => {
+  it('creates a resize task from individually selected media IDs', async () => {
     const view = render(LibraryView, {
       global: {
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
       },
     })
 
-    const selectPage = await view.findByRole('checkbox', { name: '全选当前页' })
-    await fireEvent.click(selectPage)
-    expect(view.getByRole('checkbox', { name: '选择 one.jpg' })).toBeChecked()
-    expect(view.getByRole('checkbox', { name: '选择 two.png' })).toBeChecked()
+    await fireEvent.click(await view.findByRole('checkbox', { name: '选择 one.jpg' }))
+    await fireEvent.click(view.getByRole('checkbox', { name: '选择 two.png' }))
 
     await fireEvent.click(view.getByRole('button', { name: '安全缩放所选' }))
 
@@ -108,6 +115,45 @@ describe('LibraryView batch actions', () => {
       type: 'resize',
       root_id: root.id,
       options: { media_ids: ['media-1', 'media-2'], max_size: 1216 },
+    })
+  })
+
+  it('selects every matching library item instead of only the current 60-item page', async () => {
+    mocks.getLibrary.mockResolvedValueOnce({ items, total: 120, next_cursor: 'media-3' })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await fireEvent.click(await view.findByRole('checkbox', { name: '全选搜索结果' }))
+
+    expect(view.getByText('已选择 120 项')).toBeVisible()
+    await fireEvent.click(view.getByRole('button', { name: '安全缩放所选' }))
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'resize',
+      root_id: root.id,
+      options: { library_query: '', excluded_media_ids: [], max_size: 1216 },
+    })
+  })
+
+  it('keeps a selected-search exception when an item is unchecked', async () => {
+    mocks.getLibrary.mockResolvedValueOnce({ items, total: 120, next_cursor: 'media-3' })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await fireEvent.click(await view.findByRole('checkbox', { name: '全选搜索结果' }))
+    await fireEvent.click(view.getByRole('checkbox', { name: '选择 two.png' }))
+
+    expect(view.getByText('已选择 119 项')).toBeVisible()
+    await fireEvent.click(view.getByRole('button', { name: '标签处理所选' }))
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'tag_pipeline',
+      root_id: root.id,
+      options: { library_query: '', excluded_media_ids: ['media-2'] },
     })
   })
 
@@ -144,11 +190,11 @@ describe('LibraryView batch actions', () => {
     })
   })
 
-  it('follows the server library cursor and returns through cursor history', async () => {
+  it('follows numbered pages and returns to the previous page', async () => {
     mocks.getLibrary
-      .mockResolvedValueOnce({ items: [items[0]], total: 2, next_cursor: 'media-2' })
-      .mockResolvedValueOnce({ items: [items[1]], total: 2 })
-      .mockResolvedValueOnce({ items: [items[0]], total: 2, next_cursor: 'media-2' })
+      .mockResolvedValueOnce({ items: [items[0]], total: 2, page: 1, total_pages: 2, score_ranges: [] })
+      .mockResolvedValueOnce({ items: [items[1]], total: 2, page: 2, total_pages: 2, score_ranges: [] })
+      .mockResolvedValueOnce({ items: [items[0]], total: 2, page: 1, total_pages: 2, score_ranges: [] })
     const view = render(LibraryView, {
       global: {
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
@@ -158,15 +204,122 @@ describe('LibraryView batch actions', () => {
 
     await fireEvent.click(view.getByRole('button', { name: '下一页' }))
 
+    expect(mocks.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' })
     expect(mocks.getLibrary).toHaveBeenLastCalledWith({
-      rootId: root.id, query: '', cursor: 'media-2', limit: 60,
+      rootId: root.id, directory: '', query: '', page: 2, limit: 60,
     }, expect.any(AbortSignal))
     expect(await view.findByRole('img', { name: 'two.png' })).toBeVisible()
     await fireEvent.click(view.getByRole('button', { name: '上一页' }))
     expect(mocks.getLibrary).toHaveBeenLastCalledWith({
-      rootId: root.id, query: '', cursor: undefined, limit: 60,
+      rootId: root.id, directory: '', query: '', page: 1, limit: 60,
     }, expect.any(AbortSignal))
     expect(await view.findByRole('img', { name: 'one.jpg' })).toBeVisible()
+  })
+
+  it('filters by a dynamic score interval and jumps directly to a page', async () => {
+    mocks.getLibrary.mockResolvedValue({
+      items,
+      total: 120,
+      page: 1,
+      total_pages: 2,
+      score_ranges: [{ score_min: 0, score_max: 9, count: 80 }],
+    })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await view.findByRole('option', { name: '0–9（80 项）' })
+    await fireEvent.update(await view.findByRole('combobox', { name: '评分区间' }), '0:9')
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: '',
+      page: 1,
+      scoreMin: 0,
+      scoreMax: 9,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+
+    await fireEvent.update(view.getByLabelText('跳转至页码'), '2')
+    await fireEvent.click(view.getByRole('button', { name: '跳转' }))
+
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: '',
+      page: 2,
+      scoreMin: 0,
+      scoreMax: 9,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+    expect(view.getByText(/共 2 页/)).toBeVisible()
+  })
+
+  it('filters by a dynamic resolution interval instead of a fixed minimum', async () => {
+    mocks.getLibrary.mockResolvedValue({
+      items,
+      total: 80,
+      page: 1,
+      total_pages: 2,
+      score_ranges: [],
+      resolution_ranges: [{ resolution_min: 512, resolution_max: 1023, count: 80 }],
+    })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await view.findByRole('option', { name: '512–1023px（80 项）' })
+    await fireEvent.update(view.getByRole('combobox', { name: '分辨率区间' }), '512:1023')
+
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: '',
+      page: 1,
+      resolutionMin: 512,
+      resolutionMax: 1023,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+  })
+
+  it('keeps the active score and resolution filters when selecting every matching item', async () => {
+    mocks.getLibrary.mockResolvedValue({
+      items,
+      total: 120,
+      page: 1,
+      total_pages: 2,
+      score_ranges: [{ score_min: 0, score_max: 9, count: 80 }],
+      resolution_ranges: [{ resolution_min: 512, resolution_max: 1023, count: 80 }],
+    })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await view.findByRole('option', { name: '0–9（80 项）' })
+    await fireEvent.update(view.getByRole('combobox', { name: '评分区间' }), '0:9')
+    await fireEvent.update(view.getByRole('combobox', { name: '分辨率区间' }), '512:1023')
+    await fireEvent.click(view.getByRole('checkbox', { name: '全选搜索结果' }))
+    await fireEvent.click(view.getByRole('button', { name: '安全缩放所选' }))
+
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'resize',
+      root_id: root.id,
+      options: {
+        library_query: '',
+        library_score_min: 0,
+        library_score_max: 9,
+        library_resolution_min: 512,
+        library_resolution_max: 1023,
+        excluded_media_ids: [],
+        max_size: 1216,
+      },
+    })
   })
 
   it('creates a vLLM task with stable selected media IDs', async () => {
@@ -231,6 +384,29 @@ describe('LibraryView batch actions', () => {
       root_id: root.id,
       options: { media_ids: ['media-2'] },
     })
+  })
+
+  it('creates a confirmation-gated delete task for selected media IDs', async () => {
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await fireEvent.click(await view.findByRole('checkbox', { name: '选择 two.png' }))
+    await fireEvent.click(view.getByRole('checkbox', { name: '选择 one.jpg' }))
+    await fireEvent.click(view.getByRole('button', { name: '删除所选' }))
+
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'delete_selected',
+      root_id: root.id,
+      options: { media_ids: ['media-1', 'media-2'] },
+    })
+    expect(mocks.success).toHaveBeenCalledWith(
+      '删除任务已加入队列',
+      '请在任务页确认后，所选媒体及同名标签文件会移入隔离区，可在隔离区恢复。',
+    )
+    expect(mocks.push).toHaveBeenCalledWith('/tasks')
   })
 
   it('disables HEIC conversion with an accessible reason for mixed formats', async () => {
@@ -405,11 +581,56 @@ describe('LibraryView batch actions', () => {
 
     await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
       rootId: root.id,
+      directory: '',
       query: 'character_exact',
-      cursor: undefined,
+      page: 1,
       limit: 60,
     }, expect.any(AbortSignal)))
     expect(view.queryByRole('dialog', { name: 'one.jpg' })).not.toBeInTheDocument()
+  })
+
+  it('appends a detail tag to an existing library search', async () => {
+    mocks.getLibraryItem.mockResolvedValueOnce({
+      ...items[0],
+      tags: ['character_exact'],
+    })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+    await fireEvent.update(await view.findByPlaceholderText('精确标签，例如：1girl landscape（所有标签都必须匹配）'), 'existing_tag')
+    await fireEvent.click(view.getByRole('button', { name: '查看 one.jpg' }))
+
+    await fireEvent.click(await view.findByRole('button', { name: 'character_exact' }))
+
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: 'existing_tag character_exact',
+      page: 1,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+  })
+
+  it('opens a full-size local image preview from the detail panel', async () => {
+    mocks.blurSensitiveMedia = false
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+
+    await fireEvent.click(await view.findByRole('button', { name: '查看 one.jpg' }))
+    const previewOpener = await view.findByRole('button', { name: '放大查看本地图片 one.jpg' })
+    previewOpener.focus()
+    await fireEvent.click(previewOpener)
+
+    const dialog = view.getByRole('dialog', { name: '原图预览 one.jpg' })
+    await waitFor(() => expect(dialog).toHaveFocus())
+    await fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(view.queryByRole('dialog', { name: '原图预览 one.jpg' })).not.toBeInTheDocument()
+    await waitFor(() => expect(previewOpener).toHaveFocus())
   })
 
   it('keeps the list snapshot open and shows a toast when detail refresh fails', async () => {

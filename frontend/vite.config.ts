@@ -17,4 +17,10 @@ export default defineConfig({
     port: 4173,
     strictPort: true,
   },
+  build: {
+    // Apache ECharts is isolated behind the asynchronously loaded monitor
+    // component. Its 533 KiB renderer is intentional and does not affect the
+    // initial application bundle; retain a small buffer for patch releases.
+    chunkSizeWarningLimit: 550,
+  },
 })

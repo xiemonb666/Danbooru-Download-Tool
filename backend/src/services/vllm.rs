@@ -175,6 +175,9 @@ pub struct VllmBatchItem {
     pub image_path: PathBuf,
     pub existing_tags: Option<String>,
     pub sidecar_quarantine_path: Option<PathBuf>,
+    /// Stable identity tokens (for example original artist/character tags)
+    /// that must precede newly inferred tags in one comma-separated caption.
+    pub tag_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,7 +416,8 @@ impl VllmService {
         }
         drop(permit);
 
-        let sidecar_content = tags.join(",");
+        let final_tags = merge_caption_tags(item.tag_prefixes, tags);
+        let sidecar_content = final_tags.join(",");
         let image_path = item.image_path.clone();
         let sidecar_quarantine_path = item.sidecar_quarantine_path.clone();
         let mode = self.config.tag_mode;
@@ -440,7 +444,7 @@ impl VllmService {
 
         Ok(VllmTagSuccess {
             media_id,
-            tags,
+            tags: final_tags,
             sidecar_written: true,
         })
     }
@@ -566,6 +570,18 @@ impl VllmService {
         }
         Ok(verified)
     }
+}
+
+fn merge_caption_tags(prefixes: Vec<String>, inferred: Vec<String>) -> Vec<String> {
+    let mut final_tags = Vec::with_capacity(prefixes.len() + inferred.len());
+    let mut seen = HashSet::new();
+    for tag in prefixes.into_iter().chain(inferred.into_iter()) {
+        let normalized = tag.trim().trim_matches(',').trim().to_string();
+        if !normalized.is_empty() && seen.insert(normalized.clone()) {
+            final_tags.push(normalized);
+        }
+    }
+    final_tags
 }
 
 fn retry_item(media_id: &str, error: VllmError) -> VllmRetryItem {
@@ -1182,6 +1198,23 @@ mod secure_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn caption_prefixes_stay_first_and_are_comma_deduplicated() {
+        let tags = merge_caption_tags(
+            vec!["artist:origin".to_string(), "character_a".to_string()],
+            vec![
+                "1girl".to_string(),
+                "character_a".to_string(),
+                " blue_hair, ".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            tags,
+            vec!["artist:origin", "character_a", "1girl", "blue_hair"]
+        );
+    }
+
+    #[test]
     fn endpoint_policy_rejects_non_loopback_http() {
         let result = validate_endpoint("http://192.168.1.50:8000/v1", &[]);
 
@@ -1405,6 +1438,7 @@ mod secure_tests {
                 image_path: image_path.clone(),
                 existing_tags: None,
                 sidecar_quarantine_path: None,
+                tag_prefixes: Vec::new(),
             }])
             .await
             .expect("batch result");

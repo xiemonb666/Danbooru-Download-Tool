@@ -31,6 +31,7 @@ import {
   type BatchDownloadSettings,
 } from '../utils/batchDownloadHistory'
 import { contentRatingName, requiresContentReveal } from '../utils/contentRating'
+import { scrollToPageTop } from '../utils/pageScroll'
 import { cachePosts, getCachedPost, prunePostCache } from '../utils/postCache'
 
 const route = useRoute()
@@ -263,10 +264,20 @@ function updateRoute(nextPage: number | string = 1): void {
   suggestionsOpen.value = false
 }
 
+function navigateToPage(nextPage: number | string): void {
+  scrollToPageTop()
+  updateRoute(nextPage)
+}
+
 function chooseSuggestion(value: string): void {
   const negative = inputQuery.value.match(/-?[^\s()]+$/)?.[0]?.startsWith('-') ?? false
   inputQuery.value = inputQuery.value.replace(/-?[^\s()]+$/, `${negative ? '-' : ''}${value}`)
   suggestionsOpen.value = false
+}
+
+function appendTagToSearch(tag: string): void {
+  inputQuery.value = `${inputQuery.value} ${tag}`.trim()
+  updateRoute(1)
 }
 
 function chooseBatchSuggestion(value: string): void {
@@ -642,11 +653,11 @@ onBeforeUnmount(() => {
     </div>
 
     <nav v-if="!loading && result?.posts.length" class="pagination" aria-label="查询分页">
-      <button type="button" class="button button-small" :disabled="!hasPrevious" @click="updateRoute(result?.previous_page ?? Math.max(1, (page ?? 1) - 1))">
+      <button type="button" class="button button-small" :disabled="!hasPrevious" @click="navigateToPage(result?.previous_page ?? Math.max(1, (page ?? 1) - 1))">
         <ChevronLeft :size="15" /> 上一页
       </button>
       <span class="pagination-info">{{ pageLabel }}</span>
-      <button type="button" class="button button-small" :disabled="!hasNext" @click="updateRoute(result?.next_page ?? (page ?? 1) + 1)">
+      <button type="button" class="button button-small" :disabled="!hasNext" @click="navigateToPage(result?.next_page ?? (page ?? 1) + 1)">
         下一页 <ChevronRight :size="15" />
       </button>
     </nav>
@@ -735,7 +746,7 @@ onBeforeUnmount(() => {
             <template v-if="detailPost.tags[group].length">
               <h3>{{ group }}</h3>
               <div class="tag-list">
-                <button v-for="tag in detailPost.tags[group]" :key="tag" type="button" class="tag" :class="group" @click="inputQuery = `${inputQuery} ${tag}`.trim(); updateRoute(1)">{{ tag }}</button>
+                <button v-for="tag in detailPost.tags[group]" :key="tag" type="button" class="tag" :class="group" @click="appendTagToSearch(tag)">{{ tag }}</button>
               </div>
             </template>
           </div>

@@ -11,6 +11,17 @@ const schemaPath = path.resolve(frontendDir, 'openapi.json')
 const generatedPath = path.resolve(frontendDir, 'src/api/generated.ts')
 const checkOnly = process.argv.includes('--check')
 
+function pathForCargo(pathname, cargo) {
+  // A WSL Node process can discover only cargo.exe while native Cargo is not
+  // installed. Windows Cargo cannot resolve /mnt/c paths, so convert both
+  // input and output paths explicitly instead of relying on shell expansion.
+  if (process.platform !== 'win32' && /\.exe$/i.test(cargo)) {
+    const converted = spawnSync('wslpath', ['-w', pathname], { encoding: 'utf8' })
+    if (converted.status === 0 && converted.stdout.trim()) return converted.stdout.trim()
+  }
+  return pathname
+}
+
 function exportRustSchema() {
   const candidates = process.env.CARGO
     ? [process.env.CARGO]
@@ -19,16 +30,18 @@ function exportRustSchema() {
       : ['cargo', 'cargo.exe']
 
   for (const cargo of candidates) {
+    const manifestPath = pathForCargo(backendManifest, cargo)
+    const outputPath = pathForCargo(schemaPath, cargo)
     const result = spawnSync(
       cargo,
       [
         'run',
         '--manifest-path',
-        backendManifest,
+        manifestPath,
         '--locked',
         '--',
         '--export-openapi',
-        schemaPath,
+        outputPath,
       ],
       { stdio: 'inherit' },
     )

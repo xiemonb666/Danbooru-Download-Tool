@@ -269,6 +269,146 @@ pub struct LibraryMediaPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryMediaFilters {
+    pub score_min: Option<i64>,
+    pub score_max: Option<i64>,
+    pub min_resolution: Option<i64>,
+    pub max_resolution: Option<i64>,
+    pub relative_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LibraryScoreRange {
+    pub score_min: i64,
+    pub score_max: i64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LibraryResolutionRange {
+    pub resolution_min: i64,
+    pub resolution_max: i64,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LibraryMediaNumberedPage {
+    pub items: Vec<MediaFileRecord>,
+    pub total: i64,
+    pub page: usize,
+    pub total_pages: usize,
+    pub score_ranges: Vec<LibraryScoreRange>,
+    pub resolution_ranges: Vec<LibraryResolutionRange>,
+}
+
+fn library_query_filter_parts(
+    root_id: &str,
+    exact_tag_query: &str,
+    filters: &LibraryMediaFilters,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut tags = Vec::<String>::new();
+    for tag in exact_tag_query.split_whitespace() {
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    let mut clause = String::new();
+    let mut values = vec![root_id.to_string().into()];
+    for tag in tags {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(
+            " AND EXISTS (
+                SELECT 1 FROM post_tags pt
+                JOIN tags t ON t.id=pt.tag_id
+                WHERE pt.post_id=m.post_id AND t.name=?{parameter}
+              )"
+        ));
+        values.push(rusqlite::types::Value::Text(tag));
+    }
+    if let Some(score_min) = filters.score_min {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(
+            " AND COALESCE((SELECT score FROM posts p WHERE p.id=m.post_id), 0)>=?{parameter}"
+        ));
+        values.push(rusqlite::types::Value::Integer(score_min));
+    }
+    if let Some(score_max) = filters.score_max {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(
+            " AND COALESCE((SELECT score FROM posts p WHERE p.id=m.post_id), 0)<=?{parameter}"
+        ));
+        values.push(rusqlite::types::Value::Integer(score_max));
+    }
+    let minimum_resolution = filters.min_resolution.filter(|value| *value > 0);
+    if minimum_resolution.is_some() || filters.max_resolution.is_some() {
+        clause.push_str(" AND m.width IS NOT NULL AND m.height IS NOT NULL");
+    }
+    if let Some(min_resolution) = minimum_resolution {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(" AND MIN(m.width, m.height)>=?{parameter}"));
+        values.push(rusqlite::types::Value::Integer(min_resolution));
+    }
+    if let Some(max_resolution) = filters.max_resolution {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(" AND MIN(m.width, m.height)<=?{parameter}"));
+        values.push(rusqlite::types::Value::Integer(max_resolution));
+    }
+    if let Some(directory) = filters.relative_directory.as_deref() {
+        let parameter = values.len() + 1;
+        if directory.is_empty() {
+            clause.push_str(" AND instr(m.relative_path, '/')=0");
+        } else {
+            clause.push_str(&format!(
+                " AND substr(m.relative_path, 1, length(?{parameter}))=?{parameter}
+                   AND substr(m.relative_path, length(?{parameter}) + 1, 1)='/'"
+            ));
+            values.push(rusqlite::types::Value::Text(directory.to_string()));
+        }
+    }
+    (clause, values)
+}
+
+fn dynamic_numeric_range_size(minimum: i64, maximum: i64) -> i64 {
+    let span = maximum.saturating_sub(minimum).saturating_add(1).max(1) as u64;
+    let target_size = span.div_ceil(8).max(1);
+    let mut scale = 1_u64;
+    while scale <= target_size / 10 {
+        scale = scale.saturating_mul(10);
+    }
+    for multiplier in [1_u64, 2, 5, 10] {
+        let candidate = multiplier.saturating_mul(scale);
+        if candidate >= target_size {
+            return candidate.min(i64::MAX as u64) as i64;
+        }
+    }
+    i64::MAX
+}
+
+fn dynamic_numeric_ranges(values: Vec<(i64, i64)>) -> Vec<(i64, i64, i64)> {
+    let (Some((minimum, _)), Some((maximum, _))) = (values.first(), values.last()) else {
+        return Vec::new();
+    };
+    let range_size = dynamic_numeric_range_size(*minimum, *maximum).max(1);
+    let range_start = minimum.div_euclid(range_size).saturating_mul(range_size);
+    let mut ranges = Vec::<(i64, i64, i64)>::new();
+    for (value, count) in values {
+        let offset = value.saturating_sub(range_start);
+        let range_min =
+            range_start.saturating_add(offset.div_euclid(range_size).saturating_mul(range_size));
+        let range_max = range_min.saturating_add(range_size.saturating_sub(1));
+        if let Some((_, _, last_count)) = ranges
+            .last_mut()
+            .filter(|(minimum, _, _)| *minimum == range_min)
+        {
+            *last_count = last_count.saturating_add(count);
+        } else {
+            ranges.push((range_min, range_max, count));
+        }
+    }
+    ranges
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PostRecordInput {
     pub id: i64,
@@ -563,6 +703,17 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_media_root_path_unique
                 ON media_files(root_id, relative_path);
 
+            CREATE TABLE IF NOT EXISTS downloaded_post_locations (
+                root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                relative_directory TEXT NOT NULL,
+                post_id INTEGER NOT NULL,
+                last_task_id TEXT,
+                downloaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (root_id, relative_directory, post_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_downloaded_post_locations_lookup
+                ON downloaded_post_locations(root_id, relative_directory, post_id);
+
             CREATE TABLE IF NOT EXISTS tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -639,15 +790,54 @@ impl Database {
 
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
-            PRAGMA user_version=2;
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+            PRAGMA user_version=3;
             ",
         )?;
+        backfill_downloaded_post_locations(&transaction)?;
         transaction.commit()
     }
 
     // =========================================================================
     // Download History
     // =========================================================================
+
+    pub fn was_post_downloaded_in_directory(
+        &self,
+        root_id: &str,
+        relative_directory: &str,
+        post_id: i64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM downloaded_post_locations
+                WHERE root_id=?1 AND relative_directory=?2 AND post_id=?3
+             )",
+            params![root_id, relative_directory, post_id],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn record_downloaded_post_in_directory(
+        &self,
+        root_id: &str,
+        relative_directory: &str,
+        post_id: i64,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO downloaded_post_locations(
+                root_id, relative_directory, post_id, last_task_id
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root_id, relative_directory, post_id) DO UPDATE SET
+                last_task_id=excluded.last_task_id,
+                downloaded_at=datetime('now')",
+            params![root_id, relative_directory, post_id, task_id],
+        )?;
+        Ok(())
+    }
 
     pub fn start_download(&self, task_id: &str, config: &DownloadConfig) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1045,31 +1235,30 @@ impl Database {
         limit: usize,
         exact_tag_query: &str,
     ) -> rusqlite::Result<LibraryMediaPage> {
-        let mut tags = Vec::<String>::new();
-        for tag in exact_tag_query.split_whitespace() {
-            if !tags.iter().any(|existing| existing == tag) {
-                tags.push(tag.to_string());
-            }
-        }
-        let mut tag_filter = String::new();
-        for index in 0..tags.len() {
-            tag_filter.push_str(&format!(
-                " AND EXISTS (
-                    SELECT 1 FROM post_tags pt
-                    JOIN tags t ON t.id=pt.tag_id
-                    WHERE pt.post_id=m.post_id AND t.name=?{}
-                  )",
-                index + 2
-            ));
-        }
+        self.list_library_media_filtered(
+            root_id,
+            after_id,
+            limit,
+            exact_tag_query,
+            &LibraryMediaFilters::default(),
+        )
+    }
+
+    pub fn list_library_media_filtered(
+        &self,
+        root_id: &str,
+        after_id: Option<&str>,
+        limit: usize,
+        exact_tag_query: &str,
+        filters: &LibraryMediaFilters,
+    ) -> rusqlite::Result<LibraryMediaPage> {
         let limit = limit.clamp(1, 200);
+        let (filter_clause, filter_values) =
+            library_query_filter_parts(root_id, exact_tag_query, filters);
         let conn = self.conn.lock().unwrap();
-        let mut filter_values = Vec::<rusqlite::types::Value>::with_capacity(tags.len() + 1);
-        filter_values.push(root_id.to_string().into());
-        filter_values.extend(tags.into_iter().map(rusqlite::types::Value::Text));
         let count_sql = format!(
             "SELECT COUNT(*) FROM media_files m
-             WHERE m.root_id=?1 AND m.status='active'{tag_filter}"
+             WHERE m.root_id=?1 AND m.status='active'{filter_clause}"
         );
         let total = conn.query_row(
             &count_sql,
@@ -1083,7 +1272,7 @@ impl Database {
                     m.byte_size, m.sha256, m.md5, m.width, m.height, m.duration, m.status,
                     m.created_at, m.updated_at
              FROM media_files m
-             WHERE m.root_id=?1 AND m.status='active'{tag_filter}
+             WHERE m.root_id=?1 AND m.status='active'{filter_clause}
                    AND (?{cursor_parameter} IS NULL OR m.id > ?{cursor_parameter})
              ORDER BY m.id LIMIT ?{limit_parameter}"
         );
@@ -1107,6 +1296,138 @@ impl Database {
             items,
             total,
             next_cursor,
+        })
+    }
+
+    pub fn list_library_media_by_page(
+        &self,
+        root_id: &str,
+        requested_page: usize,
+        limit: usize,
+        exact_tag_query: &str,
+        filters: &LibraryMediaFilters,
+    ) -> rusqlite::Result<LibraryMediaNumberedPage> {
+        let limit = limit.clamp(1, 200);
+        let (filter_clause, filter_values) =
+            library_query_filter_parts(root_id, exact_tag_query, filters);
+        let conn = self.conn.lock().unwrap();
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM media_files m
+             WHERE m.root_id=?1 AND m.status='active'{filter_clause}"
+        );
+        let total = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(filter_values.iter()),
+            |row| row.get::<_, i64>(0),
+        )?;
+        let total_pages = if total <= 0 {
+            0
+        } else {
+            ((total as usize).saturating_sub(1) / limit).saturating_add(1)
+        };
+        let page = if total_pages == 0 {
+            1
+        } else {
+            requested_page.clamp(1, total_pages)
+        };
+        let offset = page.saturating_sub(1).saturating_mul(limit);
+        let limit_parameter = filter_values.len() + 1;
+        let offset_parameter = limit_parameter + 1;
+        let page_sql = format!(
+            "SELECT m.id, m.root_id, m.post_id, m.relative_path, m.variant, m.mime_type,
+                    m.byte_size, m.sha256, m.md5, m.width, m.height, m.duration, m.status,
+                    m.created_at, m.updated_at
+             FROM media_files m
+             WHERE m.root_id=?1 AND m.status='active'{filter_clause}
+             ORDER BY m.id LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
+        );
+        let mut page_values = filter_values.clone();
+        page_values.push(rusqlite::types::Value::Integer(limit as i64));
+        page_values.push(rusqlite::types::Value::Integer(
+            offset.min(i64::MAX as usize) as i64,
+        ));
+        let mut statement = conn.prepare(&page_sql)?;
+        let items = statement
+            .query_map(
+                rusqlite::params_from_iter(page_values.iter()),
+                map_media_file,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let score_filters = LibraryMediaFilters {
+            min_resolution: filters.min_resolution,
+            max_resolution: filters.max_resolution,
+            relative_directory: filters.relative_directory.clone(),
+            ..LibraryMediaFilters::default()
+        };
+        let (score_filter_clause, score_filter_values) =
+            library_query_filter_parts(root_id, exact_tag_query, &score_filters);
+        let score_sql = format!(
+            "SELECT COALESCE(p.score, 0), COUNT(*)
+             FROM media_files m
+             LEFT JOIN posts p ON p.id=m.post_id
+             WHERE m.root_id=?1 AND m.status='active'{score_filter_clause}
+             GROUP BY COALESCE(p.score, 0)
+             ORDER BY COALESCE(p.score, 0)"
+        );
+        let mut score_statement = conn.prepare(&score_sql)?;
+        let scores = score_statement
+            .query_map(
+                rusqlite::params_from_iter(score_filter_values.iter()),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let score_ranges = dynamic_numeric_ranges(scores)
+            .into_iter()
+            .map(|(score_min, score_max, count)| LibraryScoreRange {
+                score_min,
+                score_max,
+                count,
+            })
+            .collect();
+
+        let resolution_filters = LibraryMediaFilters {
+            score_min: filters.score_min,
+            score_max: filters.score_max,
+            relative_directory: filters.relative_directory.clone(),
+            ..LibraryMediaFilters::default()
+        };
+        let (resolution_filter_clause, resolution_filter_values) =
+            library_query_filter_parts(root_id, exact_tag_query, &resolution_filters);
+        let resolution_sql = format!(
+            "SELECT MIN(m.width, m.height), COUNT(*)
+             FROM media_files m
+             WHERE m.root_id=?1 AND m.status='active'
+               AND m.width IS NOT NULL AND m.height IS NOT NULL
+               AND MIN(m.width, m.height)>0{resolution_filter_clause}
+             GROUP BY MIN(m.width, m.height)
+             ORDER BY MIN(m.width, m.height)"
+        );
+        let mut resolution_statement = conn.prepare(&resolution_sql)?;
+        let resolutions = resolution_statement
+            .query_map(
+                rusqlite::params_from_iter(resolution_filter_values.iter()),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let resolution_ranges = dynamic_numeric_ranges(resolutions)
+            .into_iter()
+            .map(
+                |(resolution_min, resolution_max, count)| LibraryResolutionRange {
+                    resolution_min,
+                    resolution_max,
+                    count,
+                },
+            )
+            .collect();
+
+        Ok(LibraryMediaNumberedPage {
+            items,
+            total,
+            page,
+            total_pages,
+            score_ranges,
+            resolution_ranges,
         })
     }
 
@@ -1171,6 +1492,9 @@ impl Database {
         post: &PostRecordInput,
         tags: &[PostTagInput],
         media_files: &[MediaFileInput],
+        root_id: &str,
+        relative_directory: &str,
+        task_id: Option<&str>,
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn.transaction()?;
@@ -1178,6 +1502,13 @@ impl Database {
         for media in media_files {
             upsert_media_file_in_transaction(&transaction, media)?;
         }
+        record_downloaded_post_location_in_transaction(
+            &transaction,
+            root_id,
+            relative_directory,
+            post.id,
+            task_id,
+        )?;
         transaction.commit()
     }
 
@@ -1191,6 +1522,8 @@ impl Database {
         post: &PostRecordInput,
         tags: &[PostTagInput],
         media_files: &[MediaFileInput],
+        root_id: &str,
+        relative_directory: &str,
     ) -> rusqlite::Result<()> {
         if !matches!(status, "completed" | "skipped") {
             return Err(rusqlite::Error::InvalidParameterName(
@@ -1204,6 +1537,13 @@ impl Database {
         for media in media_files {
             upsert_media_file_in_transaction(&transaction, media)?;
         }
+        record_downloaded_post_location_in_transaction(
+            &transaction,
+            root_id,
+            relative_directory,
+            post.id,
+            Some(task_id),
+        )?;
         let changed = transaction.execute(
             "UPDATE task_items
              SET status=?3, result_json=?4, error_json=NULL, attempts=attempts+1,
@@ -1224,61 +1564,22 @@ impl Database {
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn.transaction()?;
-        let inserted = transaction.execute(
-            "INSERT INTO posts(
-                id, md5, rating, score, fav_count, width, height, file_ext, file_size,
-                source, duration, status, tag_string, tag_string_general,
-                tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                ?16, ?17, ?18
-             )
-             ON CONFLICT DO NOTHING",
-            params![
-                post.id,
-                post.md5,
-                post.rating,
-                post.score,
-                post.fav_count,
-                post.width,
-                post.height,
-                post.file_ext,
-                post.file_size,
-                post.source,
-                post.duration,
-                post.status,
-                post.tag_string,
-                post.tag_string_general,
-                post.tag_string_character,
-                post.tag_string_copyright,
-                post.tag_string_artist,
-                post.tag_string_meta,
-            ],
-        )?;
-        if inserted == 0 {
-            return transaction.commit();
+        insert_local_post_with_tags_if_missing_in_transaction(&transaction, post, tags)?;
+        transaction.commit()
+    }
+
+    pub fn upsert_indexed_media_batch(
+        &self,
+        local_posts: &[(PostRecordInput, Vec<PostTagInput>)],
+        media_files: &[MediaFileInput],
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        for (post, tags) in local_posts {
+            insert_local_post_with_tags_if_missing_in_transaction(&transaction, post, tags)?;
         }
-        for tag in tags {
-            let name = tag.name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            transaction.execute(
-                "INSERT INTO tags(name, category, post_count) VALUES (?1, ?2, COALESCE(?3, 0))
-                 ON CONFLICT(name) DO UPDATE SET
-                    category=excluded.category,
-                    post_count=COALESCE(?3, tags.post_count),
-                    updated_at=datetime('now')",
-                params![name, tag.category, tag.post_count],
-            )?;
-            let tag_id: i64 =
-                transaction.query_row("SELECT id FROM tags WHERE name=?1", [name], |row| {
-                    row.get(0)
-                })?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO post_tags(post_id, tag_id) VALUES (?1, ?2)",
-                params![post.id, tag_id],
-            )?;
+        for media in media_files {
+            upsert_media_file_in_transaction(&transaction, media)?;
         }
         transaction.commit()
     }
@@ -1412,6 +1713,14 @@ impl Database {
             .query_map([limit.clamp(1, 1_000) as i64], map_task)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
+    }
+
+    /// Deletes the task together with its task items. The schema's foreign-key
+    /// cascade keeps this operation atomic for callers that have already
+    /// completed filesystem cleanup.
+    pub fn delete_task(&self, id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM tasks WHERE id=?1", [id])? == 1)
     }
 
     pub fn list_all_tasks(&self) -> rusqlite::Result<Vec<TaskRecord>> {
@@ -2002,6 +2311,70 @@ impl Database {
     }
 }
 
+fn insert_local_post_with_tags_if_missing_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    post: &PostRecordInput,
+    tags: &[PostTagInput],
+) -> rusqlite::Result<()> {
+    let inserted = transaction.execute(
+        "INSERT INTO posts(
+            id, md5, rating, score, fav_count, width, height, file_ext, file_size,
+            source, duration, status, tag_string, tag_string_general,
+            tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18
+         )
+         ON CONFLICT DO NOTHING",
+        params![
+            post.id,
+            post.md5,
+            post.rating,
+            post.score,
+            post.fav_count,
+            post.width,
+            post.height,
+            post.file_ext,
+            post.file_size,
+            post.source,
+            post.duration,
+            post.status,
+            post.tag_string,
+            post.tag_string_general,
+            post.tag_string_character,
+            post.tag_string_copyright,
+            post.tag_string_artist,
+            post.tag_string_meta,
+        ],
+    )?;
+    if inserted == 0 {
+        return Ok(());
+    }
+    for tag in tags {
+        let name = tag.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO tags(name, category, post_count) VALUES (?1, ?2, COALESCE(?3, 0))
+             ON CONFLICT(name) DO UPDATE SET
+                category=excluded.category,
+                post_count=COALESCE(?3, tags.post_count),
+                updated_at=datetime('now')",
+            params![name, tag.category, tag.post_count],
+        )?;
+        let tag_id: i64 =
+            transaction.query_row("SELECT id FROM tags WHERE name=?1", [name], |row| {
+                row.get(0)
+            })?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO post_tags(post_id, tag_id) VALUES (?1, ?2)",
+            params![post.id, tag_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn upsert_post_with_tags_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     post: &PostRecordInput,
@@ -2089,7 +2462,17 @@ fn upsert_media_file_in_transaction(
             mime_type=excluded.mime_type, byte_size=excluded.byte_size,
             sha256=excluded.sha256, md5=excluded.md5, width=excluded.width,
             height=excluded.height, duration=excluded.duration, status='active',
-            updated_at=datetime('now')",
+            updated_at=datetime('now')
+         ON CONFLICT(root_id, relative_path) DO UPDATE SET
+            post_id=COALESCE(excluded.post_id, media_files.post_id),
+            variant=excluded.variant, mime_type=excluded.mime_type,
+            byte_size=excluded.byte_size,
+            sha256=COALESCE(excluded.sha256, media_files.sha256),
+            md5=COALESCE(excluded.md5, media_files.md5),
+            width=COALESCE(excluded.width, media_files.width),
+            height=COALESCE(excluded.height, media_files.height),
+            duration=COALESCE(excluded.duration, media_files.duration),
+            status='active', updated_at=datetime('now')",
         params![
             media.id,
             media.root_id,
@@ -2105,6 +2488,60 @@ fn upsert_media_file_in_transaction(
             media.duration,
         ],
     )?;
+    Ok(())
+}
+
+fn record_downloaded_post_location_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    root_id: &str,
+    relative_directory: &str,
+    post_id: i64,
+    task_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO downloaded_post_locations(
+            root_id, relative_directory, post_id, last_task_id
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(root_id, relative_directory, post_id) DO UPDATE SET
+            last_task_id=excluded.last_task_id,
+            downloaded_at=datetime('now')",
+        params![root_id, relative_directory, post_id, task_id],
+    )?;
+    Ok(())
+}
+
+fn backfill_downloaded_post_locations(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let records = {
+        let mut statement = transaction.prepare(
+            "SELECT root_id, post_id, relative_path
+             FROM media_files
+             WHERE status='active' AND post_id IS NOT NULL",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+    };
+    for (root_id, post_id, relative_path) in records {
+        let normalized_path = relative_path.replace('\\', "/");
+        let relative_directory = normalized_path
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        transaction.execute(
+            "INSERT OR IGNORE INTO downloaded_post_locations(
+                root_id, relative_directory, post_id
+             ) VALUES (?1, ?2, ?3)",
+            params![root_id, relative_directory, post_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -2291,7 +2728,8 @@ fn query_quarantine(conn: &Connection, id: &str) -> rusqlite::Result<Option<Quar
 #[cfg(test)]
 mod migration_tests {
     use super::{
-        Database, MediaFileInput, PostRecordInput, PostTagInput, QuarantineInput, TaskItemInput,
+        Database, LibraryMediaFilters, LibraryScoreRange, MediaFileInput, PostRecordInput,
+        PostTagInput, QuarantineInput, TaskItemInput,
     };
     use crate::models::DownloadConfig;
 
@@ -2374,7 +2812,7 @@ mod migration_tests {
             .unwrap();
 
         assert_eq!(created.id, "migrated-task");
-        assert_eq!(user_version, 2);
+        assert_eq!(user_version, 3);
         assert!(version_recorded);
     }
 
@@ -2854,10 +3292,15 @@ mod migration_tests {
             &post,
             &[PostTagInput::new("cat", 0)],
             std::slice::from_ref(&media),
+            "root-1",
+            "",
         )
         .unwrap();
 
         assert_eq!(db.get_media_file("media-7").unwrap().unwrap().byte_size, 99);
+        assert!(db
+            .was_post_downloaded_in_directory("root-1", "", 7)
+            .unwrap());
         let item = db.list_task_items("task-1").unwrap().remove(0);
         assert_eq!(item.status, "completed");
         assert_eq!(item.result.unwrap()["bytes"], 99);
@@ -2877,6 +3320,8 @@ mod migration_tests {
                 &PostRecordInput { id: 8, ..post },
                 &[],
                 std::slice::from_ref(&missing_item_media),
+                "root-1",
+                "",
             )
             .is_err());
         assert!(db.get_media_file("media-8").unwrap().is_none());
@@ -3550,6 +3995,213 @@ mod migration_tests {
     }
 
     #[test]
+    fn library_directory_filter_keeps_root_and_augmentation_subsets_separate() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-library-directory-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        for (id, relative_path) in [
+            ("root", "source.png"),
+            (
+                "portrait",
+                "dataset-expanded/task/derived/portrait/images/one.png",
+            ),
+            (
+                "upper",
+                "dataset-expanded/task/derived/upper_body/images/two.png",
+            ),
+        ] {
+            db.upsert_media_file(&MediaFileInput {
+                id: id.into(),
+                root_id: "root-1".into(),
+                post_id: None,
+                relative_path: relative_path.into(),
+                variant: "dataset_augmentation".into(),
+                mime_type: "image/png".into(),
+                byte_size: 42,
+                sha256: None,
+                md5: None,
+                width: Some(1024),
+                height: Some(1024),
+                duration: None,
+            })
+            .unwrap();
+        }
+
+        let root = db
+            .list_library_media_by_page(
+                "root-1",
+                1,
+                60,
+                "",
+                &LibraryMediaFilters {
+                    relative_directory: Some(String::new()),
+                    ..LibraryMediaFilters::default()
+                },
+            )
+            .unwrap();
+        let portrait = db
+            .list_library_media_by_page(
+                "root-1",
+                1,
+                60,
+                "",
+                &LibraryMediaFilters {
+                    relative_directory: Some(
+                        "dataset-expanded/task/derived/portrait/images".to_string(),
+                    ),
+                    ..LibraryMediaFilters::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(root.items.len(), 1);
+        assert_eq!(root.items[0].id, "root");
+        assert_eq!(portrait.items.len(), 1);
+        assert_eq!(portrait.items[0].id, "portrait");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn library_page_filters_an_actual_score_interval_and_reports_its_pages() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-library-score-page-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("INSERT INTO posts(id, score) VALUES (1, 3), (2, 7), (3, 48);")
+                .unwrap();
+        }
+        for (id, post_id, width, height) in [
+            ("media-1", 1, 512, 512),
+            ("media-2", 2, 1024, 512),
+            ("media-3", 3, 2048, 1024),
+        ] {
+            db.upsert_media_file(&MediaFileInput {
+                id: id.into(),
+                root_id: "root-1".into(),
+                post_id: Some(post_id),
+                relative_path: format!("{id}.jpg"),
+                variant: "original".into(),
+                mime_type: "image/jpeg".into(),
+                byte_size: 42,
+                sha256: None,
+                md5: None,
+                width: Some(width),
+                height: Some(height),
+                duration: None,
+            })
+            .unwrap();
+        }
+
+        let page = db
+            .list_library_media_by_page(
+                "root-1",
+                1,
+                1,
+                "",
+                &LibraryMediaFilters {
+                    score_min: Some(0),
+                    score_max: Some(9),
+                    min_resolution: Some(512),
+                    max_resolution: None,
+                    relative_directory: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.page, 1);
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.items[0].id, "media-1");
+        assert_eq!(
+            page.score_ranges,
+            vec![
+                LibraryScoreRange {
+                    score_min: 0,
+                    score_max: 9,
+                    count: 2,
+                },
+                LibraryScoreRange {
+                    score_min: 40,
+                    score_max: 49,
+                    count: 1,
+                },
+            ]
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn library_page_filters_an_actual_resolution_interval() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-library-resolution-page-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        for (id, width, height) in [
+            ("media-512", 768, 512),
+            ("media-768", 1024, 768),
+            ("media-1536", 2048, 1536),
+        ] {
+            db.upsert_media_file(&MediaFileInput {
+                id: id.into(),
+                root_id: "root-1".into(),
+                post_id: None,
+                relative_path: format!("{id}.jpg"),
+                variant: "original".into(),
+                mime_type: "image/jpeg".into(),
+                byte_size: 42,
+                sha256: None,
+                md5: None,
+                width: Some(width),
+                height: Some(height),
+                duration: None,
+            })
+            .unwrap();
+        }
+
+        let page = db
+            .list_library_media_by_page(
+                "root-1",
+                1,
+                60,
+                "",
+                &LibraryMediaFilters {
+                    min_resolution: Some(500),
+                    max_resolution: Some(1_000),
+                    ..LibraryMediaFilters::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["media-512", "media-768"]
+        );
+        assert!(!page.resolution_ranges.is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn ten_thousand_item_library_fixture_keeps_pages_and_payloads_bounded() {
         let path = std::env::temp_dir().join(format!(
             "danbooru-library-ten-thousand-{}.db",
@@ -3844,6 +4496,109 @@ mod migration_tests {
     }
 
     #[test]
+    fn indexed_media_batch_registers_multiple_local_posts_and_files_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("indexed-batch.db")).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        let local_posts = vec![
+            (
+                PostRecordInput {
+                    id: 1,
+                    md5: None,
+                    rating: "unknown".into(),
+                    score: 10,
+                    fav_count: 0,
+                    width: 100,
+                    height: 80,
+                    file_ext: Some("jpg".into()),
+                    file_size: Some(42),
+                    source: None,
+                    duration: None,
+                    status: "local".into(),
+                    tag_string: "cat".into(),
+                    tag_string_general: "cat".into(),
+                    tag_string_character: String::new(),
+                    tag_string_copyright: String::new(),
+                    tag_string_artist: String::new(),
+                    tag_string_meta: String::new(),
+                },
+                vec![PostTagInput::new("cat", 0)],
+            ),
+            (
+                PostRecordInput {
+                    id: 2,
+                    md5: None,
+                    rating: "unknown".into(),
+                    score: 20,
+                    fav_count: 0,
+                    width: 120,
+                    height: 90,
+                    file_ext: Some("png".into()),
+                    file_size: Some(84),
+                    source: None,
+                    duration: None,
+                    status: "local".into(),
+                    tag_string: "dog".into(),
+                    tag_string_general: "dog".into(),
+                    tag_string_character: String::new(),
+                    tag_string_copyright: String::new(),
+                    tag_string_artist: String::new(),
+                    tag_string_meta: String::new(),
+                },
+                vec![PostTagInput::new("dog", 0)],
+            ),
+        ];
+        let media_files = vec![
+            MediaFileInput {
+                id: "indexed-1".into(),
+                root_id: "root-1".into(),
+                post_id: Some(1),
+                relative_path: "1.jpg".into(),
+                variant: "original".into(),
+                mime_type: "image/jpeg".into(),
+                byte_size: 42,
+                sha256: None,
+                md5: None,
+                width: Some(100),
+                height: Some(80),
+                duration: None,
+            },
+            MediaFileInput {
+                id: "indexed-2".into(),
+                root_id: "root-1".into(),
+                post_id: Some(2),
+                relative_path: "2.png".into(),
+                variant: "original".into(),
+                mime_type: "image/png".into(),
+                byte_size: 84,
+                sha256: None,
+                md5: None,
+                width: Some(120),
+                height: Some(90),
+                duration: None,
+            },
+        ];
+
+        db.upsert_indexed_media_batch(&local_posts, &media_files)
+            .unwrap();
+
+        assert_eq!(db.count_media_files("root-1").unwrap(), 2);
+        assert_eq!(
+            db.list_library_media("root-1", None, 60, "cat")
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            db.list_library_media("root-1", None, 60, "dog")
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    #[test]
     fn post_library_metadata_returns_rating_and_stably_sorted_tags() {
         let path =
             std::env::temp_dir().join(format!("danbooru-post-metadata-{}.db", std::process::id()));
@@ -4024,6 +4779,69 @@ mod migration_tests {
             .unwrap()
             .is_none());
         drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn downloaded_post_history_is_scoped_to_the_exact_directory_and_survives_media_deletion() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-directory-download-history-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library 1", None, Some("/media/one"))
+            .unwrap();
+
+        assert!(!db
+            .was_post_downloaded_in_directory("root-1", "characters/alice", 42)
+            .unwrap());
+        db.record_downloaded_post_in_directory("root-1", "characters/alice", 42, Some("task-1"))
+            .unwrap();
+
+        assert!(db
+            .was_post_downloaded_in_directory("root-1", "characters/alice", 42)
+            .unwrap());
+        assert!(!db
+            .was_post_downloaded_in_directory("root-1", "", 42)
+            .unwrap());
+        assert!(!db
+            .was_post_downloaded_in_directory("root-1", "characters/bob", 42)
+            .unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrading_backfills_download_history_from_existing_catalogued_media() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-directory-download-history-backfill-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library 1", None, Some("/media/one"))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("INSERT INTO posts(id) VALUES (42)", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO media_files(id, root_id, post_id, relative_path, mime_type)
+                 VALUES ('media-42', 'root-1', 42, 'characters/alice/42.jpg', 'image/jpeg')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        let upgraded = Database::open(&path).unwrap();
+        assert!(upgraded
+            .was_post_downloaded_in_directory("root-1", "characters/alice", 42)
+            .unwrap());
+
+        drop(upgraded);
         let _ = std::fs::remove_file(&path);
     }
 

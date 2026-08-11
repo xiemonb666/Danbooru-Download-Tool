@@ -15,6 +15,8 @@ import {
 import { useTasksStore } from '../stores/tasks'
 import { useToastStore } from '../stores/toast'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import TrainingMonitor from '../components/TrainingMonitor.vue'
+import { scrollToPageTop } from '../utils/pageScroll'
 
 const tasks = useTasksStore()
 const toast = useToastStore()
@@ -37,10 +39,14 @@ let detailsController: AbortController | null = null
 
 const visibleTasks = computed(() => {
   const all = tasks.sortedTasks()
-  if (filter.value === 'active') return all.filter((task) => ['queued', 'running', 'pausing', 'paused', 'cancelling', 'awaiting_confirmation'].includes(task.status))
-  if (filter.value === 'completed') return all.filter((task) => task.status === 'completed')
-  if (filter.value === 'failed') return all.filter((task) => task.status === 'failed' || task.status === 'cancelled')
-  return all
+  const filtered = filter.value === 'active'
+    ? all.filter((task) => ['queued', 'running', 'pausing', 'paused', 'cancelling', 'awaiting_confirmation'].includes(task.status))
+    : filter.value === 'completed'
+      ? all.filter((task) => task.status === 'completed')
+      : filter.value === 'failed'
+        ? all.filter((task) => task.status === 'failed' || task.status === 'cancelled')
+        : all
+  return [...filtered].sort((left, right) => Number(right.kind === 'training') - Number(left.kind === 'training'))
 })
 
 const labels: Record<TaskStatus, string> = {
@@ -48,10 +54,10 @@ const labels: Record<TaskStatus, string> = {
   awaiting_confirmation: '等待确认', completed: '已完成', failed: '失败', cancelled: '已取消',
 }
 
-const kindLabels: Record<TaskSummary['kind'], string> = {
+const kindLabels: Record<string, string> = {
   download: '下载', index_library: '刷新图库', integrity_scan: '完整性检查', exact_dedup: '精确去重',
-  near_dedup: '相似图片检查', resize: '缩放图片', heic_convert: 'HEIC 转换', delete_by_tag: '按标签隔离',
-  tag_pipeline: '标签处理', vllm_tag: '视觉模型打标',
+  near_dedup: '相似图片检查', resize: '缩放图片', heic_convert: 'HEIC 转换', delete_by_tag: '按标签隔离', delete_selected: '删除所选媒体',
+  tag_pipeline: '标签处理', vllm_tag: '视觉模型打标', dataset_augmentation: '数据集增广', training: 'LoRA 训练',
 }
 
 function percent(task: TaskSummary): number {
@@ -135,7 +141,7 @@ function taskResultItems(value: unknown): ResultItem[] {
   })
 }
 
-function taskResultSummary(kind: TaskSummary['kind'], value: unknown): ResultSummary[] {
+function taskResultSummary(kind: string, value: unknown): ResultSummary[] {
   const entries: ResultSummary[] = []
   const addCount = (key: string, label: string) => {
     const count = resultNumber(value, key)
@@ -166,6 +172,7 @@ function taskResultSummary(kind: TaskSummary['kind'], value: unknown): ResultSum
     case 'near_dedup':
     case 'integrity_scan':
     case 'delete_by_tag':
+    case 'delete_selected':
       addCount('moved', '已移入隔离区')
       break
     case 'tag_pipeline':
@@ -173,6 +180,18 @@ function taskResultSummary(kind: TaskSummary['kind'], value: unknown): ResultSum
       break
     case 'vllm_tag':
       addCount('tagged', '已完成打标')
+      break
+    case 'dataset_augmentation':
+      addCount('generated', '已生成')
+      addCount('rejected', '已拒绝')
+      addCount('retagging_pending', '待重新打标')
+      {
+        const output = resultText(value, 'training_relative_directory') ?? resultText(value, 'derived_relative_directory')
+        if (output) entries.push({ label: '训练目录', value: output })
+      }
+      break
+    case 'training':
+      entries.push({ label: '训练运行', value: resultText(value, 'adapter_id') ?? 'SDXL LoRA' })
       break
   }
   return entries
@@ -281,6 +300,13 @@ async function loadDetailsPage(task: TaskSummary, cursor?: string): Promise<void
   }
 }
 
+function loadNextDetailsPage(task: TaskSummary): void {
+  const nextCursor = details.value?.next_cursor
+  if (!nextCursor) return
+  scrollToPageTop()
+  void loadDetailsPage(task, nextCursor)
+}
+
 watch(
   () => {
     const id = expandedTaskId.value
@@ -308,7 +334,7 @@ onBeforeUnmount(() => detailsController?.abort())
         <h1 class="page-title">任务中心</h1>
         <p class="page-description">任务状态会跨页面保留。断线后自动通过快照恢复，事件序列缺口会触发重新同步。</p>
       </div>
-      <button v-if="section === 'tasks'" type="button" class="button" :disabled="tasks.loading" @click="tasks.loadSnapshot">
+      <button v-if="section === 'tasks'" type="button" class="button" :disabled="tasks.loading" @click="() => tasks.loadSnapshot()">
         <RefreshCw :size="16" /> 同步状态
       </button>
       <button v-else type="button" class="button" :disabled="historyLoading" @click="loadHistory()">
@@ -358,6 +384,15 @@ onBeforeUnmount(() => detailsController?.abort())
           <span v-if="task.status === 'running'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
         </div>
 
+        <div v-if="task.training" class="training-queue-summary">
+          <strong>{{ task.training.adapter_id }} · {{ task.training.runtime_profile_id }}</strong>
+          <span>GPU {{ task.training.gpu_ids.length ? task.training.gpu_ids.join(', ') : '自动选择' }}</span>
+          <span v-if="task.training.model_path">模型 {{ task.training.model_path }}</span>
+          <span v-if="task.training.train_data_dir">数据集 {{ task.training.train_data_dir }}</span>
+          <span v-if="task.training.output_dir">输出 {{ task.training.output_dir }}{{ task.training.output_name ? `/${task.training.output_name}` : '' }}</span>
+          <small v-if="task.status === 'queued'">训练队列优先展示；等待目标 GPU 与全局工作槽同时可用。</small>
+        </div>
+
         <div v-if="task.failures.length" class="failure-list">
           <strong>{{ task.failures.length }} 个失败项</strong>
           <span v-for="failure in task.failures.slice(0, 4)" :key="`${failure.item_id}-${failure.code}`">{{ failure.item_id ? `${failure.item_id}：` : '' }}{{ failure.message }}</span>
@@ -398,6 +433,11 @@ onBeforeUnmount(() => detailsController?.abort())
           <p v-if="detailsLoading" role="status">正在加载任务详情</p>
           <p v-else-if="detailsError" role="alert">{{ detailsError }}</p>
           <template v-else-if="details">
+            <TrainingMonitor
+              v-if="task.kind === 'training'"
+              :task-id="task.id"
+              :active="['queued', 'running', 'pausing', 'paused', 'cancelling'].includes(task.status)"
+            />
             <label class="task-detail-filter">
               <span>项目状态</span>
               <select v-model="detailsStatus" aria-label="任务项目状态" @change="loadDetailsPage(task)">
@@ -457,7 +497,7 @@ onBeforeUnmount(() => detailsController?.abort())
               </li>
             </ul>
             <div v-if="details.next_cursor" class="task-detail-pagination">
-              <button type="button" class="button button-small" :disabled="detailsLoading" @click="loadDetailsPage(task, details.next_cursor)">下一页</button>
+              <button type="button" class="button button-small" :disabled="detailsLoading" @click="loadNextDetailsPage(task)">下一页</button>
             </div>
           </template>
         </section>

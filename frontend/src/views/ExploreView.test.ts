@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   getMediaRoots: vi.fn(),
   createMediaDirectory: vi.fn(),
   push: vi.fn(),
+  scrollTo: vi.fn(),
   setAutocompleteSuggestions: undefined as undefined | ((items: Array<Record<string, unknown>>) => void),
   warning: vi.fn(),
 }))
@@ -69,6 +70,7 @@ vi.mock('vue-router', () => ({
 describe('ExploreView result count', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.stubGlobal('scrollTo', mocks.scrollTo)
     localStorage.clear()
     mocks.getDanbooruPosts.mockResolvedValue({ posts: [], page: 1 })
     mocks.countDanbooruPosts.mockResolvedValue({ count: 12_345, exact: false })
@@ -85,6 +87,27 @@ describe('ExploreView result count', () => {
 
     expect(await view.findByText('约 12,345 项结果 · 第 1 页')).toBeVisible()
     expect(mocks.countDanbooruPosts).toHaveBeenCalledWith('cat', expect.any(AbortSignal))
+  })
+
+  it('scrolls to the top when moving to the next explore page', async () => {
+    mocks.getDanbooruPosts.mockResolvedValueOnce({
+      posts: [{
+        id: 44, rating: 's', score: 7, fav_count: 2, image_width: 800, image_height: 600,
+        file_ext: 'jpg', file_size: 1024, is_video: false, is_ugoira: false,
+        restricted: false, downloaded: false,
+        tags: { general: ['cat'], artist: [], copyright: [], character: [], meta: [] },
+      }],
+      page: 1,
+      next_page: '2',
+    })
+    const view = render(ExploreView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await fireEvent.click(await view.findByRole('button', { name: '下一页' }))
+
+    expect(mocks.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' })
+    expect(mocks.push).toHaveBeenLastCalledWith({ path: '/explore', query: { page: '2', q: 'cat' } })
   })
 
   it('stores loaded search posts in the bounded local post cache', async () => {
@@ -281,6 +304,37 @@ describe('ExploreView result count', () => {
     await fireEvent.keyDown(dialog, { key: 'Escape' })
     expect(view.queryByRole('dialog', { name: '帖子 #43' })).not.toBeInTheDocument()
     await waitFor(() => expect(opener).toHaveFocus())
+  })
+
+  it('appends a detail tag to the existing explore query', async () => {
+    const post = {
+      id: 46,
+      rating: 's',
+      score: 1,
+      fav_count: 0,
+      image_width: 800,
+      image_height: 600,
+      file_ext: 'jpg',
+      file_size: 1024,
+      is_video: false,
+      is_ugoira: false,
+      restricted: false,
+      downloaded: false,
+      tags: { general: ['added_tag'], artist: [], copyright: [], character: [], meta: [] },
+    }
+    mocks.getDanbooruPosts.mockResolvedValueOnce({ posts: [post], page: 1 })
+    mocks.getDanbooruPost.mockResolvedValueOnce(post)
+    const view = render(ExploreView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await fireEvent.click(await view.findByRole('button', { name: '打开帖子 46' }))
+    await fireEvent.click(await view.findByRole('button', { name: 'added_tag' }))
+
+    expect(mocks.push).toHaveBeenLastCalledWith({
+      path: '/explore',
+      query: { page: '1', q: 'cat added_tag' },
+    })
   })
 
   it('opens a still image at the proxied original resolution from post details', async () => {

@@ -161,7 +161,9 @@ export type DownloadTaskRequest = ApiSchema<'DownloadTaskRequest'>
 
 export type CreateTaskRequest = ApiSchema<'CreateTaskRequest'>
 
-export type RootTaskRequest = Exclude<CreateTaskRequest, DownloadTaskRequest>
+export type TrainingTaskRequest = Extract<CreateTaskRequest, { type: 'training' }>
+
+export type RootTaskRequest = Exclude<CreateTaskRequest, DownloadTaskRequest | TrainingTaskRequest>
 
 export type DownloadHistoryRecord = ApiSchema<'DownloadHistoryRecord'>
 
@@ -206,6 +208,12 @@ export type VllmHealthStatus = ApiSchema<'VllmHealthStatus'>
 
 export function getVllmHealth(signal?: AbortSignal): Promise<VllmHealthStatus> {
   return apiClient.get<VllmHealthStatus>('/vllm/health', { signal })
+}
+
+export type VllmLoadStatus = ApiSchema<'VllmLoadStatus'>
+
+export function loadVllmModel(): Promise<VllmLoadStatus> {
+  return apiClient.post<VllmLoadStatus>('/vllm/load')
 }
 
 export type DanbooruPostsPage = ApiSchema<'DanbooruPostsPage'>
@@ -287,6 +295,13 @@ export interface LibraryParams {
   rootId: string
   query?: string
   cursor?: string
+  page?: number
+  scoreMin?: number
+  scoreMax?: number
+  minResolution?: number
+  resolutionMin?: number
+  resolutionMax?: number
+  directory?: string
   limit?: number
 }
 
@@ -294,6 +309,13 @@ export function getLibrary(params: LibraryParams, signal?: AbortSignal): Promise
   const query = new URLSearchParams({ root_id: params.rootId, limit: String(params.limit ?? 60) })
   if (params.query) query.set('q', params.query)
   if (params.cursor) query.set('cursor', params.cursor)
+  if (params.page !== undefined) query.set('page', String(params.page))
+  if (params.scoreMin !== undefined) query.set('score_min', String(params.scoreMin))
+  if (params.scoreMax !== undefined) query.set('score_max', String(params.scoreMax))
+  if (params.minResolution !== undefined) query.set('min_resolution', String(params.minResolution))
+  if (params.resolutionMin !== undefined) query.set('resolution_min', String(params.resolutionMin))
+  if (params.resolutionMax !== undefined) query.set('resolution_max', String(params.resolutionMax))
+  if (params.directory !== undefined) query.set('directory', params.directory)
   return apiClient.get<LibraryPage>(`/library/items?${query}`, { signal })
 }
 
@@ -333,4 +355,421 @@ export function saveSecret(kind: SecretKind, secret: string): Promise<SecretResp
 
 export function deleteSecret(kind: SecretKind): Promise<SecretResponse> {
   return apiClient.delete<SecretResponse>(`/secrets/${kind}`)
+}
+
+export interface TrainingGroup {
+  id: string
+  label: string
+  description: string
+}
+
+export interface TrainingField {
+  key: string
+  label: string
+  group: string
+  kind: 'path' | 'text' | 'number' | 'boolean' | 'select' | 'list' | 'json' | 'secret'
+  default: unknown
+  choices: string[]
+  required: boolean
+  advanced: boolean
+  help: string
+}
+
+export interface TrainingAdapter {
+  id: string
+  version: string
+  label: string
+  family: string
+  family_label: string
+  training_type: string
+  training_type_label: string
+  trainer: string
+  fields: TrainingField[]
+  groups: TrainingGroup[]
+}
+
+export interface TrainingRuntimeProfile {
+  id: string
+  label: string
+  kind: 'windows' | 'wsl' | 'conda' | 'venv'
+  /** Discovered environments are changed only after the user explicitly presses install/sync. */
+  managed: boolean
+  installed: boolean
+  installing?: boolean
+  last_error?: string | null
+  runtime_root: string
+  python_path: string
+}
+
+export interface TrainingRuntimeCheck {
+  id: string
+  ok: boolean
+  detail: string
+}
+
+export interface TrainingRuntimeDiagnostics {
+  profile: TrainingRuntimeProfile
+  checks: TrainingRuntimeCheck[]
+}
+
+export type VisionCropRuntimeHealth = ApiSchema<'VisionCropRuntimeHealth'>
+
+export interface TrainingGpu {
+  id: string
+  name: string
+  memory_total_mib: number
+  memory_used_mib: number
+  utilization_percent: number
+  graphics_clock_mhz?: number | null
+  memory_clock_mhz?: number | null
+  power_draw_w?: number | null
+  power_limit_w?: number | null
+  temperature_c?: number | null
+  fan_speed_percent?: number | null
+  external_processes?: TrainingGpuExternalProcess[]
+}
+
+export interface TrainingGpuExternalProcess {
+  pid: number
+  process_name: string
+  memory_used_mib: number
+}
+
+export interface TrainingPreview {
+  toml: string
+}
+
+export interface LoraSvdAnalysisFile {
+  path: string
+  label?: string
+}
+
+export interface LoraSvdAnalysisRequest {
+  runtime_profile_id: string
+  files: LoraSvdAnalysisFile[]
+  device: 'auto'
+}
+
+export interface LoraSvdAnalysisResult {
+  id: string
+  reports: LoraSvdModelReport[]
+  comparison?: LoraSvdComparison | null
+  execution: LoraSvdExecution
+  expires_at: number
+}
+
+export interface LoraSvdExecution {
+  device: string
+  reason: string
+  selection_reason?: string
+  duration_ms: number
+  fallback?: boolean
+}
+
+export interface LoraSvdThresholdRanks {
+  energy_95: number
+  energy_99: number
+  energy_999: number
+}
+
+export interface LoraSvdModuleSummary {
+  id: string
+  component: string
+  rank: number
+  alpha: number
+  scale: number
+  numerical_rank: number
+  stable_rank: number
+  tail_energy_20: number
+  effective_rank: LoraSvdThresholdRanks
+  energy: number
+  flag?: 'compression_headroom' | 'compressible' | 'well_utilized' | 'saturation_signal' | null
+}
+
+export interface LoraSvdModelReport {
+  id: string
+  label: string
+  path: string
+  file_size_bytes: number
+  sha256: string
+  modified_at: number
+  step?: number | null
+  architecture: string
+  format: string
+  /** False for LoHa/LoKr/other structures where standard LoRA QR-SVD is invalid. */
+  svd_applicable?: boolean
+  coverage: { analyzed_modules: number; candidate_modules: number; unsupported_modules: number }
+  rank_distribution: { minimum: number; maximum: number; modal: number; uniform: boolean }
+  effective_rank: LoraSvdThresholdRanks
+  current_rank_energy: number
+  tail_energy_20: number
+  verdict: 'high_compression_headroom' | 'compressible' | 'well_utilized' | 'saturation_signal' | 'partial_evidence'
+  verdict_message: string
+  metadata: Record<string, string>
+  excluded: Array<{ id: string; reason: string }>
+  modules: LoraSvdModuleSummary[]
+  global_singular_values_count?: number
+  global_singular_values: number[]
+  global_cumulative_energy_count?: number
+  global_cumulative_energy: number[]
+}
+
+export interface LoraSvdComparison {
+  comparable: boolean
+  reason: string
+  checkpoints: Array<{ id: string; label: string; step?: number | null; effective_rank: LoraSvdThresholdRanks; rank_utilization: number; tail_energy_20: number }>
+}
+
+export interface TrainingMetric {
+  step: number
+  timestamp: number
+  series: string
+  value: number
+}
+
+export type TrainingMetricSnapshot = ApiSchema<'TrainingMetricsResponse'>
+export type TrainingMetricSeriesSummary = ApiSchema<'TrainingMetricSeriesSummary'>
+export type TrainingMetricsOverview = ApiSchema<'TrainingMetricsOverviewResponse'>
+export type TrainingCleanupPath = ApiSchema<'TrainingCleanupPath'>
+export type TrainingCleanupPreview = ApiSchema<'TrainingCleanupPreviewResponse'>
+export type TrainingCleanupResult = ApiSchema<'TrainingCleanupResponse'>
+
+export interface TrainingMetricQuery {
+  series?: string[]
+  maxPoints?: number
+  fromStep?: number
+  toStep?: number
+  fromTimestamp?: number
+  toTimestamp?: number
+}
+
+export interface TrainingLogs {
+  text: string
+}
+
+export interface TrainingGalleryDataset {
+  root_id: string
+  relative_directory: string
+  repeats: number
+  caption_extension?: string | null
+}
+
+export interface TrainingGalleryDatasetPreview {
+  root_id: string
+  root_name: string
+  relative_directory: string
+  image_dir: string
+  caption_extension: string
+  image_count: number
+  caption_count: number
+  repeats: number
+  effective_image_count: number
+}
+
+export type TrainingSamplePromptSource = 'manual' | 'dataset_captions'
+
+export interface TrainingSampleSettings {
+  enabled: boolean
+  prompt_source: TrainingSamplePromptSource
+  prompt: string
+  negative_prompt: string
+  dataset_caption_count: number
+  steps: number
+  width: number
+  height: number
+  every_n_epochs: number
+}
+
+export interface TrainingQueueEntry {
+  task_id: string
+  status: TaskStatus
+  adapter_id: string
+  runtime_profile_id: string
+  gpu_ids: string[]
+  assigned_gpu_ids: string[]
+  queue_position?: number | null
+  blocking_task_ids: string[]
+  blocked_gpu_ids: string[]
+  estimated_wait_seconds?: number | null
+  wait_reason?: string | null
+}
+
+export interface TrainingQueue {
+  entries: TrainingQueueEntry[]
+}
+
+export interface TrainingPresetInput {
+  name: string
+  training: {
+    adapter_id: string
+    runtime_profile_id: string
+    gpu_ids: string[]
+    parameters: Record<string, unknown>
+    gallery_dataset?: TrainingGalleryDataset | null
+    gallery_datasets?: TrainingGalleryDataset[]
+    sample?: TrainingSampleSettings | null
+  }
+}
+
+export interface TrainingPreset extends TrainingPresetInput {
+  id: string
+  created_at: number
+  updated_at: number
+  version_count: number
+}
+
+export interface TrainingArtifact {
+  id: string
+  kind: 'lora' | 'checkpoint' | 'sample' | 'state' | 'config' | 'log' | 'metrics' | 'other'
+  name: string
+  path: string
+  size_bytes: number
+  modified_at: number
+  step?: number | null
+  url: string
+}
+
+export interface TrainingPathEntry {
+  name: string
+  path: string
+}
+
+export interface TrainingPathBrowser {
+  current_path: string
+  parent_path?: string | null
+  directories: TrainingPathEntry[]
+  files: TrainingPathEntry[]
+}
+
+export interface TrainingTaskCreateRequest {
+  type: 'training'
+  root_id: '__training__'
+  training: TrainingPresetInput['training']
+}
+
+export function getTrainingAdapters(): Promise<TrainingAdapter[]> {
+  return apiClient.get<TrainingAdapter[]>('/training/adapters')
+}
+
+export function getTrainingRuntimeProfiles(): Promise<TrainingRuntimeProfile[]> {
+  return apiClient.get<TrainingRuntimeProfile[]>('/training/runtime-profiles')
+}
+
+export function getTrainingRuntimeDiagnostics(profileId: string): Promise<TrainingRuntimeDiagnostics> {
+  return apiClient.get<TrainingRuntimeDiagnostics>(`/training/runtime-profiles/${encodeURIComponent(profileId)}/diagnostics`)
+}
+
+export function installTrainingRuntime(profileId: string): Promise<TrainingRuntimeProfile> {
+  return apiClient.post<TrainingRuntimeProfile>(`/training/runtime-profiles/${encodeURIComponent(profileId)}/install`)
+}
+
+export function getVisionCropRuntimeHealth(profileId: string): Promise<VisionCropRuntimeHealth> {
+  return apiClient.get<VisionCropRuntimeHealth>(`/vision-crop/runtime-profiles/${encodeURIComponent(profileId)}/health`)
+}
+
+export function installVisionCropRuntime(profileId: string): Promise<VisionCropRuntimeHealth> {
+  return apiClient.post<VisionCropRuntimeHealth>(`/vision-crop/runtime-profiles/${encodeURIComponent(profileId)}/install`)
+}
+
+export function getTrainingGpus(): Promise<TrainingGpu[]> {
+  return apiClient.get<TrainingGpu[]>('/training/gpus')
+}
+
+export function getTrainingQueue(): Promise<TrainingQueue> {
+  return apiClient.get<TrainingQueue>('/training/queue')
+}
+
+export function previewTrainingGalleryDataset(dataset: TrainingGalleryDataset): Promise<TrainingGalleryDatasetPreview> {
+  const query = new URLSearchParams({
+    root_id: dataset.root_id,
+    relative_directory: dataset.relative_directory,
+    repeats: String(dataset.repeats),
+  })
+  if (dataset.caption_extension) query.set('caption_extension', dataset.caption_extension)
+  return apiClient.get<TrainingGalleryDatasetPreview>(`/training/datasets/gallery?${query}`)
+}
+
+export function browseTrainingPath(kind: 'model' | 'dataset' | 'output', path: string): Promise<TrainingPathBrowser> {
+  const query = new URLSearchParams({ kind, path })
+  return apiClient.get<TrainingPathBrowser>(`/training/paths?${query}`)
+}
+
+export function getTrainingPresets(): Promise<TrainingPreset[]> {
+  return apiClient.get<TrainingPreset[]>('/training/presets')
+}
+
+export function createTrainingPreset(input: TrainingPresetInput): Promise<TrainingPreset> {
+  return apiClient.post<TrainingPreset>('/training/presets', input)
+}
+
+export function updateTrainingPreset(id: string, input: TrainingPresetInput): Promise<TrainingPreset> {
+  return apiClient.put<TrainingPreset>(`/training/presets/${encodeURIComponent(id)}`, input)
+}
+
+export function exportTrainingPreset(id: string): Promise<{ name: string; toml: string }> {
+  return apiClient.get<{ name: string; toml: string }>(`/training/presets/${encodeURIComponent(id)}/export`)
+}
+
+export function importTrainingPreset(input: { name: string; adapter_id?: string; runtime_profile_id?: string; gpu_ids?: string[]; toml: string }): Promise<TrainingPreset> {
+  return apiClient.post<TrainingPreset>('/training/presets/import', input)
+}
+
+export function updateTrainingPresetToml(id: string, input: { name: string; adapter_id?: string; runtime_profile_id?: string; gpu_ids?: string[]; toml: string }): Promise<TrainingPreset> {
+  return apiClient.put<TrainingPreset>(`/training/presets/${encodeURIComponent(id)}/toml`, input)
+}
+
+export function getTrainingArtifacts(id: string): Promise<{ artifacts: TrainingArtifact[] }> {
+  return apiClient.get<{ artifacts: TrainingArtifact[] }>(`/training/tasks/${encodeURIComponent(id)}/artifacts`)
+}
+
+export function getTrainingLogs(taskId: string, tail = 300): Promise<TrainingLogs> {
+  return apiClient.get<TrainingLogs>(`/training/tasks/${encodeURIComponent(taskId)}/logs?tail=${Math.max(1, Math.min(2000, tail))}`)
+}
+
+export function previewTraining(adapterId: string, parameters: Record<string, unknown>): Promise<TrainingPreview> {
+  return apiClient.post<TrainingPreview>('/training/preview', { adapter_id: adapterId, parameters })
+}
+
+export function analyzeLoraSvd(request: LoraSvdAnalysisRequest): Promise<LoraSvdAnalysisResult> {
+  return apiClient.post<LoraSvdAnalysisResult>('/training/lora-svd/analyses', request)
+}
+
+export function loraSvdModuleUrl(analysisId: string, moduleId: string): string {
+  return `/api/training/lora-svd/analyses/${encodeURIComponent(analysisId)}/modules/${encodeURIComponent(moduleId)}`
+}
+
+export function loraSvdExportUrl(analysisId: string): string {
+  return `/api/training/lora-svd/analyses/${encodeURIComponent(analysisId)}/export`
+}
+
+export function createTrainingTask(request: TrainingTaskCreateRequest): Promise<TaskSummary> {
+  return apiClient.post<TaskSummary>('/tasks', request)
+}
+
+export function getTrainingMetrics(id: string, query: TrainingMetricQuery = {}, signal?: AbortSignal): Promise<TrainingMetricSnapshot> {
+  const params = new URLSearchParams()
+  for (const value of query.series ?? []) params.append('series', value)
+  if (query.maxPoints != null) params.set('max_points', String(query.maxPoints))
+  if (query.fromStep != null) params.set('from_step', String(query.fromStep))
+  if (query.toStep != null) params.set('to_step', String(query.toStep))
+  if (query.fromTimestamp != null) params.set('from_timestamp', String(query.fromTimestamp))
+  if (query.toTimestamp != null) params.set('to_timestamp', String(query.toTimestamp))
+  return apiClient.get<TrainingMetricSnapshot>(`/training/tasks/${encodeURIComponent(id)}/metrics?${params}`, { signal })
+}
+
+export function getTrainingMetricsOverview(id: string, signal?: AbortSignal): Promise<TrainingMetricsOverview> {
+  return apiClient.get<TrainingMetricsOverview>(`/training/tasks/${encodeURIComponent(id)}/metrics/overview`, { signal })
+}
+
+export function getTrainingCleanupPreview(id: string): Promise<TrainingCleanupPreview> {
+  return apiClient.get<TrainingCleanupPreview>(`/training/tasks/${encodeURIComponent(id)}/cleanup-preview`)
+}
+
+export function deleteTrainingTask(id: string): Promise<TrainingCleanupResult> {
+  return apiClient.delete<TrainingCleanupResult>(`/training/tasks/${encodeURIComponent(id)}`)
+}
+
+export function trainingMetricEventsUrl(id: string, after?: number): string {
+  const suffix = after == null ? '' : `?after=${encodeURIComponent(String(after))}`
+  return `/api/training/tasks/${encodeURIComponent(id)}/events${suffix}`
 }
