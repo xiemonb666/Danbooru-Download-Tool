@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   deleteSecret: vi.fn(),
   getMediaRoots: vi.fn(),
   loadVllmModel: vi.fn(),
+  unloadVllmModel: vi.fn(),
   getMediaDirectories: vi.fn(),
   createMediaDirectory: vi.fn(),
   saveSecret: vi.fn(),
@@ -27,6 +28,7 @@ vi.mock('../api', () => ({
   deleteSecret: mocks.deleteSecret,
   getMediaRoots: mocks.getMediaRoots,
   loadVllmModel: mocks.loadVllmModel,
+  unloadVllmModel: mocks.unloadVllmModel,
   getMediaDirectories: mocks.getMediaDirectories,
   createMediaDirectory: mocks.createMediaDirectory,
   saveSecret: mocks.saveSecret,
@@ -212,6 +214,17 @@ describe('SettingsView media root mapping', () => {
     await vi.waitFor(() => expect(mocks.loadVllmModel).toHaveBeenCalledOnce())
     expect(mocks.saveConfig).toHaveBeenCalledOnce()
     expect(mocks.success).toHaveBeenCalledWith('模型正在加载')
+    expect(mocks.healthCheck).toHaveBeenCalledOnce()
+  })
+
+  it('lets the user unload the vLLM model and refreshes its status', async () => {
+    mocks.unloadVllmModel.mockResolvedValue({ state: 'stopped', message: 'vLLM 模型已卸载，显存已释放' })
+    const view = render(SettingsView)
+
+    await fireEvent.click(await view.findByRole('button', { name: '卸载 vLLM 模型' }))
+
+    await vi.waitFor(() => expect(mocks.unloadVllmModel).toHaveBeenCalledOnce())
+    expect(mocks.success).toHaveBeenCalledWith('vLLM 模型已卸载，显存已释放')
     expect(mocks.healthCheck).toHaveBeenCalledOnce()
   })
 

@@ -29,6 +29,7 @@ _LOSS_TOTAL = 0.0
 _LOSS_COUNT = 0
 _LAST_STEP: int | None = None
 _LAST_STEP_AT: float | None = None
+_MAX_STEPS = 0
 
 
 def _number(value: Any) -> float | None:
@@ -85,6 +86,15 @@ def _write_metrics(step: int, metrics: dict[str, float]) -> None:
             stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def _attach_resources(numeric: dict[str, float]) -> None:
+    """Attach best-effort resource metrics at most every 2 seconds."""
+    global _LAST_RESOURCE_SAMPLE
+    now = time.monotonic()
+    if now - _LAST_RESOURCE_SAMPLE >= 2.0:
+        numeric.update(_resource_metrics())
+        _LAST_RESOURCE_SAMPLE = now
+
+
 def _training_progress_metrics(step: int, values: dict[str, float]) -> None:
     """Derive study-friendly series without changing the upstream trainer."""
     global _LOSS_TOTAL, _LOSS_COUNT, _LAST_STEP, _LAST_STEP_AT
@@ -96,16 +106,22 @@ def _training_progress_metrics(step: int, values: dict[str, float]) -> None:
         values["loss.average"] = _LOSS_TOTAL / _LOSS_COUNT
 
     now = time.monotonic()
+    try:
+        maximum = int(os.environ.get("DANBOORU_TRAINING_MAX_STEPS", "0"))
+    except ValueError:
+        maximum = 0
+    if maximum <= 0:
+        maximum = _MAX_STEPS
     if _LAST_STEP is not None and _LAST_STEP_AT is not None and step > _LAST_STEP:
         rate = (step - _LAST_STEP) / max(now - _LAST_STEP_AT, 1e-6)
         values["train.steps_per_second"] = rate
-        try:
-            maximum = int(os.environ.get("DANBOORU_TRAINING_MAX_STEPS", "0"))
-        except ValueError:
-            maximum = 0
         if maximum > 0:
+            values["train.max_steps"] = float(maximum)
             values["train.progress_percent"] = min(100.0, step / maximum * 100.0)
             values["train.eta_seconds"] = max(0.0, (maximum - step) / rate)
+    elif maximum > 0:
+        values["train.max_steps"] = float(maximum)
+        values["train.progress_percent"] = min(100.0, step / maximum * 100.0)
     _LAST_STEP = step
     _LAST_STEP_AT = now
 
@@ -128,17 +144,13 @@ def _install_accelerate_hook() -> None:
     original_log = Accelerator.log
 
     def observed_log(self: Any, values: Any, step: int | None = None, *args: Any, **kwargs: Any) -> Any:
-        global _LAST_RESOURCE_SAMPLE
         result = original_log(self, values, step=step, *args, **kwargs)
         numeric = {
             str(key): number
             for key, value in (values.items() if isinstance(values, dict) else [])
             if (number := _number(value)) is not None
         }
-        now = time.monotonic()
-        if now - _LAST_RESOURCE_SAMPLE >= 2.0:
-            numeric.update(_resource_metrics())
-            _LAST_RESOURCE_SAMPLE = now
+        _attach_resources(numeric)
         actual_step = step if step is not None else 0
         _training_progress_metrics(actual_step, numeric)
         _write_metrics(actual_step, numeric)
@@ -159,6 +171,68 @@ def _install_accelerate_hook() -> None:
     Accelerator.log = observed_log
 
 
+def _install_network_trainer_hook() -> None:
+    """kohya LoRA 路径 (train_network.py) 的每步指标只写入 accelerate tracker
+    (tracker.log)，不经过 ``Accelerator.log``，遥测 hook 因此收不到。直接挂钩
+    ``NetworkTrainer.accelerator_logging``，无论 tracker 是否存在都把数值
+    指标复写一份到 JSONL 流。"""
+    try:
+        from train_network import NetworkTrainer  # type: ignore
+    except Exception:
+        return
+
+    original = NetworkTrainer.accelerator_logging
+    epoch_keys = ("loss/epoch", "loss/epoch_average", "loss/validation/epoch_average", "loss/validation/epoch_divergence")
+
+    def observed(self, accelerator, logs, step_value, global_step, epoch, val_step=None):
+        try:
+            numeric = {
+                str(key): number
+                for key, value in (logs.items() if isinstance(logs, dict) else [])
+                if (number := _number(value)) is not None
+            }
+            if numeric:
+                _attach_resources(numeric)
+                if any(key in numeric for key in epoch_keys):
+                    _write_metrics(max(0, epoch), numeric)
+                else:
+                    _training_progress_metrics(global_step, numeric)
+                    _write_metrics(global_step, numeric)
+        except Exception:
+            pass
+        return original(self, accelerator, logs, step_value, global_step, epoch, val_step)
+
+    NetworkTrainer.accelerator_logging = observed
+
+
+def _install_progress_hook() -> None:
+    """kohya 总步数（max_train_steps）在训练循环里由 ``tqdm(range(...))``
+    决定，可能是 epoch 折算而来，无法从启动参数可靠得知。挂钩 tqdm 构造，
+    从 ``desc="steps"`` 进度条读取真实总步数，供进度条/ETA 使用。"""
+    global _MAX_STEPS
+    try:
+        import tqdm  # type: ignore
+    except Exception:
+        return
+
+    original_init = tqdm.tqdm.__init__
+
+    def observed_init(self, iterable=None, *args, **kwargs):
+        global _MAX_STEPS
+        if str(kwargs.get("desc", "")).startswith("steps"):
+            total = kwargs.get("total")
+            try:
+                if total is None and iterable is not None:
+                    total = len(iterable)
+            except TypeError:
+                total = None
+            if isinstance(total, int) and total > 0:
+                _MAX_STEPS = max(_MAX_STEPS or 0, total)
+        return original_init(self, iterable, *args, **kwargs)
+
+    tqdm.tqdm.__init__ = observed_init
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         raise SystemExit("usage: telemetry_launcher.py TRAINER [args...]")
@@ -171,6 +245,8 @@ def main() -> int:
     # explicit without depending on a globally modified PYTHONPATH.
     sys.path.insert(0, str(trainer.parent))
     _install_accelerate_hook()
+    _install_network_trainer_hook()
+    _install_progress_hook()
     sys.argv = [str(trainer), *sys.argv[2:]]
     try:
         runpy.run_path(str(trainer), run_name="__main__")

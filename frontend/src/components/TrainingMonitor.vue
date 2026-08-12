@@ -88,6 +88,7 @@ const lastMetrics = computed(() => overview.value
   .map((item) => item.latest)
   .sort((left, right) => left.series.localeCompare(right.series)))
 const trainingStepTarget = computed(() => overview.value.find((item) => item.series === 'train.max_steps')?.latest.value ?? null)
+const etaSeconds = computed(() => overview.value.find((item) => item.series === 'train.eta_seconds')?.latest.value ?? null)
 const currentTrainingStep = computed(() => Math.max(0, ...overview.value.map((item) => item.latest.step), ...metrics.value.map((item) => item.step)))
 const trainingProgressPercent = computed(() => trainingStepTarget.value
   ? clamp(currentTrainingStep.value / trainingStepTarget.value * 100, 0, 100)
@@ -107,8 +108,43 @@ function coordinate(metric: TrainingMetric): number {
   return axisMode.value === 'step' ? metric.step : timestampMilliseconds(metric.timestamp)
 }
 
+function dedupeByCoordinate(points: TrainingMetric[]): TrainingMetric[] {
+  const result: TrainingMetric[] = []
+  for (const point of points) {
+    const last = result[result.length - 1]
+    if (last && coordinate(last) === coordinate(point)) {
+      result[result.length - 1] = point
+      continue
+    }
+    result.push(point)
+  }
+  return result
+}
+
+function movingAverage(points: TrainingMetric[], window: number): TrainingMetric[] {
+  const size = Math.min(window, points.length)
+  if (size <= 1) return points
+  const prefix: number[] = [0]
+  for (const point of points) prefix.push(prefix[prefix.length - 1] + point.value)
+  const half = Math.floor((size - 1) / 2)
+  return points.map((point, index) => {
+    const start = Math.max(0, index - half)
+    const end = Math.min(points.length - 1, index + half)
+    const count = end - start + 1
+    return { ...point, value: (prefix[end + 1] - prefix[start]) / count }
+  })
+}
+
 function timestampMilliseconds(timestamp: number): number {
   return timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp
+}
+
+function formatDuration(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return '—'
+  const total = Math.round(seconds)
+  if (total >= 3600) return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`
+  if (total >= 60) return `${Math.floor(total / 60)}m ${total % 60}s`
+  return `${total}s`
 }
 
 function format(value: number | null): string {
@@ -203,8 +239,11 @@ function scheduleChartRender(): void {
 
 function renderChart(): void {
   if (!chart) return
-  const points = focusPoints.value
-  const smooth = smoothing.value === 0 ? false : smoothing.value / 100
+  const rawPoints = dedupeByCoordinate(focusPoints.value)
+  const smoothWindow = smoothing.value === 0
+    ? 1
+    : Math.max(2, Math.round((smoothing.value / 100) * Math.max(5, Math.round(rawPoints.length * 0.08))))
+  const points = smoothWindow <= 1 ? rawPoints : movingAverage(rawPoints, smoothWindow)
   const data = points.map((metric) => ({ value: [coordinate(metric), metric.value], metric }))
   chart.setOption({
     animation: false,
@@ -212,6 +251,7 @@ function renderChart(): void {
     grid: { left: 68, right: 24, top: 26, bottom: 30, containLabel: false },
     xAxis: {
       type: axisMode.value === 'time' ? 'time' : 'value',
+      scale: true,
       axisLine: { lineStyle: { color: '#cad8ed' } },
       axisTick: { show: false },
       axisLabel: { color: '#7184a0', fontFamily: 'var(--font-mono)', fontSize: 10, hideOverlap: true },
@@ -255,8 +295,7 @@ function renderChart(): void {
       data,
       showSymbol: false,
       symbol: 'circle',
-      smooth,
-      smoothMonotone: 'x',
+      smooth: false,
       clip: true,
       lineStyle: { width: 3.5, color: lineColor.value, cap: 'round', join: 'round' },
       itemStyle: { color: lineColor.value },
@@ -413,7 +452,7 @@ watch([focusPoints, axisMode, smoothing, lineColor], scheduleChartRender)
 
 function attachChart(host: HTMLElement | null): void {
   if (!host || chart) return
-  chart = init(host, undefined, { renderer: 'canvas', useDirtyRect: true })
+  chart = init(host, undefined, { renderer: 'canvas', useDirtyRect: false })
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
       if (resizeFrame !== null) return
@@ -454,7 +493,7 @@ onBeforeUnmount(() => {
       <button class="button button-small" type="button" :disabled="loading" @click="refresh"><RefreshCw :size="14" /> 刷新</button>
     </header>
     <section v-if="trainingStepTarget" class="training-step-progress">
-      <div><span>训练步骤 <InfoTooltip title="训练步骤" description="当前已完成的优化 step 与任务配置中的最大 step。部分上游训练器只能在启动后确定总步数。" /></span><strong>Step {{ currentTrainingStep }} / {{ trainingStepTarget }}</strong><small>{{ trainingProgressPercent.toFixed(1) }}%</small></div>
+      <div><span>训练步骤 <InfoTooltip title="训练步骤" description="当前已完成的优化 step 与任务配置中的最大 step。部分上游训练器只能在启动后确定总步数。" /></span><strong>Step {{ currentTrainingStep }} / {{ trainingStepTarget }}</strong><small>{{ trainingProgressPercent.toFixed(1) }}% · 预计剩余 {{ formatDuration(etaSeconds) }}</small></div>
       <div class="training-step-progress-track" role="progressbar" aria-label="训练步骤进度" :aria-valuemin="0" :aria-valuemax="trainingStepTarget" :aria-valuenow="currentTrainingStep"><i :style="{ width: `${trainingProgressPercent}%` }" /></div>
     </section>
     <p v-if="error" class="training-monitor-error">{{ error }}</p>

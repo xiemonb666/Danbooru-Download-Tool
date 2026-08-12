@@ -259,7 +259,8 @@ describe('ToolsView media selection boundary', () => {
 
     await fireEvent.click(within(card).getByRole('button', { name: '配置任务' }))
     const dialog = view.getByRole('dialog')
-    await fireEvent.update(within(dialog).getByLabelText('输出文件夹'), 'training/dataset-expanded')
+    expect(within(dialog).getByText(/不会另存为/)).toBeVisible()
+    expect(within(dialog).queryByLabelText('输出文件夹')).toBeNull()
     await fireEvent.click(within(dialog).getByLabelText('生成水平翻转副本（需要重新打标）'))
     await fireEvent.click(within(dialog).getByRole('button', { name: '创建任务' }))
 
@@ -268,7 +269,6 @@ describe('ToolsView media selection boundary', () => {
       root_id: root.id,
       options: {
         relative_directory: '.',
-        output_directory: 'training/dataset-expanded',
         min_megapixels: 1.8,
         min_long_side: 1536,
         min_short_side: 768,
@@ -308,6 +308,23 @@ describe('ToolsView media selection boundary', () => {
     expect(within(dialog).getByLabelText('生成肖像裁剪')).toBeChecked()
     expect(within(dialog).getByLabelText('生成上半身裁剪')).toBeChecked()
     expect(within(dialog).getByLabelText('生成紧凑全身裁剪')).toBeChecked()
+  })
+
+  it('groups dataset augmentation controls into a compact layout', async () => {
+    const view = render(ToolsView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+    const heading = await view.findByRole('heading', { name: '数据集增广' })
+    const card = heading.closest('article')
+    if (!card) throw new Error('Tool card is missing')
+
+    await fireEvent.click(within(card).getByRole('button', { name: '配置任务' }))
+    const dialog = view.getByRole('dialog')
+
+    expect(dialog.querySelector('.dataset-augmentation-grid')).toBeTruthy()
+    expect(dialog.querySelectorAll('.dataset-augmentation-section')).toHaveLength(3)
+    expect(dialog.querySelector('.dataset-resolution-grid')).toBeTruthy()
+    expect(dialog.querySelector('.dataset-split-grid')).toBeTruthy()
   })
 
   it('offers existing library folders instead of requiring users to remember relative paths', async () => {

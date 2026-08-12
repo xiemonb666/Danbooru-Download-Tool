@@ -46,7 +46,7 @@ const definitions: ToolDefinition[] = [
   { type: 'delete_by_tag', title: '按标签隔离', description: '规范化标签 token 后精确匹配，将匹配项移入可恢复隔离区。', action: '配置任务', icon: Trash2, preflight: true },
   { type: 'tag_pipeline', title: '标签处理', description: '恢复分类排序、过滤和 artist:/@ 前缀规则，预检后原子替换。', action: '配置任务', icon: Tags, preflight: true },
   { type: 'vllm_tag', title: '视觉模型打标', description: '可按相对目录批量打标；语言、提示词、联网校验和并发由设置控制。', action: '配置任务', icon: Bot, preflight: false },
-  { type: 'dataset_augmentation', title: '数据集增广', description: '创建独立训练数据集：原图不覆盖、严格不拉伸、按 family 防泄漏切分，并输出 JSONL metadata。', action: '配置任务', icon: WandSparkles, preflight: false },
+  { type: 'dataset_augmentation', title: '数据集增广', description: '原图留在源目录，生成无损派生图；按 family 防泄漏切分，并将元数据独立保存。', action: '配置任务', icon: WandSparkles, preflight: false },
 ]
 
 const roots = ref<MediaRoot[]>([])
@@ -67,7 +67,6 @@ const directoryLoadError = ref(false)
 const manualDirectory = ref(false)
 const resizeMaxSize = ref(1216)
 const resizeQuality = ref(90)
-const datasetOutputDirectory = ref('dataset-expanded')
 const datasetMinMegapixels = ref(1.8)
 const datasetMinLongSide = ref(1536)
 const datasetMinShortSide = ref(768)
@@ -314,7 +313,6 @@ async function createSelectedTask(): Promise<void> {
       root_id: rootId.value,
       options: {
         relative_directory,
-        output_directory: datasetOutputDirectory.value.trim(),
         min_megapixels: datasetMinMegapixels.value,
         min_long_side: datasetMinLongSide.value,
         min_short_side: datasetMinShortSide.value,
@@ -462,6 +460,7 @@ onMounted(async () => {
       :open="selectedTool !== null"
       :title="selectedTool?.preflight ? `创建${selectedTool?.title}预检` : `创建${selectedTool?.title}任务`"
       :confirm-label="selectedTool?.preflight ? '开始预检' : '创建任务'"
+      :wide="selectedTool?.type === 'dataset_augmentation'"
       :busy="creating"
       @cancel="selectedTool = null"
       @confirm="createSelectedTask"
@@ -507,81 +506,49 @@ onMounted(async () => {
         </div>
       </template>
       <template v-if="selectedTool?.type === 'dataset_augmentation'">
-        <div class="notice" style="margin-top: 12px">输出包含 raw、derived、metadata、splits 与 ready。仅原图及其现有标签会进入 ready 训练目录；所有翻转、裁剪派生图均不复制原标签，会写入 metadata/retagging.jsonl，完成重新打标前绝不会进入训练集。Bucket 只写入 metadata；图片不会为匹配尺寸而拉伸。</div>
-        <div class="notice" style="margin-top: 12px">
-          <strong>智能裁剪</strong> 会在原图保留的前提下，使用本地动漫检测模型生成自然构图；低置信或可能切断主体的候选会被拒绝。
-        </div>
-        <div class="field">
-          <label class="checkbox-row" for="dataset-smart-crop-enabled"><input id="dataset-smart-crop-enabled" v-model="datasetSmartCropEnabled" type="checkbox"> 启用 GPU 动漫智能裁剪（默认）</label>
-          <span class="field-help">使用 dghs-imgutils ONNX 动漫检测、HumanArt/RTMPose 与 ISNet 前景保护；不会回退到 CPU。</span>
-        </div>
-        <div v-if="datasetSmartCropEnabled" class="inline">
-          <div class="field">
-            <label class="field-label" for="dataset-smart-crop-runtime">Python 运行时</label>
-            <select id="dataset-smart-crop-runtime" v-model="datasetSmartCropRuntimeProfileId" class="select">
-              <option value="conda:lora">conda:lora（推荐）</option>
-              <option v-for="profile in trainingProfiles" :key="profile.id" :value="profile.id">{{ profile.label }}</option>
-            </select>
+        <section class="dataset-augmentation-form">
+          <p class="dataset-augmentation-summary">原图继续留在所选源目录，不会另存为 <code>original</code>。派生训练图写入 <code>.augmentation/&lt;任务 ID&gt;/</code>，JSONL、状态和拒绝记录独立写入 <code>.augmentation-metadata/&lt;任务 ID&gt;/</code>。</p>
+          <div class="dataset-augmentation-grid">
+            <section class="dataset-augmentation-section dataset-crop-section">
+              <div class="dataset-augmentation-section-header">
+                <div><strong>智能裁剪</strong><span>GPU 动漫人物、头部、手部、姿态与分割联合保护；低置信和多人重叠会拒绝个人裁剪。</span></div>
+                <label class="dataset-inline-check" for="dataset-smart-crop-enabled"><input id="dataset-smart-crop-enabled" v-model="datasetSmartCropEnabled" type="checkbox"> 开启</label>
+              </div>
+              <div v-if="datasetSmartCropEnabled" class="dataset-runtime-grid">
+                <div class="field"><label class="field-label" for="dataset-smart-crop-runtime">Python 运行时</label><select id="dataset-smart-crop-runtime" v-model="datasetSmartCropRuntimeProfileId" class="select"><option value="conda:lora">conda:lora（推荐）</option><option v-for="profile in trainingProfiles" :key="profile.id" :value="profile.id">{{ profile.label }}</option></select></div>
+                <div class="field"><label class="field-label" for="dataset-smart-crop-gpu">GPU 编号</label><input id="dataset-smart-crop-gpu" v-model="datasetSmartCropGpuId" class="input" inputmode="numeric" pattern="[0-9]*"></div>
+              </div>
+              <div v-if="datasetSmartCropEnabled" class="dataset-runtime-status">
+                <div class="inline"><button class="button button-small" type="button" :disabled="visionCropBusy" @click="checkVisionCropRuntime">检查运行时</button><button class="button button-small" type="button" :disabled="visionCropBusy" @click="installVisionCropModels">安装并预热检测模型</button></div>
+                <span v-if="visionCropHealth" class="field-help">{{ visionCropHealth.ready ? `已就绪：${visionCropHealth.gpu_name ?? 'GPU'}；${visionCropHealth.providers.join(', ')}` : visionCropHealth.message }}</span>
+                <span v-else class="field-help">anime-quality；任务会再次检查 CUDA provider、可用显存与模型状态，不会回退到 CPU。</span>
+              </div>
+              <div class="dataset-checkbox-grid"><label class="checkbox-row" for="dataset-smart-crop-portrait"><input id="dataset-smart-crop-portrait" v-model="datasetSmartCropPortrait" type="checkbox"> 生成肖像裁剪</label><label class="checkbox-row" for="dataset-smart-crop-upper-body"><input id="dataset-smart-crop-upper-body" v-model="datasetSmartCropUpperBody" type="checkbox"> 生成上半身裁剪</label><label class="checkbox-row" for="dataset-smart-crop-full-body"><input id="dataset-smart-crop-full-body" v-model="datasetSmartCropFullBody" type="checkbox"> 生成紧凑全身裁剪</label></div>
+            </section>
+
+            <section class="dataset-augmentation-section">
+              <div class="dataset-augmentation-section-header"><div><strong>输出位置与质量筛选</strong><span>派生图保存为无损 PNG；不缩放、不拉伸，也不重新 JPEG 压缩。</span></div></div>
+              <p class="field-help">路径由处理范围自动决定：<code>所选原始目录/.augmentation/&lt;任务 ID&gt;/</code>。因此导入训练时可自动绑定原图与每个派生子集。</p>
+              <div class="dataset-resolution-grid">
+                <div class="field"><label class="field-label" for="dataset-min-megapixels">最小像素数（MP）</label><input id="dataset-min-megapixels" v-model.number="datasetMinMegapixels" class="input" type="number" min="0.1" max="1000" step="0.1"></div>
+                <div class="field"><label class="field-label" for="dataset-min-long-side">最小长边像素</label><input id="dataset-min-long-side" v-model.number="datasetMinLongSide" class="input" type="number" min="1" max="100000"></div>
+                <div class="field"><label class="field-label" for="dataset-min-short-side">最小原生短边</label><input id="dataset-min-short-side" v-model.number="datasetMinShortSide" class="input" type="number" min="1" max="100000"></div>
+              </div>
+              <label class="checkbox-row" for="dataset-horizontal-flip"><input id="dataset-horizontal-flip" v-model="datasetHorizontalFlip" type="checkbox"> 生成水平翻转副本（需要重新打标）</label>
+            </section>
+
+            <section class="dataset-augmentation-section">
+              <div class="dataset-augmentation-section-header"><div><strong>二次打标与数据切分</strong><span>派生图可交给 vLLM 重打标，整组 family 始终留在同一训练切分。</span></div></div>
+              <div class="field"><label class="checkbox-row" for="dataset-retag-vllm"><input id="dataset-retag-vllm" v-model="datasetRetagWithVllm" type="checkbox"> 增广完成后发送派生图到 vLLM 二次打标</label><label v-if="datasetRetagWithVllm" class="checkbox-row" for="dataset-retag-identity"><input id="dataset-retag-identity" v-model="datasetPreserveArtistCharacterTags" type="checkbox"> 将原图 artist / character 标签置于新标签最前（逗号分隔）</label></div>
+              <div class="dataset-split-grid">
+                <div class="field"><label class="field-label" for="dataset-train-percent">训练集比例</label><input id="dataset-train-percent" v-model.number="datasetTrainPercent" class="input" type="number" min="0" max="100"></div>
+                <div class="field"><label class="field-label" for="dataset-validation-percent">验证集比例</label><input id="dataset-validation-percent" v-model.number="datasetValidationPercent" class="input" type="number" min="0" max="100"></div>
+                <div class="field"><label class="field-label" for="dataset-test-percent">测试集比例</label><input id="dataset-test-percent" v-model.number="datasetTestPercent" class="input" type="number" min="0" max="100"></div>
+              </div>
+              <span class="field-help">三项必须合计 100；只含 vLLM 成功写入新 Caption 的派生图才会加入对应的 ready 子集。</span>
+            </section>
           </div>
-          <div class="field">
-            <label class="field-label" for="dataset-smart-crop-gpu">GPU 编号</label>
-            <input id="dataset-smart-crop-gpu" v-model="datasetSmartCropGpuId" class="input" inputmode="numeric" pattern="[0-9]*">
-          </div>
-        </div>
-        <div v-if="datasetSmartCropEnabled" class="field">
-          <div class="inline">
-            <button class="button button-small" type="button" :disabled="visionCropBusy" @click="checkVisionCropRuntime">检查运行时</button>
-            <button class="button button-small" type="button" :disabled="visionCropBusy" @click="installVisionCropModels">安装并预热检测模型</button>
-          </div>
-          <span v-if="visionCropHealth" class="field-help">
-            {{ visionCropHealth.ready ? `已就绪：${visionCropHealth.gpu_name ?? 'GPU'}；${visionCropHealth.providers.join(', ')}` : visionCropHealth.message }}
-          </span>
-          <span v-else class="field-help">质量档：anime-quality。任务开始前会再次检查 CUDA provider、GPU 可用显存与模型状态。</span>
-        </div>
-        <div class="field">
-          <label class="checkbox-row" for="dataset-smart-crop-portrait"><input id="dataset-smart-crop-portrait" v-model="datasetSmartCropPortrait" type="checkbox"> 生成肖像裁剪</label>
-          <label class="checkbox-row" for="dataset-smart-crop-upper-body"><input id="dataset-smart-crop-upper-body" v-model="datasetSmartCropUpperBody" type="checkbox"> 生成上半身裁剪</label>
-          <label class="checkbox-row" for="dataset-smart-crop-full-body"><input id="dataset-smart-crop-full-body" v-model="datasetSmartCropFullBody" type="checkbox"> 生成紧凑全身裁剪</label>
-        </div>
-        <div class="field">
-          <label class="checkbox-row" for="dataset-retag-vllm"><input id="dataset-retag-vllm" v-model="datasetRetagWithVllm" type="checkbox"> 增广完成后发送派生图到 vLLM 二次打标</label>
-          <label v-if="datasetRetagWithVllm" class="checkbox-row" for="dataset-retag-identity"><input id="dataset-retag-identity" v-model="datasetPreserveArtistCharacterTags" type="checkbox"> 将原图 artist / character 标签置于新标签最前（逗号分隔）</label>
-          <span class="field-help">未勾选时派生图保持无标签并被排除训练；勾选后只有 vLLM 成功写入的新 Caption 才会加入对应的 ready 子集。</span>
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-output-directory">输出文件夹</label>
-          <input id="dataset-output-directory" v-model="datasetOutputDirectory" class="input" placeholder="例如：dataset-expanded" autocomplete="off">
-          <span class="field-help">相对于媒体库；每次任务会在该目录创建独立的任务子目录。</span>
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-min-megapixels">最小像素数（MP）</label>
-          <input id="dataset-min-megapixels" v-model.number="datasetMinMegapixels" class="input" type="number" min="0.1" max="1000" step="0.1">
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-min-long-side">最小长边像素</label>
-          <input id="dataset-min-long-side" v-model.number="datasetMinLongSide" class="input" type="number" min="1" max="100000">
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-min-short-side">最小原生短边像素</label>
-          <input id="dataset-min-short-side" v-model.number="datasetMinShortSide" class="input" type="number" min="1" max="100000">
-        </div>
-        <div class="field">
-          <label class="checkbox-row" for="dataset-horizontal-flip"><input id="dataset-horizontal-flip" v-model="datasetHorizontalFlip" type="checkbox"> 生成水平翻转副本（需要重新打标）</label>
-        </div>
-        <div class="field-help">派生图保存为无损 PNG，不会因增广重新 JPEG 压缩而损失细节；原图始终以原始文件保留。</div>
-        <div class="field">
-          <label class="field-label" for="dataset-train-percent">训练集比例</label>
-          <input id="dataset-train-percent" v-model.number="datasetTrainPercent" class="input" type="number" min="0" max="100">
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-validation-percent">验证集比例</label>
-          <input id="dataset-validation-percent" v-model.number="datasetValidationPercent" class="input" type="number" min="0" max="100">
-        </div>
-        <div class="field">
-          <label class="field-label" for="dataset-test-percent">测试集比例</label>
-          <input id="dataset-test-percent" v-model.number="datasetTestPercent" class="input" type="number" min="0" max="100">
-          <span class="field-help">三项必须合计 100；同一 family 及 SHA-256 相同来源会始终进入同一个切分。</span>
-        </div>
+        </section>
       </template>
       <div v-if="selectedTool?.type === 'tag_pipeline'" class="field">
         <label class="field-label" for="artist-prefix">艺术家标签前缀</label>

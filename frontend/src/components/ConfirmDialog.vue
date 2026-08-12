@@ -8,11 +8,13 @@ const props = withDefaults(defineProps<{
   cancelLabel?: string
   destructive?: boolean
   busy?: boolean
+  wide?: boolean
 }>(), {
   confirmLabel: '确认',
   cancelLabel: '取消',
   destructive: false,
   busy: false,
+  wide: false,
 })
 
 const emit = defineEmits<{ confirm: []; cancel: [] }>()
@@ -68,6 +70,7 @@ onMounted(() => {
         <section
           ref="dialog"
           class="dialog"
+          :class="{ 'dialog-wide': wide }"
           role="dialog"
           aria-modal="true"
           aria-labelledby="confirm-title"

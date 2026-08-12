@@ -61,6 +61,12 @@ pub struct VllmLoadStatus {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VllmUnloadStatus {
+    pub state: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UgoiraPolicy {
@@ -900,6 +906,24 @@ pub struct TrainingGalleryDatasetResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingAugmentationSubsetResponse {
+    pub task_id: String,
+    pub id: String,
+    pub label: String,
+    pub relative_directory: String,
+    pub caption_extension: String,
+    pub repeats: u32,
+    pub image_count: u64,
+    pub caption_count: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingAugmentationDiscoveryResponse {
+    pub source: TrainingGalleryDatasetResponse,
+    pub subsets: Vec<TrainingAugmentationSubsetResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TrainingPathEntry {
     pub name: String,
     pub path: String,
@@ -1232,6 +1256,9 @@ mod paths {
     #[utoipa::path(post, path = "/api/vllm/load", responses((status = 200, body = ApiSuccess<VllmLoadStatus>), (status = 400, body = ApiFailure), (status = 500, body = ApiFailure)))]
     pub async fn vllm_load() {}
 
+    #[utoipa::path(post, path = "/api/vllm/unload", responses((status = 200, body = ApiSuccess<VllmUnloadStatus>), (status = 400, body = ApiFailure), (status = 500, body = ApiFailure)))]
+    pub async fn vllm_unload() {}
+
     #[utoipa::path(get, path = "/api/config", responses((status = 200, body = ApiSuccess<AppConfig>)))]
     pub async fn get_config() {}
 
@@ -1322,6 +1349,9 @@ mod paths {
     #[utoipa::path(get, path = "/api/training/datasets/gallery", params(("root_id" = String, Query), ("relative_directory" = Option<String>, Query), ("repeats" = u32, Query), ("caption_extension" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<TrainingGalleryDatasetResponse>), (status = 400, body = ApiFailure)))]
     pub async fn training_gallery_dataset() {}
 
+    #[utoipa::path(get, path = "/api/training/datasets/augmentations", params(("root_id" = String, Query), ("relative_directory" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<TrainingAugmentationDiscoveryResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_gallery_augmentations() {}
+
     #[utoipa::path(get, path = "/api/training/paths", params(("kind" = String, Query), ("path" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<TrainingPathBrowserResponse>), (status = 400, body = ApiFailure)))]
     pub async fn training_path_browser() {}
 
@@ -1405,6 +1435,7 @@ mod paths {
         paths::health,
         paths::vllm_health,
         paths::vllm_load,
+        paths::vllm_unload,
         paths::get_config,
         paths::update_config,
         paths::put_secret,
@@ -1435,6 +1466,7 @@ mod paths {
         paths::training_gpus,
         paths::training_queue,
         paths::training_gallery_dataset,
+        paths::training_gallery_augmentations,
         paths::training_path_browser,
         paths::list_training_presets,
         paths::create_training_preset,
@@ -1513,6 +1545,8 @@ mod paths {
         TrainingQueueEntry,
         TrainingQueueResponse,
         TrainingGalleryDatasetResponse,
+        TrainingAugmentationSubsetResponse,
+        TrainingAugmentationDiscoveryResponse,
         TrainingPathEntry,
         TrainingPathBrowserResponse,
         TrainingPresetInput,
@@ -1544,6 +1578,7 @@ mod paths {
         HealthStatus,
         VllmHealthStatus,
         VllmLoadStatus,
+        VllmUnloadStatus,
         ApiFailure,
     ))
 )]
@@ -1574,7 +1609,7 @@ mod tests {
         let document = document();
         // Training runtime discovery, diagnostics, installation and live logs
         // are public API operations and must stay represented in the contract.
-        assert_eq!(document.paths.paths.len(), 50);
+        assert_eq!(document.paths.paths.len(), 52);
         let operation_count = document
             .paths
             .paths
@@ -1595,7 +1630,7 @@ mod tests {
                 .count()
             })
             .sum::<usize>();
-        assert_eq!(operation_count, 58);
+        assert_eq!(operation_count, 60);
         for path in [
             "/api/training/runtime-profiles",
             "/api/training/runtime-profiles/{id}/diagnostics",
@@ -1604,6 +1639,7 @@ mod tests {
             "/api/vision-crop/runtime-profiles/{id}/install",
             "/api/training/queue",
             "/api/training/datasets/gallery",
+            "/api/training/datasets/augmentations",
             "/api/training/paths",
             "/api/training/presets",
             "/api/training/presets/{id}/toml",

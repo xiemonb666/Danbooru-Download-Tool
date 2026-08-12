@@ -216,6 +216,12 @@ export function loadVllmModel(): Promise<VllmLoadStatus> {
   return apiClient.post<VllmLoadStatus>('/vllm/load')
 }
 
+export type VllmUnloadStatus = ApiSchema<'VllmUnloadStatus'>
+
+export function unloadVllmModel(): Promise<VllmUnloadStatus> {
+  return apiClient.post<VllmUnloadStatus>('/vllm/unload')
+}
+
 export type DanbooruPostsPage = ApiSchema<'DanbooruPostsPage'>
 
 export interface DanbooruPostsParams {
@@ -357,22 +363,31 @@ export function deleteSecret(kind: SecretKind): Promise<SecretResponse> {
   return apiClient.delete<SecretResponse>(`/secrets/${kind}`)
 }
 
+export interface TrainingSubgroup {
+  id: string
+  label: string
+}
+
 export interface TrainingGroup {
   id: string
   label: string
   description: string
+  subgroups: TrainingSubgroup[]
 }
 
 export interface TrainingField {
   key: string
   label: string
   group: string
+  subgroup: string
   kind: 'path' | 'text' | 'number' | 'boolean' | 'select' | 'list' | 'json' | 'secret'
   default: unknown
   choices: string[]
   required: boolean
   advanced: boolean
   help: string
+  description: string
+  when_to_adjust: string
 }
 
 export interface TrainingAdapter {
@@ -566,6 +581,22 @@ export interface TrainingGalleryDatasetPreview {
   effective_image_count: number
 }
 
+export interface TrainingAugmentationSubset {
+  task_id: string
+  id: 'horizontal_flip' | 'portrait' | 'upper_body' | 'full_body_tight'
+  label: string
+  relative_directory: string
+  caption_extension: string
+  repeats: number
+  image_count: number
+  caption_count: number
+}
+
+export interface TrainingAugmentationDiscovery {
+  source: TrainingGalleryDatasetPreview
+  subsets: TrainingAugmentationSubset[]
+}
+
 export type TrainingSamplePromptSource = 'manual' | 'dataset_captions'
 
 export interface TrainingSampleSettings {
@@ -687,6 +718,11 @@ export function previewTrainingGalleryDataset(dataset: TrainingGalleryDataset): 
   })
   if (dataset.caption_extension) query.set('caption_extension', dataset.caption_extension)
   return apiClient.get<TrainingGalleryDatasetPreview>(`/training/datasets/gallery?${query}`)
+}
+
+export function discoverTrainingGalleryAugmentations(rootId: string, relativeDirectory: string): Promise<TrainingAugmentationDiscovery> {
+  const query = new URLSearchParams({ root_id: rootId, relative_directory: relativeDirectory })
+  return apiClient.get<TrainingAugmentationDiscovery>(`/training/datasets/augmentations?${query}`)
 }
 
 export function browseTrainingPath(kind: 'model' | 'dataset' | 'output', path: string): Promise<TrainingPathBrowser> {

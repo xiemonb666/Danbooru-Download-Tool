@@ -9,6 +9,7 @@ import {
   getMediaRoots,
   loadVllmModel,
   saveSecret,
+  unloadVllmModel,
   updateMediaRoot,
   type MediaRoot,
   type SaveMediaRootRequest,
@@ -34,6 +35,7 @@ const vllmSecret = ref('')
 const allowedHosts = ref('')
 const credentialSaving = ref<SecretKind | null>(null)
 const vllmLoading = ref(false)
+const vllmUnloading = ref(false)
 
 const vllmPromptPresets = {
   danbooru: 'You are a Danbooru image tagging assistant. Return concise, canonical Danbooru tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas, replace spaces inside tags with underscores, and do not include prose or explanations.',
@@ -94,6 +96,19 @@ async function requestVllmModelLoad(): Promise<void> {
     toast.error('无法加载 vLLM 模型', reason instanceof Error ? reason.message : '未知错误')
   } finally {
     vllmLoading.value = false
+  }
+}
+
+async function requestVllmModelUnload(): Promise<void> {
+  vllmUnloading.value = true
+  try {
+    const result = await unloadVllmModel()
+    toast.success(result.message)
+    await health.check()
+  } catch (reason: unknown) {
+    toast.error('无法卸载 vLLM 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    vllmUnloading.value = false
   }
 }
 
@@ -325,7 +340,10 @@ onMounted(() => {
             <div class="credential-row">
               <Server :size="20" :class="health.vllmStatus === 'online' ? 'configured' : 'not-configured'" />
               <span><strong>{{ health.vllmStatus === 'online' ? 'vLLM 正常' : health.vllmStatus === 'offline' ? 'vLLM 离线' : '正在检查 vLLM' }}</strong><small>{{ health.vllmMessage }}</small></span>
-              <button type="button" class="button button-small" :disabled="vllmLoading || health.vllmStatus === 'online'" @click="requestVllmModelLoad">{{ vllmLoading ? '正在请求加载' : health.vllmStatus === 'online' ? '模型已加载' : '加载 vLLM 模型' }}</button>
+              <span class="inline">
+                <button type="button" class="button button-small" :disabled="vllmLoading || vllmUnloading || health.vllmStatus === 'online'" @click="requestVllmModelLoad">{{ vllmLoading ? '正在请求加载' : health.vllmStatus === 'online' ? '模型已加载' : '加载 vLLM 模型' }}</button>
+                <button type="button" class="button button-small button-danger" :disabled="vllmLoading || vllmUnloading" @click="requestVllmModelUnload">{{ vllmUnloading ? '正在卸载' : '卸载 vLLM 模型' }}</button>
+              </span>
             </div>
           </div>
         </section>

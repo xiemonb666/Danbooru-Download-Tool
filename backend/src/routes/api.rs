@@ -338,6 +338,12 @@ struct VllmLoadResponse {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct VllmUnloadResponse {
+    state: &'static str,
+    message: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     settings_path: PathBuf,
@@ -1503,6 +1509,56 @@ fn launch_vllm_process(project_root: &Path, port: u16) -> Result<(), String> {
         .map_err(|error| format!("无法启动 vLLM: {error}"))
 }
 
+fn unload_vllm_process(project_root: &Path) -> Result<&'static str, String> {
+    let (launcher, program) = if cfg!(windows) {
+        (project_root.join("stop_vllm.bat"), None)
+    } else {
+        (project_root.join("stop_vllm.sh"), Some("bash"))
+    };
+    if !launcher.is_file() {
+        return Err(format!("找不到 vLLM 卸载脚本: {}", launcher.display()));
+    }
+    let mut command = if let Some(program) = program {
+        let mut command = Command::new(program);
+        command.arg(&launcher);
+        command
+    } else {
+        Command::new(&launcher)
+    };
+    let output = command
+        .current_dir(project_root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("无法执行 vLLM 卸载脚本: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(if detail.is_empty() {
+            format!("vLLM 卸载脚本退出失败（{}）", output.status)
+        } else {
+            format!("vLLM 卸载失败：{detail}")
+        });
+    }
+    if stdout
+        .lines()
+        .any(|line| line.trim() == "VLLM_UNLOAD_STATE=stopped")
+    {
+        Ok("stopped")
+    } else if stdout
+        .lines()
+        .any(|line| line.trim() == "VLLM_UNLOAD_STATE=not_running")
+    {
+        Ok("not_running")
+    } else {
+        Err("vLLM 卸载脚本返回了未知状态".to_string())
+    }
+}
+
 fn isolated_mode_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
@@ -1617,6 +1673,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/vllm/health", get(vllm_health))
         .route("/api/vllm/load", axum::routing::post(vllm_load))
+        .route("/api/vllm/unload", axum::routing::post(vllm_unload))
         .route("/api/config", get(get_config).put(update_config))
         .route(
             "/api/secrets/{kind}",
@@ -1673,6 +1730,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route(
             "/api/training/datasets/gallery",
             get(training_gallery_dataset_preview),
+        )
+        .route(
+            "/api/training/datasets/augmentations",
+            get(training_gallery_augmentation_discovery),
         )
         .route("/api/training/paths", get(training_path_browser))
         .route(
@@ -2002,6 +2063,191 @@ async fn training_gallery_dataset_preview(
 }
 
 #[derive(Debug, Deserialize)]
+struct TrainingAugmentationDiscoveryQuery {
+    root_id: String,
+    #[serde(default)]
+    relative_directory: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TrainingAugmentationDiscoveryResponse {
+    source: TrainingGalleryDatasetResponse,
+    subsets: Vec<TrainingAugmentationSubsetResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrainingAugmentationSubsetResponse {
+    task_id: String,
+    id: String,
+    label: String,
+    relative_directory: String,
+    caption_extension: String,
+    repeats: u32,
+    image_count: u64,
+    caption_count: u64,
+}
+
+async fn training_gallery_augmentation_discovery(
+    State(state): State<AppState>,
+    Query(query): Query<TrainingAugmentationDiscoveryQuery>,
+) -> Result<Json<ApiSuccess<TrainingAugmentationDiscoveryResponse>>, ApiError> {
+    let source_dataset = TrainingGalleryDataset {
+        root_id: query.root_id.clone(),
+        relative_directory: query.relative_directory.clone(),
+        repeats: 1,
+        caption_extension: Some(".txt".to_string()),
+    };
+    let source = inspect_training_gallery_dataset(&state, &source_dataset)?;
+    let root = state
+        .database
+        .get_root(&query.root_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::not_found("root_not_found", "媒体根不存在"))?;
+    let verified = VerifiedMediaRoot::open(current_platform_path(&root)?).map_err(|error| {
+        ApiError::bad_request("root_unavailable", format!("媒体根当前不可访问: {error}"))
+    })?;
+    let metadata_relative =
+        PathBuf::from(&source.relative_directory).join(".augmentation-metadata");
+    let metadata_directory = verified.resolve(&metadata_relative).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_gallery_dataset",
+            format!("增广元数据目录不可用: {error}"),
+        )
+    })?;
+    let mut subsets = Vec::new();
+    if metadata_directory.is_dir() {
+        let mut entries = std::fs::read_dir(&metadata_directory)
+            .map_err(|error| ApiError::internal(format!("无法读取增广元数据: {error}")))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+        for entry in entries.into_iter().take(100) {
+            if !matches!(entry.file_type(), Ok(file_type) if !file_type.is_symlink() && file_type.is_dir())
+            {
+                continue;
+            }
+            let task_id = entry.file_name().to_string_lossy().to_string();
+            if task_id.is_empty() || entry.path().join("INCOMPLETE.json").is_file() {
+                continue;
+            }
+            let ready_path = entry.path().join("READY.json");
+            if !matches!(std::fs::metadata(&ready_path), Ok(metadata) if metadata.is_file() && metadata.len() <= 2 * 1024 * 1024)
+            {
+                continue;
+            }
+            let ready = match std::fs::read(&ready_path)
+                .ok()
+                .and_then(|content| serde_json::from_slice::<Value>(&content).ok())
+            {
+                Some(ready) => ready,
+                None => continue,
+            };
+            let Some(manifest_subsets) = ready
+                .get("training_subsets")
+                .and_then(|manifest| manifest.get("subsets"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let expected_prefix = PathBuf::from(&source.relative_directory)
+                .join(".augmentation")
+                .join(&task_id)
+                .join("ready/train");
+            for subset in manifest_subsets {
+                let Some(id) = subset.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !matches!(
+                    id,
+                    "horizontal_flip" | "portrait" | "upper_body" | "full_body_tight"
+                ) {
+                    continue;
+                }
+                let Some(relative_directory) =
+                    subset.get("relative_directory").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let relative_directory = match normalize_task_relative_directory(relative_directory)
+                {
+                    Ok(relative_directory) => relative_directory,
+                    Err(_) => continue,
+                };
+                if !Path::new(&relative_directory).starts_with(&expected_prefix) {
+                    continue;
+                }
+                let repeats = subset
+                    .get("default_repeats")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(1)
+                    .clamp(1, 10_000);
+                let dataset = TrainingGalleryDataset {
+                    root_id: query.root_id.clone(),
+                    relative_directory: relative_directory.clone(),
+                    repeats,
+                    caption_extension: Some(source.caption_extension.clone()),
+                };
+                let inspection = match inspect_training_gallery_dataset(&state, &dataset) {
+                    Ok(inspection)
+                        if inspection.image_count > 0
+                            && inspection.caption_count == inspection.image_count =>
+                    {
+                        inspection
+                    }
+                    _ => continue,
+                };
+                subsets.push(TrainingAugmentationSubsetResponse {
+                    task_id: task_id.clone(),
+                    id: id.to_string(),
+                    label: subset
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or(id)
+                        .to_string(),
+                    relative_directory,
+                    caption_extension: inspection.caption_extension,
+                    repeats: inspection.repeats,
+                    image_count: inspection.image_count,
+                    caption_count: inspection.caption_count,
+                });
+            }
+        }
+    }
+    subsets.sort_by(|left, right| {
+        left.task_id
+            .cmp(&right.task_id)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(ApiSuccess {
+        data: TrainingAugmentationDiscoveryResponse {
+            source: training_gallery_dataset_response(source),
+            subsets,
+        },
+        meta: None,
+    }))
+}
+
+fn training_gallery_dataset_response(
+    inspection: TrainingGalleryDatasetInspection,
+) -> TrainingGalleryDatasetResponse {
+    TrainingGalleryDatasetResponse {
+        root_id: inspection.root_id,
+        root_name: inspection.root_name,
+        relative_directory: inspection.relative_directory,
+        image_dir: inspection.image_dir.to_string_lossy().to_string(),
+        caption_extension: inspection.caption_extension,
+        image_count: inspection.image_count,
+        caption_count: inspection.caption_count,
+        repeats: inspection.repeats,
+        effective_image_count: inspection
+            .image_count
+            .saturating_mul(inspection.repeats as u64),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct TrainingPathBrowserQuery {
     kind: String,
     path: Option<String>,
@@ -2197,6 +2443,26 @@ fn has_incomplete_augmentation_marker(root: &VerifiedMediaRoot, image_dir: &Path
     loop {
         if current.join("INCOMPLETE.json").is_file() {
             return true;
+        }
+        if current
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".augmentation")
+        {
+            let Some(source_directory) = current.parent().and_then(Path::parent) else {
+                return false;
+            };
+            let Some(task_id) = current.file_name() else {
+                return false;
+            };
+            if source_directory
+                .join(".augmentation-metadata")
+                .join(task_id)
+                .join("INCOMPLETE.json")
+                .is_file()
+            {
+                return true;
+            }
         }
         if current == root.path() {
             return false;
@@ -3687,9 +3953,28 @@ async fn export_lora_svd_analysis(
     }))
 }
 
+/// serde_urlencoded 0.7 只通过 `series[]=` 方括号语法收集 Vec；对常见的
+/// 单值 `series=loss` 会直接报 "expected a sequence"。这里与两种写法都兼容，
+/// 避免监控页与第三方调用方因为参数写法不同而收到 400。
+fn deserialize_series_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SeriesValue {
+        One(String),
+        Many(Vec<String>),
+    }
+    match SeriesValue::deserialize(deserializer)? {
+        SeriesValue::One(value) => Ok(vec![value]),
+        SeriesValue::Many(values) => Ok(values),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TrainingMetricsQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_series_list")]
     series: Vec<String>,
     max_points: Option<usize>,
     from_step: Option<u64>,
@@ -4764,6 +5049,31 @@ async fn vllm_load(
         data: VllmLoadResponse {
             state: "started",
             message: "已开始加载 vLLM 模型；首次加载可能需要数分钟，可在此页查看状态。".to_string(),
+        },
+        meta: None,
+    }))
+}
+
+async fn vllm_unload(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<VllmUnloadResponse>>, ApiError> {
+    let settings = state.settings.read().await.clone();
+    configured_local_vllm_port(&settings.vllm_base_url)
+        .map_err(|message| ApiError::bad_request("invalid_vllm_launch_endpoint", message))?;
+    let Some(project_root) = state.vllm_launcher_root.as_deref() else {
+        return Err(ApiError::internal("找不到随应用提供的 vLLM 卸载脚本"));
+    };
+    let unload_state = unload_vllm_process(project_root).map_err(ApiError::internal)?;
+    state.vllm_loads.clear();
+    let message = if unload_state == "stopped" {
+        "vLLM 模型已卸载，显存已释放。".to_string()
+    } else {
+        "没有发现由本应用启动的 vLLM 模型。外部 vLLM 服务不会被停止。".to_string()
+    };
+    Ok(Json(ApiSuccess {
+        data: VllmUnloadResponse {
+            state: unload_state,
+            message,
         },
         meta: None,
     }))
@@ -6699,12 +7009,20 @@ fn sanitize_task_result(task: &TaskSnapshot) -> Option<Value> {
             }
         }
         "dataset_augmentation" => {
-            for key in ["generated", "rejected"] {
+            for key in [
+                "source_images",
+                "generated",
+                "rejected",
+                "retagging_pending",
+                "retagged",
+            ] {
                 copy_count(key);
             }
             for key in [
                 "output_relative_directory",
                 "derived_relative_directory",
+                "metadata_relative_directory",
+                "training_relative_directory",
                 "next_step",
             ] {
                 if let Some(value) = object.get(key).and_then(Value::as_str) {
@@ -6712,6 +7030,46 @@ fn sanitize_task_result(task: &TaskSnapshot) -> Option<Value> {
                         key.to_string(),
                         Value::String(value.chars().take(4_096).collect()),
                     );
+                }
+            }
+            for key in ["variant_counts", "rejection_reasons"] {
+                if let Some(value) = sanitized_count_map(object.get(key), 8) {
+                    safe.insert(key.to_string(), value);
+                }
+            }
+            if let Some(smart_crop) = object.get("smart_crop").and_then(Value::as_object) {
+                let mut crop = serde_json::Map::new();
+                if let Some(enabled) = smart_crop.get("enabled").and_then(Value::as_bool) {
+                    crop.insert("enabled".to_string(), Value::Bool(enabled));
+                }
+                for key in ["generated", "rejected"] {
+                    if let Some(value) =
+                        smart_crop.get(key).filter(|value| value.as_u64().is_some())
+                    {
+                        crop.insert(key.to_string(), value.clone());
+                    }
+                }
+                if let Some(coverage) = smart_crop
+                    .get("coverage_percent")
+                    .and_then(Value::as_object)
+                {
+                    let mut safe_coverage = serde_json::Map::new();
+                    for (variant, value) in coverage.iter().take(4) {
+                        let Some(average) = value.get("average").filter(|value| value.is_number())
+                        else {
+                            continue;
+                        };
+                        safe_coverage.insert(
+                            variant.chars().take(64).collect(),
+                            serde_json::json!({ "average": average }),
+                        );
+                    }
+                    if !safe_coverage.is_empty() {
+                        crop.insert("coverage_percent".to_string(), Value::Object(safe_coverage));
+                    }
+                }
+                if !crop.is_empty() {
+                    safe.insert("smart_crop".to_string(), Value::Object(crop));
                 }
             }
         }
@@ -6749,6 +7107,17 @@ fn sanitize_task_result(task: &TaskSnapshot) -> Option<Value> {
             }
         }
         _ => {}
+    }
+    (!safe.is_empty()).then_some(Value::Object(safe))
+}
+
+fn sanitized_count_map(value: Option<&Value>, limit: usize) -> Option<Value> {
+    let values = value?.as_object()?;
+    let mut safe = serde_json::Map::new();
+    for (key, value) in values.iter().take(limit) {
+        if value.as_u64().is_some() {
+            safe.insert(key.chars().take(512).collect(), value.clone());
+        }
     }
     (!safe.is_empty()).then_some(Value::Object(safe))
 }
@@ -7190,6 +7559,7 @@ fn validate_task_request(state: &AppState, request: &CreateTaskRequest) -> Resul
                     &[
                         "media_ids",
                         "output_directory",
+                        "augmentation_source_directory",
                         "min_megapixels",
                         "min_long_side",
                         "min_short_side",
@@ -7225,6 +7595,9 @@ fn validate_task_request(state: &AppState, request: &CreateTaskRequest) -> Resul
             let augmentation_config = (request.kind == "dataset_augmentation")
                 .then(|| parse_dataset_augmentation_config(request.options.as_ref()))
                 .transpose()?;
+            let augmentation_output_directory = (request.kind == "dataset_augmentation")
+                .then(|| dataset_augmentation_output_directory(request.options.as_ref()))
+                .transpose()?;
             for media_id in media_ids {
                 let media = state
                     .database
@@ -7245,24 +7618,26 @@ fn validate_task_request(state: &AppState, request: &CreateTaskRequest) -> Resul
                 {
                     unsupported_vllm_media.push(media_id.clone());
                 }
-                if let Some(config) = augmentation_config.as_ref() {
+                if augmentation_config.is_some() {
                     if !is_supported_dataset_augmentation_media(
                         &media.relative_path,
                         &media.mime_type,
                     ) {
                         unsupported_augmentation_media.push(media_id.clone());
                     }
-                    let output_prefix = format!(
-                        "{}/",
-                        config.output_directory.to_string_lossy().replace('\\', "/")
-                    );
                     let media_path = media.relative_path.replace('\\', "/");
-                    if media_path == config.output_directory.to_string_lossy().replace('\\', "/")
+                    let output_directory = augmentation_output_directory
+                        .as_ref()
+                        .expect("dataset augmentation output directory must be resolved");
+                    let output_prefix =
+                        format!("{}/", output_directory.to_string_lossy().replace('\\', "/"));
+                    if is_augmentation_derived_path(&media.relative_path)
+                        || media_path == output_directory.to_string_lossy().replace('\\', "/")
                         || media_path.starts_with(&output_prefix)
                     {
                         return Err(ApiError::bad_request(
                             "dataset_output_source_overlap",
-                            "数据集输出目录不能作为本次增广的输入范围",
+                            "派生增广图片不能再次作为增广输入；请改选原始数据目录",
                         ));
                     }
                 }
@@ -7700,6 +8075,7 @@ fn expand_relative_directory_selection(
         "resize" => item.mime_type.starts_with("image/"),
         "dataset_augmentation" => {
             is_supported_dataset_augmentation_media(&item.relative_path, &item.mime_type)
+                && !is_augmentation_derived_path(&item.relative_path)
         }
         _ => true,
     });
@@ -7716,6 +8092,12 @@ fn expand_relative_directory_selection(
         ));
     }
     options.remove("relative_directory");
+    if request.kind == "dataset_augmentation" {
+        options.insert(
+            "augmentation_source_directory".to_string(),
+            Value::String(directory),
+        );
+    }
     options.insert(
         "media_ids".to_string(),
         Value::Array(
@@ -7781,8 +8163,10 @@ fn parse_artist_prefix(options: Option<&Value>) -> Result<ArtistPrefix, ApiError
 #[serde(deny_unknown_fields)]
 struct DatasetAugmentationOptions {
     media_ids: Vec<String>,
+    #[serde(default, rename = "output_directory")]
+    _output_directory: Option<String>,
     #[serde(default)]
-    output_directory: Option<String>,
+    augmentation_source_directory: Option<String>,
     #[serde(default)]
     min_megapixels: Option<f64>,
     #[serde(default)]
@@ -7855,16 +8239,6 @@ fn parse_dataset_augmentation_config(
         ));
     }
     let mut config = DatasetAugmentationConfig::default();
-    if let Some(directory) = input.output_directory {
-        let directory = normalize_task_relative_directory(&directory)?;
-        if directory.is_empty() {
-            return Err(ApiError::bad_request(
-                "invalid_dataset_output_directory",
-                "请指定媒体库内的数据集输出目录",
-            ));
-        }
-        config.output_directory = PathBuf::from(directory);
-    }
     if let Some(value) = input.min_megapixels {
         config.min_megapixels = value;
     }
@@ -7929,6 +8303,29 @@ fn parse_dataset_augmentation_config(
     Ok(config)
 }
 
+fn dataset_augmentation_source_directory(options: Option<&Value>) -> Result<PathBuf, ApiError> {
+    let options = options.ok_or_else(|| {
+        ApiError::bad_request("missing_dataset_augmentation_options", "缺少数据集增广选项")
+    })?;
+    let input: DatasetAugmentationOptions =
+        serde_json::from_value(options.clone()).map_err(|_| {
+            ApiError::bad_request(
+                "invalid_dataset_augmentation_options",
+                "数据集增广选项格式无效",
+            )
+        })?;
+    input
+        .augmentation_source_directory
+        .as_deref()
+        .map(normalize_task_relative_directory)
+        .transpose()
+        .map(|directory| directory.map(PathBuf::from).unwrap_or_default())
+}
+
+fn dataset_augmentation_output_directory(options: Option<&Value>) -> Result<PathBuf, ApiError> {
+    Ok(dataset_augmentation_source_directory(options)?.join(".augmentation"))
+}
+
 fn is_supported_vllm_media(relative_path: &str, mime_type: &str) -> bool {
     let extension = Path::new(relative_path)
         .extension()
@@ -7958,6 +8355,13 @@ fn is_supported_dataset_augmentation_media(relative_path: &str, mime_type: &str)
         Some("webp") => mime_type == "image/webp",
         _ => false,
     }
+}
+
+fn is_augmentation_derived_path(relative_path: &str) -> bool {
+    Path::new(relative_path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| component == ".augmentation")
 }
 
 async fn task_action(
@@ -9723,8 +10127,11 @@ async fn run_dataset_augmentation_task(
             message: error.to_string(),
             retryable: false,
         })?;
-    let config =
+    let mut config =
         parse_dataset_augmentation_config(request.options.as_ref()).map_err(api_task_failure)?;
+    let source_directory = dataset_augmentation_source_directory(request.options.as_ref())
+        .map_err(api_task_failure)?;
+    config.output_directory = source_directory.join(".augmentation");
     let media_ids = validated_task_media_ids(request.options.as_ref()).map_err(api_task_failure)?;
     let root = state
         .database
@@ -9816,6 +10223,7 @@ async fn run_dataset_augmentation_task(
     };
 
     let retagging_config = config.retagging.clone();
+    let smart_crop_enabled = config.smart_crop.enabled;
     let source_lookup = sources
         .iter()
         .map(|source| (source.media_id.clone(), source.clone()))
@@ -9880,11 +10288,7 @@ async fn run_dataset_augmentation_task(
                             mime_type: dataset_augmentation_mime_type(&sample.output_relative_path)
                                 .to_string(),
                             byte_size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-                            sha256: if sample.variant == "original" {
-                                source.sha256.clone()
-                            } else {
-                                None
-                            },
+                            sha256: None,
                             md5: None,
                             width: Some(i64::from(sample.width)),
                             height: Some(i64::from(sample.height)),
@@ -9944,18 +10348,54 @@ async fn run_dataset_augmentation_task(
     }
     let summary = workspace.finish().map_err(tool_task_failure)?;
     let mut variant_counts = BTreeMap::<String, usize>::new();
+    let mut crop_coverage = BTreeMap::<String, (usize, f64)>::new();
     for sample in &generated_samples {
         *variant_counts.entry(sample.variant.clone()).or_default() += 1;
+        if matches!(
+            sample.variant.as_str(),
+            "portrait" | "upper_body" | "full_body_tight"
+        ) {
+            if let Some(source) = source_media.get(&sample.source_media_id) {
+                let source_width = source.width.unwrap_or_default().max(1) as f64;
+                let source_height = source.height.unwrap_or_default().max(1) as f64;
+                let retained_percent = (f64::from(sample.width) * f64::from(sample.height))
+                    / (source_width * source_height)
+                    * 100.0;
+                let entry = crop_coverage.entry(sample.variant.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += retained_percent;
+            }
+        }
     }
+    let crop_coverage = crop_coverage
+        .into_iter()
+        .map(|(variant, (count, total_percent))| {
+            (
+                variant,
+                serde_json::json!({
+                    "count": count,
+                    "average": (total_percent / count.max(1) as f64 * 10.0).round() / 10.0,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    let smart_crop_rejected = summary
+        .rejection_reasons
+        .iter()
+        .filter(|(reason, _)| reason.starts_with("智能裁剪拒绝："))
+        .map(|(_, count)| count)
+        .sum::<usize>();
     Ok(WorkerOutcome::Complete(serde_json::json!({
         "output_relative_directory": summary.output_relative_directory,
         "derived_relative_directory": summary.derived_relative_directory,
+        "metadata_relative_directory": summary.metadata_relative_directory,
         "training_relative_directory": summary.training_relative_directory,
+        "source_images": source_media.len(),
         "generated": summary.generated,
         "rejected": summary.rejected,
         "retagging_pending": summary.retagging_pending,
         "retagged": summary.retagged,
-        "training_subsets_relative_path": summary.output_relative_directory.join("metadata/training-subsets.json"),
+        "training_subsets_relative_path": summary.metadata_relative_directory.join("metadata/training-subsets.json"),
         "retagging": {
             "requested": retagging_config.send_to_vllm,
             "preserve_artist_character_tags": retagging_config.preserve_artist_character_tags,
@@ -9965,7 +10405,14 @@ async fn run_dataset_augmentation_task(
         "samples": generated_samples,
         "rejections": rejections,
         "variant_counts": variant_counts,
-        "next_step": if summary.retagging_pending == 0 { "原图与已二次打标的派生子集已按 family 和 split 绑定。可在训练工作台选择 metadata/training-subsets.json 所列的子集，并为每个子集设置独立 repeat。" } else { "训练目录只包含原图及已二次打标的派生图。尚未完成的派生图没有复制原标签，保留在 metadata/retagging.jsonl，完成重新打标后才可加入训练。" },
+        "smart_crop": {
+            "enabled": smart_crop_enabled,
+            "generated": generated_samples.iter().filter(|sample| matches!(sample.variant.as_str(), "portrait" | "upper_body" | "full_body_tight")).count(),
+            "rejected": smart_crop_rejected,
+            "coverage_percent": crop_coverage,
+        },
+        "rejection_reasons": summary.rejection_reasons,
+        "next_step": if summary.retagging_pending == 0 { "原图保留在所选源目录；已二次打标的派生子集位于 .augmentation，任务元数据位于 .augmentation-metadata。训练工作台会自动发现可用派生子集，并可分别设置 repeat。" } else { "原图保留在源目录且不会复制。派生图没有沿用原标签，待重新打标的状态和原因在 .augmentation-metadata 中；只有完成二次打标的派生图会被训练工作台自动加入。" },
     })))
 }
 
@@ -13467,12 +13914,18 @@ mod security_contract_tests {
         let temporary = tempfile::tempdir().unwrap();
         let images = temporary
             .path()
-            .join("dataset-expanded/task-1/ready/train/images");
+            .join("odette/.augmentation/task-1/ready/train/portrait/images");
         std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(
+            temporary
+                .path()
+                .join("odette/.augmentation-metadata/task-1"),
+        )
+        .unwrap();
         std::fs::write(
             temporary
                 .path()
-                .join("dataset-expanded/task-1/INCOMPLETE.json"),
+                .join("odette/.augmentation-metadata/task-1/INCOMPLETE.json"),
             "{}",
         )
         .unwrap();
@@ -13483,7 +13936,7 @@ mod security_contract_tests {
         std::fs::remove_file(
             temporary
                 .path()
-                .join("dataset-expanded/task-1/INCOMPLETE.json"),
+                .join("odette/.augmentation-metadata/task-1/INCOMPLETE.json"),
         )
         .unwrap();
         assert!(!has_incomplete_augmentation_marker(&root, &images));
@@ -14021,6 +14474,67 @@ mod security_contract_tests {
         assert_eq!(payload["data"]["image_count"], 0);
     }
 
+    #[tokio::test]
+    async fn training_gallery_discovers_ready_augmentation_subsets_without_an_original_copy() {
+        let (application, state, directory) = test_router();
+        let media = directory.path().join("gallery-media");
+        let source = media.join("odette");
+        let derived = source.join(".augmentation/task-portrait/ready/train/portrait/images");
+        let metadata = source.join(".augmentation-metadata/task-portrait");
+        std::fs::create_dir_all(&derived).unwrap();
+        std::fs::create_dir_all(metadata.join("metadata")).unwrap();
+        std::fs::write(source.join("source.png"), b"image").unwrap();
+        std::fs::write(source.join("source.txt"), b"caption").unwrap();
+        std::fs::write(derived.join("crop.png"), b"image").unwrap();
+        std::fs::write(derived.join("crop.txt"), b"new caption").unwrap();
+        std::fs::write(
+            metadata.join("READY.json"),
+            serde_json::json!({
+                "training_subsets": {
+                    "subsets": [{
+                        "id": "portrait",
+                        "label": "肖像裁剪",
+                        "relative_directory": "odette/.augmentation/task-portrait/ready/train/portrait/images",
+                        "requires_retagging": true,
+                        "training_ready_count": 1,
+                        "default_repeats": 1
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        state
+            .database
+            .create_root(
+                "gallery-root-augmentations",
+                "图库",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/training/datasets/augmentations?root_id=gallery-root-augmentations&relative_directory=odette")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["data"]["source"]["relative_directory"], "odette");
+        assert_eq!(payload["data"]["subsets"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["data"]["subsets"][0]["id"], "portrait");
+        assert_eq!(
+            payload["data"]["subsets"][0]["relative_directory"],
+            "odette/.augmentation/task-portrait/ready/train/portrait/images"
+        );
+    }
+
     #[test]
     fn gallery_dataset_config_references_the_original_library_and_repeat_count() {
         let inspection = TrainingGalleryDatasetInspection {
@@ -14225,6 +14739,35 @@ mod security_contract_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn training_metrics_query_accepts_single_and_absent_series_values() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        use axum::body::Body;
+        let cases: [(&str, Option<(Vec<String>, Option<usize>)>); 3] = [
+            ("/metrics?series=loss&max_points=1200", Some((vec!["loss".to_string()], Some(1200)))),
+            ("/metrics?series=loss/current&max_points=2000", Some((vec!["loss/current".to_string()], Some(2000)))),
+            ("/metrics", Some((vec![], None))),
+        ];
+        for (uri, expected) in cases {
+            let request = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let (mut parts, _) = request.into_parts();
+            let parsed = axum::extract::Query::<crate::routes::api::TrainingMetricsQuery>::from_request_parts(&mut parts, &()).await;
+            match (parsed, expected) {
+                (Ok(parsed), Some((series, points))) => {
+                    assert_eq!(parsed.series, series, "uri {uri}");
+                    assert_eq!(parsed.max_points, points, "uri {uri}");
+                }
+                (Err(error), Some(_)) => panic!("Query rejection for {uri}: {error:?}"),
+                (Ok(_), None) => panic!("expected rejection for {uri}"),
+                (Err(_), None) => {}
+            }
+        }
     }
 
     #[test]
@@ -15299,6 +15842,29 @@ mod security_contract_tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/vllm/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "invalid_vllm_launch_endpoint");
+    }
+
+    #[tokio::test]
+    async fn vllm_unload_endpoint_rejects_a_non_local_model_endpoint() {
+        let (application, state, _directory) = test_router();
+        state.settings.write().await.vllm_base_url = "https://vision.example.com/v1".to_string();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vllm/unload")
                     .body(Body::empty())
                     .unwrap(),
             )

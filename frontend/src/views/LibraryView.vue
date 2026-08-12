@@ -89,6 +89,29 @@ async function loadDirectories(): Promise<void> {
   }
 }
 
+function isPlainRootBrowse(): boolean {
+  return activeDirectory.value === ''
+    && queryInput.value.trim() === ''
+    && scoreRangeInput.value === ''
+    && resolutionRangeInput.value === ''
+}
+
+function enterFirstDirectoryIfEmptyRoot(): boolean {
+  if (!isPlainRootBrowse() || page.value?.total !== 0 || !folderDirectories.value.length) return false
+  activeDirectory.value = folderDirectories.value[0]
+  resetToFirstPage()
+  void router.replace({
+    path: '/library',
+    query: { root: activeRootId.value, directory: activeDirectory.value },
+  })
+  void loadPage()
+  return true
+}
+
+watch(folderDirectories, () => {
+  enterFirstDirectoryIfEmptyRoot()
+})
+
 async function loadPage(): Promise<void> {
   if (!activeRootId.value) {
     page.value = null
@@ -121,6 +144,7 @@ async function loadPage(): Promise<void> {
         currentPage.value = response.page
         jumpPageInput.value = String(response.page)
       }
+      if (enterFirstDirectoryIfEmptyRoot()) return
     }
   } catch (reason: unknown) {
     if (controller === requestController && !(reason instanceof DOMException && reason.name === 'AbortError')) {

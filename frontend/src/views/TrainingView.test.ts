@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const apiMocks = vi.hoisted(() => ({
   createTrainingTask: vi.fn(),
+  discoverTrainingGalleryAugmentations: vi.fn(),
   getTrainingCleanupPreview: vi.fn(),
   deleteTrainingTask: vi.fn(),
 }))
@@ -24,7 +25,6 @@ vi.mock('../api', () => ({
       { key: 'network_module', label: '网络模块', group: 'network', kind: 'select', default: 'networks.lora', choices: ['networks.lora', 'lycoris.kohya'], required: true, advanced: false, help: '选择网络实现' },
       { key: 'bucket_reso_steps', label: 'Bucket 步长', group: 'network', kind: 'number', default: 32, choices: [], required: false, advanced: false, help: 'SDXL 必须为 32 的倍数' },
       { key: 'sample_sampler', label: '样图采样器', group: 'saving', kind: 'select', default: 'euler_a', choices: ['ddim', 'euler_a'], required: false, advanced: true, help: '样图采样器' },
-      { key: 'conv_dim', label: 'Conv Dim', group: 'network', kind: 'number', default: null, choices: [], required: false, advanced: true, help: '卷积 rank' },
       { key: 'optimizer_type', label: '优化器', group: 'optimizer', kind: 'select', default: 'AdamW8bit', choices: ['AdamW8bit', 'AdaFactor', 'Prodigy'], required: true, advanced: false, help: '优化器类型' },
       { key: 'optimizer_args', label: '优化器参数', group: 'optimizer', kind: 'list', default: [], choices: [], required: false, advanced: true, help: '额外参数' },
       { key: 'log_with', label: '日志后端', group: 'logging', kind: 'select', default: 'tensorboard', choices: ['tensorboard', 'wandb'], required: false, advanced: false, help: '日志记录器' },
@@ -43,6 +43,7 @@ vi.mock('../api', () => ({
   getMediaRoots: vi.fn().mockResolvedValue([{ id: 'gallery-root', name: '角色图库', media_count: 24 }]),
   getMediaDirectories: vi.fn().mockResolvedValue({ directories: ['odette'] }),
   previewTrainingGalleryDataset: vi.fn().mockImplementation((dataset) => Promise.resolve({ root_id: 'gallery-root', root_name: '角色图库', relative_directory: 'odette', image_dir: 'D:/gallery/odette', caption_extension: '.txt', image_count: 12, caption_count: 12, repeats: dataset.repeats, effective_image_count: 12 * dataset.repeats })),
+  discoverTrainingGalleryAugmentations: apiMocks.discoverTrainingGalleryAugmentations,
   exportTrainingPreset: vi.fn(),
   importTrainingPreset: vi.fn(),
   updateTrainingPreset: vi.fn(),
@@ -61,13 +62,18 @@ describe('TrainingView', () => {
     window.localStorage.clear()
     apiMocks.createTrainingTask.mockReset()
     apiMocks.createTrainingTask.mockResolvedValue({ id: 'training-1' })
+    apiMocks.discoverTrainingGalleryAugmentations.mockReset()
+    apiMocks.discoverTrainingGalleryAugmentations.mockResolvedValue({
+      source: { root_id: 'gallery-root', root_name: '角色图库', relative_directory: 'odette', image_dir: 'D:/gallery/odette', caption_extension: '.txt', image_count: 12, caption_count: 12, repeats: 1, effective_image_count: 12 },
+      subsets: [{ task_id: 'crop-task', id: 'portrait', label: '肖像裁剪', relative_directory: 'odette/.augmentation/crop-task/ready/train/portrait/images', caption_extension: '.txt', repeats: 1, image_count: 5, caption_count: 5 }],
+    })
     apiMocks.getTrainingCleanupPreview.mockReset()
     apiMocks.getTrainingCleanupPreview.mockResolvedValue({ deletable: [], retained: [] })
     apiMocks.deleteTrainingTask.mockReset()
     apiMocks.deleteTrainingTask.mockResolvedValue({ task_id: 'training-1', deleted: [], retained: [] })
   })
 
-  it('uses detected GPUs and keeps convolution rank hidden for normal LoRA', async () => {
+  it('uses detected GPUs in the training workbench', async () => {
     const view = render(TrainingView, { global: { plugins: [createPinia()] } })
     expect(view.getByRole('heading', { name: '训练工作台' })).toBeVisible()
     expect(view.getByRole('button', { name: '配置训练' })).toBeVisible()
@@ -75,7 +81,6 @@ describe('TrainingView', () => {
     expect(view.getByRole('button', { name: 'LoRA SVD 分析' })).toBeVisible()
     await fireEvent.click(await view.findByText('自动选择空闲 GPU'))
     expect(await view.findByRole('checkbox', { name: /GPU 0 · RTX 5090/ })).toBeVisible()
-    expect(view.queryByLabelText(/Conv Dim/)).not.toBeInTheDocument()
     expect(view.getByRole('button', { name: '保存参数记录' })).toBeVisible()
   })
 
@@ -87,11 +92,10 @@ describe('TrainingView', () => {
     expect(view.getByRole('button', { name: 'LoRA SVD 分析' })).toBeVisible()
   })
 
-  it('reveals convolution rank for LyCORIS and restores a saved parameter record', async () => {
+  it('restores a saved parameter record after switching network modules', async () => {
     const view = render(TrainingView, { global: { plugins: [createPinia()] } })
     const networkModule = await view.findByLabelText(/网络模块/)
     await fireEvent.update(networkModule, 'lycoris.kohya')
-    expect(await view.findByLabelText(/Conv Dim/)).toBeVisible()
 
     await fireEvent.click(view.getByText('自动选择空闲 GPU'))
     const gpu = await view.findByRole('checkbox', { name: /GPU 0 · RTX 5090/ })
@@ -103,11 +107,9 @@ describe('TrainingView', () => {
     const record = await view.findByRole('option', { name: 'LyCORIS 实验' }) as HTMLOptionElement
     await fireEvent.update(history, record.value)
     await fireEvent.update(networkModule, 'networks.lora')
-    expect(view.queryByLabelText(/Conv Dim/)).not.toBeInTheDocument()
     await fireEvent.click(view.getByRole('button', { name: '加载记录' }))
 
     await waitFor(() => expect(networkModule).toHaveValue('lycoris.kohya'))
-    expect(await view.findByLabelText(/Conv Dim/)).toBeVisible()
     expect(gpu).toBeChecked()
   })
 
@@ -196,10 +198,60 @@ describe('TrainingView', () => {
     const root = await view.findByLabelText('图库根') as HTMLSelectElement
     await fireEvent.update(root, 'gallery-root')
     await fireEvent.update(await view.findByLabelText('图库目录'), 'odette')
-    await fireEvent.update(view.getByLabelText('Repeat'), '3')
+    await fireEvent.update(view.getByLabelText('图库 Repeat'), '3')
 
     expect(await view.findByText('12 张图片 × 3 repeat')).toBeVisible()
     expect(view.getByText(/数据只引用原目录，不复制或改写图库素材/)).toBeVisible()
+  })
+
+  it('automatically binds ready augmentation subsets and keeps an independent repeat for each one', async () => {
+    const view = render(TrainingView, { global: { plugins: [createPinia()] } })
+    await fireEvent.click(await view.findByRole('button', { name: '从图库引用' }))
+    await fireEvent.update(await view.findByLabelText('图库根'), 'gallery-root')
+    await fireEvent.update(await view.findByLabelText('图库目录'), 'odette')
+
+    expect(await view.findByText('1 / 1 已启用')).toBeVisible()
+    expect(await view.findByText('12 张图片 × 1 repeat')).toBeVisible()
+    const repeat = view.getByLabelText('肖像裁剪 Repeat') as HTMLInputElement
+    await fireEvent.update(repeat, '3')
+    await fireEvent.update(view.getByLabelText('运行时'), 'conda:lora')
+    await fireEvent.click(view.getByRole('button', { name: '加入训练队列' }))
+
+    await waitFor(() => expect(apiMocks.createTrainingTask).toHaveBeenCalledWith(expect.objectContaining({
+      training: expect.objectContaining({
+        gallery_datasets: expect.arrayContaining([
+          expect.objectContaining({ relative_directory: 'odette', repeats: 1 }),
+          expect.objectContaining({ relative_directory: 'odette/.augmentation/crop-task/ready/train/portrait/images', repeats: 3 }),
+        ]),
+      }),
+    })))
+  })
+
+  it('omits augmentation subsets that are toggled off from the bound datasets', async () => {
+    const view = render(TrainingView, { global: { plugins: [createPinia()] } })
+    await fireEvent.click(await view.findByRole('button', { name: '从图库引用' }))
+    await fireEvent.update(await view.findByLabelText('图库根'), 'gallery-root')
+    await fireEvent.update(await view.findByLabelText('图库目录'), 'odette')
+
+    expect(await view.findByText('1 / 1 已启用')).toBeVisible()
+    await fireEvent.click(view.getByRole('checkbox', { name: '停用 肖像裁剪' }))
+    expect(await view.findByText('0 / 1 已启用')).toBeVisible()
+
+    await fireEvent.update(view.getByLabelText('运行时'), 'conda:lora')
+    await fireEvent.click(view.getByRole('button', { name: '加入训练队列' }))
+
+    await waitFor(() => expect(apiMocks.createTrainingTask).toHaveBeenCalledWith(expect.objectContaining({
+      training: expect.objectContaining({
+        gallery_datasets: expect.arrayContaining([
+          expect.objectContaining({ relative_directory: 'odette', repeats: 1 }),
+        ]),
+      }),
+    })))
+    const createCall = apiMocks.createTrainingTask.mock.calls[0]
+    const galleryDatasets = (createCall[0] as { training: { gallery_datasets: { relative_directory: string }[] } })
+      .training.gallery_datasets
+    expect(galleryDatasets.some((dataset) =>
+      dataset.relative_directory.includes('.augmentation'))).toBe(false)
   })
 
   it('only enables sample generation after an explicit choice and keeps negative prompt independent', async () => {

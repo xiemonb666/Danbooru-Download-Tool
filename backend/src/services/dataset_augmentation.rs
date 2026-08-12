@@ -18,10 +18,12 @@ const RESOLUTION_BUCKETS: &[(u32, u32)] = &[
 const MAX_SOURCE_PIXELS: u64 = 100_000_000;
 const MAX_UPSCALE_RATIO: f64 = 1.20;
 const SMART_CROP_MIN_SCORE: f32 = 0.55;
-/// A derived crop must visibly change the composition.  Requiring at least an
-/// thirty-percent canvas reduction avoids visually near-original JPEG re-encodes
-/// under portrait/upper-body/full-body filenames.
-const MAX_NEAR_ORIGINAL_AREA_RATIO: f32 = 0.70;
+/// A derived crop must visibly change the composition. Portraits are held to
+/// the strictest retained-area limit so that a portrait label never masks an
+/// image that still reads like the original full composition.
+const MAX_PORTRAIT_AREA_RATIO: f32 = 0.55;
+const MAX_UPPER_BODY_AREA_RATIO: f32 = 0.65;
+const MAX_FULL_BODY_TIGHT_AREA_RATIO: f32 = 0.68;
 /// A near-canvas ISNet mask is not useful crop evidence.  It can describe an
 /// illustration plus its decorative foreground, so using it would turn every
 /// safe composition back into the source canvas.
@@ -223,7 +225,7 @@ pub struct DatasetAugmentationConfig {
 impl Default for DatasetAugmentationConfig {
     fn default() -> Self {
         Self {
-            output_directory: PathBuf::from("dataset-expanded"),
+            output_directory: PathBuf::from(".augmentation"),
             min_megapixels: 1.8,
             min_long_side: 1536,
             min_short_side: 768,
@@ -309,12 +311,14 @@ pub enum DatasetAugmentationItemResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetAugmentationSummary {
     pub output_relative_directory: PathBuf,
+    pub metadata_relative_directory: PathBuf,
     pub derived_relative_directory: PathBuf,
     pub training_relative_directory: PathBuf,
     pub generated: usize,
     pub rejected: usize,
     pub retagging_pending: usize,
     pub retagged: usize,
+    pub rejection_reasons: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,11 +360,13 @@ pub struct DatasetAugmentationWorkspace {
     root: VerifiedMediaRoot,
     config: DatasetAugmentationConfig,
     output_relative: PathBuf,
+    metadata_relative: PathBuf,
     generated: usize,
     rejected: usize,
     retagging_pending: usize,
     retagged: usize,
     ready_variant_counts: BTreeMap<String, usize>,
+    rejection_reasons: BTreeMap<String, usize>,
 }
 
 impl DatasetAugmentationWorkspace {
@@ -370,29 +376,29 @@ impl DatasetAugmentationWorkspace {
         config: DatasetAugmentationConfig,
     ) -> Result<Self, ToolError> {
         config.validate().map_err(ToolError::InvalidManifest)?;
-        let output_relative = next_output_directory(&root, &config.output_directory, task_id)?;
+        let (output_relative, metadata_relative) =
+            next_augmentation_directories(&root, &config.output_directory, task_id)?;
         let output = root.resolve(&output_relative)?;
+        let metadata = root.resolve(&metadata_relative)?;
         for directory in [
-            "raw/images",
-            "raw/labels",
             "derived/horizontal_flip/images",
-            "derived/horizontal_flip/labels",
             "derived/portrait/images",
-            "derived/portrait/labels",
             "derived/upper_body/images",
-            "derived/upper_body/labels",
             "derived/full_body_tight/images",
-            "derived/full_body_tight/labels",
             "metadata",
             "retagging",
             "splits",
             "rejected",
         ] {
-            fs::create_dir_all(output.join(directory)).map_err(ToolError::Io)?;
+            if directory.starts_with("derived/") {
+                fs::create_dir_all(output.join(directory)).map_err(ToolError::Io)?;
+            } else {
+                fs::create_dir_all(metadata.join(directory)).map_err(ToolError::Io)?;
+            }
         }
-        write_json_atomic(&output.join("metadata/config.json"), &config)?;
+        write_json_atomic(&metadata.join("metadata/config.json"), &config)?;
         write_json_atomic(
-            &output.join("INCOMPLETE.json"),
+            &metadata.join("INCOMPLETE.json"),
             &serde_json::json!({
                 "format_version": 1,
                 "state": "incomplete",
@@ -404,11 +410,13 @@ impl DatasetAugmentationWorkspace {
             root,
             config,
             output_relative,
+            metadata_relative,
             generated: 0,
             rejected: 0,
             retagging_pending: 0,
             retagged: 0,
             ready_variant_counts: BTreeMap::new(),
+            rejection_reasons: BTreeMap::new(),
         })
     }
 
@@ -439,30 +447,17 @@ impl DatasetAugmentationWorkspace {
                 reason,
             };
             self.append_json_line("rejected/rejections.jsonl", &rejection)?;
+            self.record_rejection_reason(&rejection.reason);
             self.rejected += 1;
             return Ok(DatasetAugmentationItemResult::Rejected(rejection));
         }
 
-        let output = self.root.resolve(&self.output_relative)?;
-        let caption = source_caption(&self.root, &source.relative_path, &source.fallback_caption)?;
         let token = source_token(source);
         let family_id = family_id(source);
         let split = split_for_family(&family_id, &self.config);
-        let extension = source_extension(&source.relative_path)?;
-        let raw_image = output
-            .join("raw/images")
-            .join(format!("{token}.{extension}"));
-        let raw_label = output.join("raw/labels").join(format!("{token}.txt"));
-        copy_new_file(&source_path, &raw_image)?;
-        write_text_atomic(&raw_label, &caption)?;
-        write_text_atomic(&raw_image.with_extension("txt"), &caption)?;
 
         let bucket = choose_bucket(width, height);
         let mut samples = Vec::new();
-        let original = self.write_original_sample(
-            source, &token, &family_id, &split, extension, width, height, bucket,
-        )?;
-        samples.push(original);
         if self.config.horizontal_flip {
             let flipped = image.fliph();
             samples.push(self.write_flipped_sample(
@@ -563,47 +558,18 @@ impl DatasetAugmentationWorkspace {
         source: &DatasetAugmentationSource,
         reason: &str,
     ) -> Result<(), ToolError> {
+        let reason = format!("智能裁剪拒绝：{reason}");
         self.append_json_line(
             "rejected/rejections.jsonl",
             &DatasetAugmentationRejection {
                 source_media_id: source.media_id.clone(),
                 relative_path: source.relative_path.clone(),
-                reason: format!("智能裁剪拒绝：{reason}"),
+                reason: reason.clone(),
             },
         )?;
+        self.record_rejection_reason(&reason);
         self.rejected += 1;
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_original_sample(
-        &mut self,
-        source: &DatasetAugmentationSource,
-        token: &str,
-        family_id: &str,
-        split: &str,
-        extension: &str,
-        width: u32,
-        height: u32,
-        bucket: Option<ResolutionBucket>,
-    ) -> Result<DatasetAugmentationSample, ToolError> {
-        let sample_id = format!("{token}_original");
-        let image_relative = self
-            .output_relative
-            .join("raw/images")
-            .join(format!("{token}.{extension}"));
-        self.record_sample(
-            source,
-            &sample_id,
-            family_id,
-            "original",
-            &image_relative,
-            width,
-            height,
-            bucket,
-            split,
-            false,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -759,14 +725,16 @@ impl DatasetAugmentationWorkspace {
     }
 
     pub fn finish(&self) -> Result<DatasetAugmentationSummary, ToolError> {
-        let training_relative_directory = self.output_relative.join("ready/train/images");
+        let training_relative_directory = self.output_relative.join("ready/train");
         let ready = serde_json::json!({
             "format_version": 1,
+            "image_output_relative_directory": self.output_relative,
+            "metadata_relative_directory": self.metadata_relative,
             "training_relative_directory": training_relative_directory,
             "split_directories": {
-                "train": self.output_relative.join("ready/train/images"),
-                "validation": self.output_relative.join("ready/validation/images"),
-                "test": self.output_relative.join("ready/test/images"),
+                "train": self.output_relative.join("ready/train"),
+                "validation": self.output_relative.join("ready/validation"),
+                "test": self.output_relative.join("ready/test"),
             },
             "generated": self.generated,
             "rejected": self.rejected,
@@ -774,21 +742,23 @@ impl DatasetAugmentationWorkspace {
             "retagged": self.retagged,
             "training_subsets": self.training_subsets_manifest(),
         });
-        let output = self.root.resolve(&self.output_relative)?;
+        let metadata = self.root.resolve(&self.metadata_relative)?;
         write_json_atomic(
-            &output.join("metadata/training-subsets.json"),
+            &metadata.join("metadata/training-subsets.json"),
             &self.training_subsets_manifest(),
         )?;
-        write_json_atomic(&output.join("READY.json"), &ready)?;
-        fs::remove_file(output.join("INCOMPLETE.json")).map_err(ToolError::Io)?;
+        write_json_atomic(&metadata.join("READY.json"), &ready)?;
+        fs::remove_file(metadata.join("INCOMPLETE.json")).map_err(ToolError::Io)?;
         Ok(DatasetAugmentationSummary {
             output_relative_directory: self.output_relative.clone(),
+            metadata_relative_directory: self.metadata_relative.clone(),
             derived_relative_directory: self.output_relative.join("derived"),
             training_relative_directory,
             generated: self.generated,
             rejected: self.rejected,
             retagging_pending: self.retagging_pending,
             retagged: self.retagged,
+            rejection_reasons: self.rejection_reasons.clone(),
         })
     }
 
@@ -805,11 +775,8 @@ impl DatasetAugmentationWorkspace {
             .output_relative
             .join("ready")
             .join(&sample.split)
-            .join(if sample.variant == "original" {
-                PathBuf::from("images")
-            } else {
-                PathBuf::from(&sample.variant).join("images")
-            })
+            .join(&sample.variant)
+            .join("images")
             .join(format!("{}.{}", sample.sample_id, extension));
         let source = self.root.resolve(&sample.output_relative_path)?;
         let destination = self.root.resolve(&ready_relative)?;
@@ -821,7 +788,6 @@ impl DatasetAugmentationWorkspace {
 
     fn training_subsets_manifest(&self) -> serde_json::Value {
         let variants = [
-            ("original", "原图", false),
             ("horizontal_flip", "水平翻转", true),
             ("portrait", "肖像裁剪", true),
             ("upper_body", "上半身裁剪", true),
@@ -829,14 +795,17 @@ impl DatasetAugmentationWorkspace {
         ];
         serde_json::json!({
             "format_version": 1,
-            "family_binding": "metadata/dataset.jsonl",
+            "family_binding_relative_path": self.metadata_relative.join("metadata/dataset.jsonl"),
+            "source_dataset": {
+                "id": "original",
+                "label": "原图（源目录，不复制）",
+                "relative_directory": self.source_relative_directory(),
+                "requires_retagging": false,
+                "default_repeats": 1,
+            },
             "splits": ["train", "validation", "test"],
             "subsets": variants.into_iter().map(|(id, label, requires_retagging)| {
-                let directory = if id == "original" {
-                    self.output_relative.join("ready/train/images")
-                } else {
-                    self.output_relative.join("ready/train").join(id).join("images")
-                };
+                let directory = self.output_relative.join("ready/train").join(id).join("images");
                 serde_json::json!({
                     "id": id,
                     "label": label,
@@ -850,7 +819,7 @@ impl DatasetAugmentationWorkspace {
     }
 
     fn append_json_line(&self, relative: &str, value: &impl Serialize) -> Result<(), ToolError> {
-        let path = self.root.resolve(&self.output_relative.join(relative))?;
+        let path = self.root.resolve(&self.metadata_relative.join(relative))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -860,13 +829,28 @@ impl DatasetAugmentationWorkspace {
             .map_err(|error| ToolError::InvalidManifest(error.to_string()))?;
         file.write_all(b"\n").map_err(ToolError::Io)
     }
+
+    fn source_relative_directory(&self) -> PathBuf {
+        self.output_relative
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
+    fn record_rejection_reason(&mut self, reason: &str) {
+        *self
+            .rejection_reasons
+            .entry(reason.to_string())
+            .or_default() += 1;
+    }
 }
 
-fn next_output_directory(
+fn next_augmentation_directories(
     root: &VerifiedMediaRoot,
     requested: &Path,
     task_id: &str,
-) -> Result<PathBuf, ToolError> {
+) -> Result<(PathBuf, PathBuf), ToolError> {
     let safe_task_id = task_id
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
@@ -881,14 +865,24 @@ fn next_output_directory(
         } else {
             format!("{safe_task_id}-{attempt}")
         };
-        let relative = requested.join(name);
-        if !root.resolve(&relative)?.exists() {
-            return Ok(relative);
+        let image_relative = requested.join(&name);
+        let metadata_relative = augmentation_metadata_directory(requested)?.join(name);
+        if !root.resolve(&image_relative)?.exists() && !root.resolve(&metadata_relative)?.exists() {
+            return Ok((image_relative, metadata_relative));
         }
     }
     Err(ToolError::InvalidManifest(
         "无法创建新的数据集输出目录，请选择其他目录".to_string(),
     ))
+}
+
+fn augmentation_metadata_directory(image_output_root: &Path) -> Result<PathBuf, ToolError> {
+    let parent = image_output_root.parent().ok_or_else(|| {
+        ToolError::InvalidManifest(
+            "增广输出目录必须位于原数据目录的 .augmentation 子目录".to_string(),
+        )
+    })?;
+    Ok(parent.join(".augmentation-metadata"))
 }
 
 fn source_rejection_reason(
@@ -910,44 +904,6 @@ fn source_rejection_reason(
         return Some("图片未达到原生短边门槛".to_string());
     }
     None
-}
-
-fn source_caption(
-    root: &VerifiedMediaRoot,
-    source_relative: &Path,
-    fallback: &str,
-) -> Result<String, ToolError> {
-    let label_relative = source_relative.with_extension("txt");
-    let label_path = root.resolve(&label_relative)?;
-    match fs::symlink_metadata(&label_path) {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 8 * 1024 * 1024 => {
-            fs::read_to_string(root.resolve_existing_file(&label_relative)?).map_err(ToolError::Io)
-        }
-        Ok(metadata) if metadata.file_type().is_file() => Err(ToolError::InvalidManifest(
-            "标签文件超过 8 MiB 安全上限".to_string(),
-        )),
-        Ok(_) => Err(ToolError::NotRegularFile),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(fallback.to_string()),
-        Err(error) => Err(ToolError::Io(error)),
-    }
-}
-
-fn source_extension(relative_path: &Path) -> Result<&str, ToolError> {
-    match relative_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg") => Ok("jpg"),
-        Some("jpeg") => Ok("jpeg"),
-        Some("png") => Ok("png"),
-        Some("webp") => Ok("webp"),
-        Some("bmp") => Ok("bmp"),
-        _ => Err(ToolError::InvalidManifest(
-            "数据集增广仅支持 PNG、JPEG、WebP 和 BMP 静态图片".to_string(),
-        )),
-    }
 }
 
 fn source_token(source: &DatasetAugmentationSource) -> String {
@@ -1108,6 +1064,15 @@ fn composition_aspect_is_valid(candidate: CropCandidate) -> bool {
     }
 }
 
+fn composition_area_limit(kind: &str) -> f32 {
+    match kind {
+        "portrait" => MAX_PORTRAIT_AREA_RATIO,
+        "upper_body" => MAX_UPPER_BODY_AREA_RATIO,
+        "full_body_tight" => MAX_FULL_BODY_TIGHT_AREA_RATIO,
+        _ => MAX_FULL_BODY_TIGHT_AREA_RATIO,
+    }
+}
+
 fn candidate_is_native_and_safe(
     candidate: CropCandidate,
     critical: &[CropRect],
@@ -1120,7 +1085,7 @@ fn candidate_is_native_and_safe(
         && composition_aspect_is_valid(candidate)
         && crop_keeps_critical_parts(candidate.rect, critical)
         && rect_area_ratio(candidate.rect, source_width, source_height)
-            < MAX_NEAR_ORIGINAL_AREA_RATIO
+            < composition_area_limit(candidate.kind)
 }
 
 fn deduplicate_crop_candidates(mut candidates: Vec<CropCandidate>) -> Vec<CropCandidate> {
@@ -1299,18 +1264,6 @@ fn smart_crop_candidates(
     deduplicate_crop_candidates(candidates)
 }
 
-fn copy_new_file(source: &Path, destination: &Path) -> Result<(), ToolError> {
-    if destination.exists() {
-        return Err(ToolError::Conflict(destination.to_path_buf()));
-    }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| ToolError::InvalidManifest("输出文件缺少父目录".to_string()))?;
-    fs::create_dir_all(parent).map_err(ToolError::Io)?;
-    fs::copy(source, destination).map_err(ToolError::Io)?;
-    Ok(())
-}
-
 fn link_or_copy_new_file(source: &Path, destination: &Path) -> Result<(), ToolError> {
     if destination.exists() {
         return Err(ToolError::Conflict(destination.to_path_buf()));
@@ -1326,23 +1279,6 @@ fn link_or_copy_new_file(source: &Path, destination: &Path) -> Result<(), ToolEr
             Ok(())
         }
     }
-}
-
-fn write_text_atomic(destination: &Path, content: &str) -> Result<(), ToolError> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| ToolError::InvalidManifest("输出文件缺少父目录".to_string()))?;
-    fs::create_dir_all(parent).map_err(ToolError::Io)?;
-    let temporary = destination.with_extension(format!(
-        "{}.tmp-{}",
-        destination
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("txt"),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temporary, content).map_err(ToolError::Io)?;
-    fs::rename(temporary, destination).map_err(ToolError::Io)
 }
 
 fn write_png_atomic(destination: &Path, image: &image::DynamicImage) -> Result<(), ToolError> {
@@ -1440,12 +1376,12 @@ mod tests {
         let DatasetAugmentationItemResult::Generated(samples) = result else {
             panic!("source should qualify for augmentation");
         };
-        assert_eq!(samples.len(), 2);
-        assert!(!samples[0].requires_retagging);
-        assert!(samples[1].requires_retagging);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].requires_retagging);
         assert!(temporary.path().join("source.png").is_file());
-        let output = temporary.path().join("dataset-expanded/task-1");
-        assert!(output.join("raw/images/media1.png").is_file());
+        let output = temporary.path().join(".augmentation/task-1");
+        let metadata_output = temporary.path().join(".augmentation-metadata/task-1");
+        assert!(!output.join("raw/images/media1.png").exists());
         assert!(output
             .join("derived/horizontal_flip/images/media1_horizontal_flip.png")
             .is_file());
@@ -1464,25 +1400,75 @@ mod tests {
             .exists());
         assert!(!output
             .join("ready")
-            .join(&samples[1].split)
-            .join("images")
+            .join(&samples[0].split)
+            .join("horizontal_flip/images")
             .join("media1_horizontal_flip.txt")
             .exists());
         let summary = workspace.finish().unwrap();
-        let ready = output.join("ready").join(&samples[0].split).join("images");
-        assert!(ready.join("media1_original.png").is_file());
-        assert!(ready.join("media1_original.txt").is_file());
-        assert!(!ready.join("media1_horizontal_flip.png").exists());
+        assert!(!output.join("ready").exists());
         assert_eq!(summary.retagging_pending, 1);
-        let metadata = std::fs::read_to_string(output.join("metadata/dataset.jsonl")).unwrap();
+        let metadata =
+            std::fs::read_to_string(metadata_output.join("metadata/dataset.jsonl")).unwrap();
         assert!(metadata.contains("\"allow_non_uniform_scaling\":false"));
         assert!(metadata.contains("\"requires_retagging\":true"));
-        let retagging = std::fs::read_to_string(output.join("metadata/retagging.jsonl")).unwrap();
+        let retagging =
+            std::fs::read_to_string(metadata_output.join("metadata/retagging.jsonl")).unwrap();
         assert!(retagging.contains("media1_horizontal_flip"));
     }
 
     #[test]
-    fn original_sample_reuses_raw_image_instead_of_creating_a_derived_original_copy() {
+    fn workspace_keeps_originals_in_place_and_separates_augmentation_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_directory = temporary.path().join("characters/alice");
+        std::fs::create_dir_all(&source_directory).unwrap();
+        RgbImage::new(800, 800)
+            .save(source_directory.join("source.png"))
+            .unwrap();
+        std::fs::write(source_directory.join("source.txt"), "1girl").unwrap();
+        let config = DatasetAugmentationConfig {
+            output_directory: PathBuf::from("characters/alice/.augmentation"),
+            min_megapixels: 0.1,
+            min_long_side: 1,
+            min_short_side: 1,
+            horizontal_flip: true,
+            smart_crop: super::SmartCropConfig {
+                enabled: false,
+                ..super::SmartCropConfig::default()
+            },
+            ..DatasetAugmentationConfig::default()
+        };
+        let root = VerifiedMediaRoot::open(temporary.path()).unwrap();
+        let mut workspace =
+            DatasetAugmentationWorkspace::create(root, "task-layout", config).unwrap();
+
+        let DatasetAugmentationItemResult::Generated(samples) = workspace
+            .process(&DatasetAugmentationSource {
+                media_id: "media-layout".to_string(),
+                relative_path: PathBuf::from("characters/alice/source.png"),
+                sha256: None,
+                fallback_caption: String::new(),
+            })
+            .unwrap()
+        else {
+            panic!("source should qualify for augmentation");
+        };
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].variant, "horizontal_flip");
+        let images = temporary
+            .path()
+            .join("characters/alice/.augmentation/task-layout");
+        let metadata = temporary
+            .path()
+            .join("characters/alice/.augmentation-metadata/task-layout");
+        assert!(!images.join("raw").exists());
+        assert!(!images.join("original").exists());
+        assert!(metadata.join("metadata/dataset.jsonl").is_file());
+        assert!(metadata.join("INCOMPLETE.json").is_file());
+    }
+
+    #[test]
+    fn workspace_does_not_create_an_original_sample_or_raw_copy() {
         let temporary = tempfile::tempdir().unwrap();
         RgbImage::new(800, 800)
             .save(temporary.path().join("source.png"))
@@ -1510,22 +1496,22 @@ mod tests {
             })
             .unwrap()
         else {
-            panic!("source should be represented by its raw copy");
+            panic!("source should complete even when no derived operation is enabled");
         };
 
-        assert_eq!(samples.len(), 1);
-        assert!(samples[0]
-            .output_relative_path
-            .to_string_lossy()
-            .contains("raw/images"));
+        assert!(samples.is_empty());
         assert!(!temporary
             .path()
-            .join("dataset-expanded/task-original/derived/original")
+            .join(".augmentation/task-original/raw")
+            .exists());
+        assert!(!temporary
+            .path()
+            .join(".augmentation/task-original/derived/original")
             .exists());
     }
 
     #[test]
-    fn workspace_materializes_a_train_ready_split_only_when_finished() {
+    fn workspace_writes_completion_state_to_separate_metadata_directory() {
         let temporary = tempfile::tempdir().unwrap();
         RgbImage::new(800, 800)
             .save(temporary.path().join("source.png"))
@@ -1556,23 +1542,17 @@ mod tests {
             panic!("source should qualify for augmentation");
         };
 
-        let output = temporary.path().join("dataset-expanded/task-ready");
+        let output = temporary.path().join(".augmentation/task-ready");
+        let metadata_output = temporary.path().join(".augmentation-metadata/task-ready");
         assert!(!output.join("READY.json").exists());
-        assert!(output.join("INCOMPLETE.json").is_file());
+        assert!(metadata_output.join("INCOMPLETE.json").is_file());
         let summary = workspace.finish().unwrap();
-        let ready = output.join("ready").join(&samples[0].split).join("images");
-        assert!(ready
-            .join(format!("{}.png", samples[0].sample_id))
-            .is_file());
-        assert_eq!(
-            std::fs::read_to_string(ready.join(format!("{}.txt", samples[0].sample_id))).unwrap(),
-            "1girl"
-        );
-        assert!(output.join("READY.json").is_file());
-        assert!(!output.join("INCOMPLETE.json").exists());
+        assert!(samples.is_empty());
+        assert!(metadata_output.join("READY.json").is_file());
+        assert!(!metadata_output.join("INCOMPLETE.json").exists());
         assert_eq!(
             summary.training_relative_directory,
-            PathBuf::from("dataset-expanded/task-ready/ready/train/images")
+            PathBuf::from(".augmentation/task-ready/ready/train")
         );
     }
 
@@ -1632,7 +1612,7 @@ mod tests {
         let summary = workspace.finish().unwrap();
         let ready = temporary
             .path()
-            .join("dataset-expanded/task-promote/ready")
+            .join(".augmentation/task-promote/ready")
             .join(&derived.split)
             .join("horizontal_flip/images");
         assert!(ready.join(format!("{}.png", derived.sample_id)).is_file());
@@ -1645,7 +1625,7 @@ mod tests {
         let manifest = std::fs::read_to_string(
             temporary
                 .path()
-                .join("dataset-expanded/task-promote/metadata/training-subsets.json"),
+                .join(".augmentation-metadata/task-promote/metadata/training-subsets.json"),
         )
         .unwrap();
         assert!(manifest.contains("horizontal_flip"));
@@ -1872,6 +1852,28 @@ mod tests {
                 x0: 0,
                 y0: 0,
                 x1: 1500,
+                y1: 2000,
+            },
+            score: 0.9,
+        };
+
+        assert!(!candidate_is_native_and_safe(
+            candidate,
+            &[],
+            &crop_config(),
+            2000,
+            2000,
+        ));
+    }
+
+    #[test]
+    fn smart_crop_requires_a_stronger_reframe_for_portrait_compositions() {
+        let candidate = CropCandidate {
+            kind: "portrait",
+            rect: CropRect {
+                x0: 400,
+                y0: 0,
+                x1: 1600,
                 y1: 2000,
             },
             score: 0.9,

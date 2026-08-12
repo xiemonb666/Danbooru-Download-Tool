@@ -211,6 +211,42 @@ describe('TasksView destructive preflight', () => {
     expect(view.getByText('训练目录 dataset-expanded/task-1/derived')).toBeVisible()
   })
 
+  it('explains smart-crop output counts, crop coverage, and rejection diagnostics', async () => {
+    mocks.taskKind = 'dataset_augmentation'
+    mocks.taskStatus = 'completed'
+    mocks.getTaskDetails.mockResolvedValue({
+      task: { id: 'task-1' },
+      result: {
+        source_images: 12,
+        generated: 24,
+        variant_counts: { portrait: 5, upper_body: 4, full_body_tight: 3 },
+        smart_crop: {
+          generated: 12,
+          rejected: 2,
+          coverage_percent: { portrait: { average: 42 } },
+        },
+        rejection_reasons: { '智能裁剪拒绝：多人主体重叠': 2 },
+        next_step: '派生图已生成；请在图库的派生图文件夹中核对构图。',
+      },
+      item_counts: { total: 0, queued: 0, completed: 0, skipped: 0, failed: 0, retryable_failed: 0 },
+      items: [],
+    })
+    const view = render(TasksView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await fireEvent.click(view.getByRole('button', { name: '查看详情' }))
+
+    expect(await view.findByText('源原图（未复制） 12 项')).toBeVisible()
+    expect(view.getByText('肖像裁剪 5 项')).toBeVisible()
+    expect(view.getByText('上半身裁剪 4 项')).toBeVisible()
+    expect(view.getByText('紧凑全身裁剪 3 项')).toBeVisible()
+    expect(view.getByText('智能裁剪拒绝 2 项')).toBeVisible()
+    expect(view.getByText('肖像平均保留 42%')).toBeVisible()
+    expect(view.getByText('智能裁剪拒绝：多人主体重叠 2 项')).toBeVisible()
+    expect(view.getByText('派生图已生成；请在图库的派生图文件夹中核对构图。')).toBeVisible()
+  })
+
   it('shows and paginates complete failure items for a non-download task', async () => {
     mocks.taskKind = 'resize'
     mocks.taskStatus = 'failed'

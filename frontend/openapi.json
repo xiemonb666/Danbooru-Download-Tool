@@ -1281,6 +1281,54 @@
         }
       }
     },
+    "/api/training/datasets/augmentations": {
+      "get": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "training_gallery_augmentations",
+        "parameters": [
+          {
+            "name": "root_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "relative_directory",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_TrainingAugmentationDiscoveryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/training/datasets/gallery": {
       "get": {
         "tags": [
@@ -2460,6 +2508,46 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiSuccess_VllmLoadStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/vllm/unload": {
+      "post": {
+        "tags": [
+          "paths"
+        ],
+        "operationId": "vllm_unload",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiSuccess_VllmUnloadStatus"
                 }
               }
             }
@@ -3708,6 +3796,42 @@
           }
         }
       },
+      "ApiSuccess_TrainingAugmentationDiscoveryResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "source",
+              "subsets"
+            ],
+            "properties": {
+              "source": {
+                "$ref": "#/components/schemas/TrainingGalleryDatasetResponse"
+              },
+              "subsets": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TrainingAugmentationSubsetResponse"
+                }
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "ApiSuccess_TrainingCleanupPreviewResponse": {
         "type": "object",
         "required": [
@@ -4848,6 +4972,39 @@
         }
       },
       "ApiSuccess_VllmLoadStatus": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "state",
+              "message"
+            ],
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ApiSuccess_VllmUnloadStatus": {
         "type": "object",
         "required": [
           "data"
@@ -7733,6 +7890,69 @@
           }
         }
       },
+      "TrainingAugmentationDiscoveryResponse": {
+        "type": "object",
+        "required": [
+          "source",
+          "subsets"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/TrainingGalleryDatasetResponse"
+          },
+          "subsets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrainingAugmentationSubsetResponse"
+            }
+          }
+        }
+      },
+      "TrainingAugmentationSubsetResponse": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "id",
+          "label",
+          "relative_directory",
+          "caption_extension",
+          "repeats",
+          "image_count",
+          "caption_count"
+        ],
+        "properties": {
+          "caption_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "caption_extension": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "label": {
+            "type": "string"
+          },
+          "relative_directory": {
+            "type": "string"
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string"
+          }
+        }
+      },
       "TrainingCleanupPath": {
         "type": "object",
         "required": [
@@ -8856,6 +9076,21 @@
         "enum": [
           "vllm_tag"
         ]
+      },
+      "VllmUnloadStatus": {
+        "type": "object",
+        "required": [
+          "state",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
       }
     }
   }

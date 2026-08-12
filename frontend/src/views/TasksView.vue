@@ -118,6 +118,24 @@ function resultText(value: unknown, key: string): string | undefined {
   return typeof candidate === 'string' ? candidate : undefined
 }
 
+function nestedResultObject(value: unknown, key: string): ResultObject | null {
+  return asResultObject(asResultObject(value)?.[key])
+}
+
+function nestedResultNumber(value: unknown, parent: string, key: string): number | undefined {
+  const candidate = nestedResultObject(value, parent)?.[key]
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined
+}
+
+function resultCountEntries(value: unknown, key: string): ResultSummary[] {
+  const record = nestedResultObject(value, key)
+  if (!record) return []
+  return Object.entries(record)
+    .filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]))
+    .map(([label, count]) => ({ label, value: `${count.toLocaleString()} 项` }))
+    .sort((left, right) => right.value.localeCompare(left.value, 'zh-CN'))
+}
+
 function resultTags(value: unknown): string[] {
   const tags = asResultObject(value)?.tags
   return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : []
@@ -182,9 +200,38 @@ function taskResultSummary(kind: string, value: unknown): ResultSummary[] {
       addCount('tagged', '已完成打标')
       break
     case 'dataset_augmentation':
+      addCount('source_images', '源原图（未复制）')
       addCount('generated', '已生成')
       addCount('rejected', '已拒绝')
       addCount('retagging_pending', '待重新打标')
+      addCount('retagged', '已二次打标')
+      {
+        const variants = nestedResultObject(value, 'variant_counts')
+        const variantLabels: Array<[string, string]> = [
+          ['horizontal_flip', '水平翻转'],
+          ['portrait', '肖像裁剪'],
+          ['upper_body', '上半身裁剪'],
+          ['full_body_tight', '紧凑全身裁剪'],
+        ]
+        for (const [variant, label] of variantLabels) {
+          const count = variants?.[variant]
+          if (typeof count === 'number' && Number.isFinite(count)) entries.push({ label, value: `${count.toLocaleString()} 项` })
+        }
+      }
+      {
+        const rejected = nestedResultNumber(value, 'smart_crop', 'rejected')
+        if (rejected != null) entries.push({ label: '智能裁剪拒绝', value: `${rejected.toLocaleString()} 项` })
+        const coverage = nestedResultObject(nestedResultObject(value, 'smart_crop'), 'coverage_percent')
+        const coverageLabels: Array<[string, string]> = [
+          ['portrait', '肖像平均保留'],
+          ['upper_body', '上半身平均保留'],
+          ['full_body_tight', '紧凑全身平均保留'],
+        ]
+        for (const [variant, label] of coverageLabels) {
+          const average = asResultObject(coverage?.[variant])?.average
+          if (typeof average === 'number' && Number.isFinite(average)) entries.push({ label, value: `${Math.round(average)}%` })
+        }
+      }
       {
         const output = resultText(value, 'training_relative_directory') ?? resultText(value, 'derived_relative_directory')
         if (output) entries.push({ label: '训练目录', value: output })
@@ -463,6 +510,12 @@ onBeforeUnmount(() => detailsController?.abort())
               <strong class="text-sm">处理结果</strong>
               <ul v-if="taskResultSummary(task.kind, details.result).length" class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-[var(--text-secondary)]">
                 <li v-for="entry in taskResultSummary(task.kind, details.result)" :key="entry.label">{{ entry.label }} {{ entry.value }}</li>
+              </ul>
+              <p v-if="task.kind === 'dataset_augmentation' && resultText(details.result, 'next_step')" class="mt-2 text-sm text-[var(--text-secondary)]">
+                {{ resultText(details.result, 'next_step') }}
+              </p>
+              <ul v-if="task.kind === 'dataset_augmentation' && resultCountEntries(details.result, 'rejection_reasons').length" class="mt-2 grid gap-1 text-sm text-[var(--text-secondary)]" aria-label="增广拒绝原因">
+                <li v-for="entry in resultCountEntries(details.result, 'rejection_reasons')" :key="entry.label">{{ entry.label }} {{ entry.value }}</li>
               </ul>
               <ul v-if="taskResultItems(details.result).length" class="mt-2 grid gap-1 text-sm text-[var(--text-secondary)]">
                 <li v-for="item in taskResultItems(details.result)" :key="item.id" class="flex flex-wrap gap-x-2">

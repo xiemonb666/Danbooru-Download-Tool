@@ -351,6 +351,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/training/datasets/augmentations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["training_gallery_augmentations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/training/datasets/gallery": {
         parameters: {
             query?: never;
@@ -799,6 +815,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/vllm/unload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["vllm_unload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1116,6 +1148,15 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        ApiSuccess_TrainingAugmentationDiscoveryResponse: {
+            data: {
+                source: components["schemas"]["TrainingGalleryDatasetResponse"];
+                subsets: components["schemas"]["TrainingAugmentationSubsetResponse"][];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
         ApiSuccess_TrainingCleanupPreviewResponse: {
             data: {
                 deletable: components["schemas"]["TrainingCleanupPath"][];
@@ -1405,6 +1446,15 @@ export interface components {
             } | null;
         };
         ApiSuccess_VllmLoadStatus: {
+            data: {
+                message: string;
+                state: string;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_VllmUnloadStatus: {
             data: {
                 message: string;
                 state: string;
@@ -2146,6 +2196,23 @@ export interface components {
         TrainingArtifactsResponse: {
             artifacts: components["schemas"]["TrainingArtifact"][];
         };
+        TrainingAugmentationDiscoveryResponse: {
+            source: components["schemas"]["TrainingGalleryDatasetResponse"];
+            subsets: components["schemas"]["TrainingAugmentationSubsetResponse"][];
+        };
+        TrainingAugmentationSubsetResponse: {
+            /** Format: int64 */
+            caption_count: number;
+            caption_extension: string;
+            id: string;
+            /** Format: int64 */
+            image_count: number;
+            label: string;
+            relative_directory: string;
+            /** Format: int32 */
+            repeats: number;
+            task_id: string;
+        };
         TrainingCleanupPath: {
             /** Format: int64 */
             bytes: number;
@@ -2431,6 +2498,10 @@ export interface components {
         };
         /** @enum {string} */
         VllmTagTaskType: "vllm_tag";
+        VllmUnloadStatus: {
+            message: string;
+            state: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -3295,6 +3366,36 @@ export interface operations {
             };
         };
     };
+    training_gallery_augmentations: {
+        parameters: {
+            query: {
+                root_id: string;
+                relative_directory?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingAugmentationDiscoveryResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
     training_gallery_dataset: {
         parameters: {
             query: {
@@ -4099,6 +4200,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiSuccess_VllmLoadStatus"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
+    vllm_unload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_VllmUnloadStatus"];
                 };
             };
             400: {

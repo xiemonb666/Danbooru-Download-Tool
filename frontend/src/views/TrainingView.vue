@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Activity, BarChart3, ChevronDown, CirclePlay, Cpu, FileCode2, FolderOpen, Gauge, Layers3, SlidersHorizontal, Trash2 } from '@lucide/vue'
+import { Activity, BarChart3, ChevronDown, CirclePlay, Cpu, FileCode2, FolderOpen, Gauge, Layers3, Plus, RefreshCw, SlidersHorizontal, Sparkles, Trash2 } from '@lucide/vue'
 import GpuLiveStatus from '../components/GpuLiveStatus.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import InfoTooltip from '../components/InfoTooltip.vue'
 import {
   createTrainingTask,
+  discoverTrainingGalleryAugmentations,
   deleteTrainingTask,
   browseTrainingPath,
   getMediaDirectories,
@@ -25,6 +26,7 @@ import {
   type TrainingCleanupPreview,
   type TrainingField,
   type TrainingGalleryDataset,
+  type TrainingAugmentationSubset,
   type TrainingGalleryDatasetPreview,
   type TrainingGpu,
   type TrainingPathBrowser,
@@ -76,6 +78,8 @@ const galleryDirectory = ref('')
 const galleryRepeat = ref(1)
 const galleryCaptionExtension = ref('.txt')
 const galleryAdditionalDatasets = ref<TrainingGalleryDataset[]>([])
+const galleryAugmentationDatasets = ref<GalleryAugmentationDataset[]>([])
+const galleryAugmentationLoading = ref(false)
 const datasetMode = ref<'path' | 'gallery'>('path')
 const galleryPreview = ref<TrainingGalleryDatasetPreview | null>(null)
 const galleryPreviewLoading = ref(false)
@@ -100,6 +104,13 @@ interface OptimizerTuningField {
   kind: OptimizerTuningKind
   default: number | boolean | string
   help: string
+}
+
+interface GalleryAugmentationDataset extends TrainingGalleryDataset {
+  taskId: string
+  label: string
+  imageCount: number
+  enabled: boolean
 }
 
 const adamTuning: OptimizerTuningField[] = [
@@ -257,7 +268,16 @@ const galleryDataset = computed<TrainingGalleryDataset | null>(() => {
 const galleryDatasets = computed<TrainingGalleryDataset[]>(() => {
   const primary = galleryDataset.value
   if (!primary) return []
-  return [primary, ...galleryAdditionalDatasets.value
+  const normalizedAuto = galleryAugmentationDatasets.value
+    .filter((dataset) => dataset.enabled && dataset.root_id && dataset.relative_directory.trim())
+    .map((dataset) => ({
+      ...dataset,
+      repeats: Math.max(1, Math.min(10_000, Math.floor(Number(dataset.repeats) || 1))),
+      caption_extension: dataset.caption_extension?.trim() || '.txt',
+    }))
+  const knownDirectories = new Set([primary.relative_directory, ...normalizedAuto.map((dataset) => dataset.relative_directory)])
+  return [primary, ...normalizedAuto, ...galleryAdditionalDatasets.value
+    .filter((dataset) => !knownDirectories.has(dataset.relative_directory))
     .filter((dataset) => dataset.root_id && dataset.relative_directory.trim())
     .map((dataset) => ({
       ...dataset,
@@ -265,8 +285,8 @@ const galleryDatasets = computed<TrainingGalleryDataset[]>(() => {
       caption_extension: dataset.caption_extension?.trim() || '.txt',
     }))]
 })
-const sampleSettings = computed<TrainingSampleSettings | null>(() => {
-  if (!supportsSamples.value || !sampleEnabled.value) return null
+const enabledAugmentationCount = computed(() => galleryAugmentationDatasets.value.filter((dataset) => dataset.enabled).length)
+const sampleSettings = computed<TrainingSampleSettings | null>(() => {  if (!supportsSamples.value || !sampleEnabled.value) return null
   return {
     enabled: true,
     prompt_source: samplePromptSource.value,
@@ -285,17 +305,27 @@ const sampleOutputDirectory = computed(() => {
   return `${outputDir.replace(/[\\/]$/, '')}/samples`
 })
 const fieldsByGroup = computed(() => {
-  const result = new Map<string, TrainingField[]>()
+  const result = new Map<string, Map<string, TrainingField[]>>()
   const normalized = query.value.trim().toLowerCase()
   for (const field of adapter.value?.fields ?? []) {
     if (!shouldShowField(field)) continue
-    if (normalized && !`${field.label} ${field.key} ${field.help}`.toLowerCase().includes(normalized)) continue
-    const fields = result.get(field.group) ?? []
+    if (normalized && !`${field.label} ${field.key} ${field.help} ${field.description}`.toLowerCase().includes(normalized)) continue
+    const subgroups = result.get(field.group) ?? new Map<string, TrainingField[]>()
+    const fields = subgroups.get(field.subgroup) ?? []
     fields.push(field)
-    result.set(field.group, fields)
+    subgroups.set(field.subgroup, fields)
+    result.set(field.group, subgroups)
   }
   return result
 })
+const subgroupLabel = (groupId: string, subgroupId: string): string =>
+  groups.value.find((group) => group.id === groupId)?.subgroups.find((subgroup) => subgroup.id === subgroupId)?.label ?? subgroupId
+const subgroupHint = (groupId: string, subgroupId: string): string =>
+  subgroupId === 'upstream' ? '由当前 lora-scripts parser 自动导出，含义随上游版本变化。' : ''
+const groupFieldCount = (groupId: string): number =>
+  [...(fieldsByGroup.value.get(groupId)?.values() ?? [])].reduce((sum, fields) => sum + fields.length, 0)
+const fieldsBySubgroup = (groupId: string): Array<[string, TrainingField[]]> =>
+  [...(fieldsByGroup.value.get(groupId) ?? new Map<string, TrainingField[]>()).entries()]
 const activeOptimizerName = computed(() => String(values.value.optimizer_type ?? '').trim().toLowerCase())
 const activeOptimizerTuning = computed(() => optimizerTuningCatalog[activeOptimizerName.value] ?? [])
 
@@ -340,9 +370,7 @@ function parameters(): Record<string, unknown> {
 
 function shouldShowField(field: TrainingField): boolean {
   if (['pretrained_model_name_or_path', 'train_data_dir', 'dataset_config', 'output_dir', 'output_name', 'prompts_file', 'sample_prompts', 'sample_sampler', 'sample_every_n_epochs', 'sample_every_n_steps', 'sample_at_first', 'optimizer_args'].includes(field.key)) return false
-  if (!['conv_dim', 'conv_alpha'].includes(field.key)) return true
-  const networkModule = String(values.value.network_module ?? '')
-  return /lycoris|locon/i.test(networkModule)
+  return true
 }
 
 function optimizerTuningValue(field: OptimizerTuningField): number | boolean | string {
@@ -495,12 +523,14 @@ function applyGalleryDataset(dataset: TrainingGalleryDataset): void {
   galleryDirectory.value = dataset.relative_directory
   galleryRepeat.value = dataset.repeats
   galleryCaptionExtension.value = dataset.caption_extension || '.txt'
+  galleryAugmentationDatasets.value = []
 }
 
 function applyGalleryDatasets(datasets: TrainingGalleryDataset[]): void {
   const [primary, ...additional] = datasets
   if (primary) applyGalleryDataset(primary)
   galleryAdditionalDatasets.value = additional.map((dataset) => ({ ...dataset }))
+  galleryAugmentationDatasets.value = []
 }
 
 function addGallerySubset(): void {
@@ -532,12 +562,39 @@ async function refreshGalleryDirectories(): Promise<void> {
   galleryDirectories.value = []
   galleryDirectory.value = ''
   galleryPreview.value = null
+  galleryAugmentationDatasets.value = []
   if (!galleryRootId.value) return
   try {
     const result = await getMediaDirectories(galleryRootId.value)
     galleryDirectories.value = result.directories
   } catch (reason: unknown) {
     toast.error('无法读取图库目录', reason instanceof Error ? reason.message : '请检查媒体根是否可访问')
+  }
+}
+
+async function discoverGalleryAugmentations(): Promise<void> {
+  if (datasetMode.value !== 'gallery' || !galleryRootId.value) {
+    galleryAugmentationDatasets.value = []
+    return
+  }
+  galleryAugmentationLoading.value = true
+  try {
+    const discovery = await discoverTrainingGalleryAugmentations(galleryRootId.value, galleryDirectory.value)
+    galleryAugmentationDatasets.value = discovery.subsets.map((subset: TrainingAugmentationSubset) => ({
+      root_id: galleryRootId.value,
+      relative_directory: subset.relative_directory,
+      repeats: subset.repeats,
+      caption_extension: subset.caption_extension,
+      taskId: subset.task_id,
+      label: subset.label,
+      imageCount: subset.image_count,
+      enabled: true,
+    }))
+  } catch (reason: unknown) {
+    galleryAugmentationDatasets.value = []
+    toast.error('无法识别增广子集', reason instanceof Error ? reason.message : '请检查增广任务是否已完成二次打标')
+  } finally {
+    galleryAugmentationLoading.value = false
   }
 }
 
@@ -842,6 +899,9 @@ watch(galleryRootId, () => { void refreshGalleryDirectories() })
 watch([galleryDirectory, galleryRepeat, galleryCaptionExtension, datasetMode], () => {
   if (datasetMode.value === 'gallery') void refreshGalleryPreview()
 })
+watch([galleryRootId, galleryDirectory, datasetMode], () => {
+  void discoverGalleryAugmentations()
+})
 watch(trainingTasks, (next) => {
   if (!next.some((task) => task.id === selectedTrainingTaskId.value)) selectedTrainingTaskId.value = next[0]?.id ?? ''
 }, { immediate: true })
@@ -973,17 +1033,56 @@ onBeforeUnmount(() => {
             <template v-if="datasetMode === 'gallery'">
               <label>图库根<select v-model="galleryRootId"><option value="">选择一个已配置图库</option><option v-for="root in mediaRoots" :key="root.id" :value="root.id">{{ root.name }} · {{ root.media_count }} 项</option></select></label>
               <label>图库目录<select v-model="galleryDirectory" :disabled="!galleryRootId"><option value="">根目录（全部图片）</option><option v-for="directory in galleryDirectories" :key="directory" :value="directory">{{ directory }}</option></select></label>
-              <div class="training-inline-fields"><label>Repeat<input v-model.number="galleryRepeat" type="number" min="1" max="10000" /></label><label>Caption 扩展名<input v-model="galleryCaptionExtension" placeholder=".txt" /></label></div>
+              <div class="training-inline-fields"><label>Repeat<input v-model.number="galleryRepeat" aria-label="图库 Repeat" type="number" min="1" max="10000" /></label><label>Caption 扩展名<input v-model="galleryCaptionExtension" placeholder=".txt" /></label></div>
               <div class="training-gallery-preview" :class="{ loading: galleryPreviewLoading }"><template v-if="galleryPreview"><strong>{{ galleryPreview.image_count }} 张图片 × {{ galleryPreview.repeats }} repeat</strong><span>预计 {{ galleryPreview.effective_image_count }} 个图片轮次 · {{ galleryPreview.caption_count }} 个 Caption</span><small :title="galleryPreview.image_dir">{{ galleryPreview.image_dir }}</small></template><template v-else><strong>{{ galleryPreviewLoading ? '正在预检图库…' : '选择图库和目录后预检' }}</strong><span>预检会在提交前检查图片、Caption 与引用路径。</span></template></div>
               <div class="training-gallery-subsets">
-                <header><strong>绑定子集（{{ galleryDatasets.length }}）</strong><button class="button button-small" type="button" @click="addGallerySubset">添加子集</button></header>
-                <small>原图和每个已重新打标的派生文件夹都会作为独立训练子集写入 dataset TOML，可各自设置 repeat。</small>
-                <div v-for="(subset, index) in galleryAdditionalDatasets" :key="`${index}-${subset.root_id}-${subset.relative_directory}`" class="training-gallery-subset-row">
-                  <select v-model="subset.root_id"><option value="">选择图库</option><option v-for="root in mediaRoots" :key="root.id" :value="root.id">{{ root.name }}</option></select>
-                  <input v-model="subset.relative_directory" placeholder="例如 dataset-expanded/任务/ready/train/portrait/images" />
-                  <input v-model.number="subset.repeats" type="number" min="1" max="10000" aria-label="子集 Repeat" />
-                  <input v-model="subset.caption_extension" placeholder=".txt" aria-label="子集 Caption 扩展名" />
-                  <button class="button button-small" type="button" @click="removeGallerySubset(index)">移除</button>
+                <header class="training-subsets-header">
+                  <span class="training-subsets-title"><strong>绑定子集</strong><span v-if="galleryDatasets.length" class="training-subsets-badge">{{ galleryDatasets.length }} 个</span></span>
+                  <span class="training-subsets-actions">
+                    <button class="button button-small" type="button" :disabled="galleryAugmentationLoading" @click="discoverGalleryAugmentations"><RefreshCw :size="13" /> {{ galleryAugmentationLoading ? '识别中…' : '刷新增广子集' }}</button>
+                    <button class="button button-small" type="button" @click="addGallerySubset"><Plus :size="13" /> 添加子集</button>
+                  </span>
+                </header>
+                <p class="training-subsets-note">原图直接引用当前目录；系统自动识别已重新打标的 <code>.augmentation</code> 子集，每种裁剪策略可单独设置 repeat，并可按需启用或停用。</p>
+                <div v-if="galleryAugmentationDatasets.length" class="training-subsets-zone">
+                  <div class="training-subsets-zone-heading">
+                    <span><Sparkles :size="13" /><strong>自动识别增广子集</strong><small>点击开关启用或停用</small></span>
+                    <span class="training-subsets-zone-meta">{{ enabledAugmentationCount }} / {{ galleryAugmentationDatasets.length }} 已启用</span>
+                  </div>
+                  <div class="training-subsets-list">
+                    <div v-for="subset in galleryAugmentationDatasets" :key="`auto-${subset.taskId}-${subset.relative_directory}`" class="training-subset-row" :class="{ 'is-disabled': !subset.enabled }">
+                      <label class="training-subset-switch" :title="subset.enabled ? '点击停用该子集' : '点击启用该子集'">
+                        <input v-model="subset.enabled" type="checkbox" :aria-label="`${subset.enabled ? '停用' : '启用'} ${subset.label}`" />
+                        <span class="training-subset-switch-track" aria-hidden="true"><i /></span>
+                      </label>
+                      <span class="training-subset-info">
+                        <strong>{{ subset.label }}<em>{{ subset.imageCount }} 张</em></strong>
+                        <code :title="subset.relative_directory">{{ subset.relative_directory }}</code>
+                      </span>
+                      <label class="training-subset-repeats">
+                        <span>Repeat</span>
+                        <input v-model.number="subset.repeats" type="number" min="1" max="10000" :disabled="!subset.enabled" :aria-label="`${subset.label} Repeat`" />
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                <div v-else-if="!galleryAugmentationLoading" class="training-subsets-empty"><Sparkles :size="14" /><span>尚未识别增广子集：增广任务完成二次打标后，点击“刷新增广子集”自动发现。</span></div>
+                <div v-if="galleryAdditionalDatasets.length" class="training-subsets-zone">
+                  <div class="training-subsets-zone-heading">
+                    <span><Layers3 :size="13" /><strong>手动绑定子集</strong><small>从其他图库目录额外绑定</small></span>
+                  </div>
+                  <div class="training-subsets-list">
+                    <div v-for="(subset, index) in galleryAdditionalDatasets" :key="`${index}-${subset.root_id}-${subset.relative_directory}`" class="training-subset-row training-subset-row-manual">
+                      <select v-model="subset.root_id"><option value="">选择图库</option><option v-for="root in mediaRoots" :key="root.id" :value="root.id">{{ root.name }}</option></select>
+                      <input v-model="subset.relative_directory" placeholder="例如 characters/alice/.augmentation/任务/ready/train/portrait/images" />
+                      <label class="training-subset-repeats">
+                        <span>Repeat</span>
+                        <input v-model.number="subset.repeats" type="number" min="1" max="10000" aria-label="子集 Repeat" />
+                      </label>
+                      <input v-model="subset.caption_extension" placeholder=".txt" aria-label="子集 Caption 扩展名" />
+                      <button class="button button-small button-quiet" type="button" aria-label="移除子集" @click="removeGallerySubset(index)"><Trash2 :size="13" /> 移除</button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </template>
@@ -1061,16 +1160,22 @@ onBeforeUnmount(() => {
             <button class="group-heading" type="button" @click="toggleGroup(group.id)">
               <span><strong>{{ group.label }}</strong><small>{{ group.description }}</small></span><ChevronDown :size="18" />
             </button>
-            <div v-if="selectedGroups.has(group.id) && (fieldsByGroup.get(group.id)?.length || group.id === 'optimizer')" class="field-grid">
-              <label v-for="field in fieldsByGroup.get(group.id)" :key="field.key" class="training-field" :class="{ wide: field.kind === 'list' || field.kind === 'json' || field.kind === 'secret' }">
-                <span>{{ field.label }} <InfoTooltip :title="field.label" :description="field.help" /> <code>--{{ field.key }}</code><em v-if="field.required">必填</em></span>
-                <select v-if="field.kind === 'select'" :value="fieldTextValue(field)" @change="setTextValue(field.key, $event)"><option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option></select>
-                <input v-else-if="field.kind === 'boolean'" :checked="values[field.key] === true" type="checkbox" class="checkbox" @change="setBooleanValue(field.key, $event)" />
-                <textarea v-else-if="field.kind === 'list'" :value="fieldTextValue(field)" :id="inputId(field)" rows="3" placeholder="每行一个值" @input="setTextValue(field.key, $event)" />
-                <textarea v-else-if="field.kind === 'json'" :value="fieldTextValue(field)" :id="inputId(field)" rows="8" placeholder="JSON 对象，例如：{ &quot;new_upstream_option&quot;: true }" @input="setTextValue(field.key, $event)" />
-                <input v-else :value="fieldTextValue(field)" :id="inputId(field)" :type="field.kind === 'secret' ? 'password' : field.kind === 'number' ? 'number' : 'text'" @input="setTextValue(field.key, $event)" />
-                <small class="training-field-hint">悬停标题旁的问号查看参数说明</small>
-              </label>
+            <div v-if="selectedGroups.has(group.id) && (groupFieldCount(group.id) > 0 || group.id === 'optimizer')" class="field-grid">
+              <template v-for="[subgroupId, subgroupFields] in fieldsBySubgroup(group.id)" :key="`${group.id}-${subgroupId}`">
+                <h4 v-if="subgroupId" class="training-subgroup-heading" :class="{ 'is-collapsed': false }">
+                  <span>{{ subgroupLabel(group.id, subgroupId) }}<small>{{ subgroupFields.length }} 项</small></span>
+                  <small v-if="subgroupHint(group.id, subgroupId)" class="training-subgroup-hint">{{ subgroupHint(group.id, subgroupId) }}</small>
+                </h4>
+                <label v-for="field in subgroupFields" :key="field.key" class="training-field" :class="{ wide: field.kind === 'list' || field.kind === 'json' || field.kind === 'secret' }">
+                  <span>{{ field.label }} <InfoTooltip :title="field.label" :description="field.description || field.help" :when-to-adjust="field.when_to_adjust" /> <code>--{{ field.key }}</code><em v-if="field.required">必填</em></span>
+                  <select v-if="field.kind === 'select'" :value="fieldTextValue(field)" @change="setTextValue(field.key, $event)"><option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option></select>
+                  <input v-else-if="field.kind === 'boolean'" :checked="values[field.key] === true" type="checkbox" class="checkbox" @change="setBooleanValue(field.key, $event)" />
+                  <textarea v-else-if="field.kind === 'list'" :value="fieldTextValue(field)" :id="inputId(field)" rows="3" placeholder="每行一个值" @input="setTextValue(field.key, $event)" />
+                  <textarea v-else-if="field.kind === 'json'" :value="fieldTextValue(field)" :id="inputId(field)" rows="8" placeholder="JSON 对象，例如：{ &quot;new_upstream_option&quot;: true }" @input="setTextValue(field.key, $event)" />
+                  <input v-else :value="fieldTextValue(field)" :id="inputId(field)" :type="field.kind === 'secret' ? 'password' : field.kind === 'number' ? 'number' : 'text'" @input="setTextValue(field.key, $event)" />
+                  <small class="training-field-hint">悬停标题旁的问号查看参数说明</small>
+                </label>
+              </template>
               <section v-if="group.id === 'optimizer'" class="training-optimizer-tuning wide" aria-label="优化器专属超参数">
                 <header><div><strong>{{ values.optimizer_type || '当前优化器' }} 专属超参数</strong><small>只显示所选优化器会实际接收的参数；切换优化器后不会把无关参数传给训练器。</small></div><span>{{ activeOptimizerTuning.length }} 项</span></header>
                 <div v-if="activeOptimizerTuning.length" class="training-optimizer-tuning-grid">
