@@ -3446,7 +3446,7 @@ pub fn adapter_by_id(id: &str) -> Option<TrainingAdapter> {
 /// A normalized argparse action exported by the bundled Python inspector.
 /// The desktop keeps curated controls stable and places unrecognized upstream
 /// options in Advanced, so a newer lora-scripts flag is never silently lost.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamParserField {
     pub key: String,
     #[serde(default = "upstream_default_value")]

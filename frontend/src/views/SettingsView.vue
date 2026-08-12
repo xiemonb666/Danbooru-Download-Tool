@@ -295,7 +295,7 @@ onMounted(() => {
               <label class="field-label" for="blur-sensitive">默认模糊敏感分级</label>
               <div class="inline">
                 <input id="blur-sensitive" v-model="config.config.blur_sensitive_media" type="checkbox">
-                <span class="field-help">开启后，Questionable、Explicit 与未知分级需手动揭示；关闭后直接显示。</span>
+                <span class="field-help">开启后，Questionable、Explicit 与未知分级需手动揭示；关闭后直接显示。同时批量下载（标签/搜索）将跳过 Questionable 与 Explicit 内容。</span>
               </div>
             </div>
           </div>

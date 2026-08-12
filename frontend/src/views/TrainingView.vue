@@ -70,6 +70,8 @@ let runtimeRefreshTimer: ReturnType<typeof setInterval> | undefined
 let queueRefreshTimer: ReturnType<typeof setInterval> | undefined
 const runtimeDiagnostics = ref<TrainingRuntimeDiagnostics | null>(null)
 const runtimeActionLoading = ref(false)
+const gpuFloatOpen = ref(true)
+const gpuFloatOpenMonitor = ref(true)
 const queueEntries = ref<TrainingQueueEntry[]>([])
 const mediaRoots = ref<MediaRoot[]>([])
 const galleryDirectories = ref<string[]>([])
@@ -559,15 +561,20 @@ function applySampleSettings(settings: TrainingSampleSettings | null): void {
 }
 
 async function refreshGalleryDirectories(): Promise<void> {
+  const previousDirectory = galleryDirectory.value
   galleryDirectories.value = []
-  galleryDirectory.value = ''
   galleryPreview.value = null
   galleryAugmentationDatasets.value = []
-  if (!galleryRootId.value) return
+  if (!galleryRootId.value) {
+    galleryDirectory.value = ''
+    return
+  }
   try {
     const result = await getMediaDirectories(galleryRootId.value)
     galleryDirectories.value = result.directories
+    if (previousDirectory && !result.directories.includes(previousDirectory)) galleryDirectory.value = ''
   } catch (reason: unknown) {
+    galleryDirectory.value = ''
     toast.error('无法读取图库目录', reason instanceof Error ? reason.message : '请检查媒体根是否可访问')
   }
 }
@@ -1022,6 +1029,13 @@ onBeforeUnmount(() => {
         <label class="training-search">查找参数<input v-model="query" placeholder="名称、CLI 参数或说明" /></label>
       </div>
 
+      <div class="surface training-history-bar">
+        <div class="training-history-copy"><strong>参数历史</strong><small>保存后可一键恢复表单、运行时和目标 GPU；密钥字段不会写入浏览器记录。</small></div>
+        <label>记录名称<input v-model="historyLabel" placeholder="例如：角色 LoRA · 1024px" /></label>
+        <label>历史参数<select v-model="selectedHistoryId"><option value="">选择一条已保存记录</option><option v-for="record in parameterHistory" :key="record.id" :value="record.id">{{ record.label }}</option></select></label>
+        <div class="training-history-actions"><button class="button" type="button" :disabled="!selectedHistoryId" @click="loadParameterHistory">加载记录</button><button class="button" type="button" :disabled="!selectedHistoryId" @click="deleteParameterHistory">删除</button><button class="button button-primary" type="button" :disabled="!adapter || !activeProfile" @click="() => saveParameterHistory()">保存参数记录</button></div>
+      </div>
+
       <section class="surface training-data-workflow" aria-label="训练数据、模型与输出路径">
         <header>
           <div><Layers3 :size="18" /><span><strong>训练输入与输出 <InfoTooltip title="输入与输出" :description="adapterDescription" /></strong><small>将数据、底模和成品目录集中设置；任务运行时会保存实际使用的不可变路径快照。</small></span></div>
@@ -1145,13 +1159,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <div class="surface training-history-bar">
-        <div class="training-history-copy"><strong>参数历史</strong><small>保存后可一键恢复表单、运行时和目标 GPU；密钥字段不会写入浏览器记录。</small></div>
-        <label>记录名称<input v-model="historyLabel" placeholder="例如：角色 LoRA · 1024px" /></label>
-        <label>历史参数<select v-model="selectedHistoryId"><option value="">选择一条已保存记录</option><option v-for="record in parameterHistory" :key="record.id" :value="record.id">{{ record.label }}</option></select></label>
-        <div class="training-history-actions"><button class="button" type="button" :disabled="!selectedHistoryId" @click="loadParameterHistory">加载记录</button><button class="button" type="button" :disabled="!selectedHistoryId" @click="deleteParameterHistory">删除</button><button class="button button-primary" type="button" :disabled="!adapter || !activeProfile" @click="() => saveParameterHistory()">保存参数记录</button></div>
-      </div>
-
       <div v-if="loading" class="surface training-empty">正在读取模型适配器与运行时能力…</div>
       <div v-else-if="!adapter" class="surface training-empty">当前没有可用训练适配器。</div>
       <div v-else class="training-config-layout">
@@ -1193,13 +1200,22 @@ onBeforeUnmount(() => {
           </article>
         </div>
         <aside class="training-side-panel">
-          <GpuLiveStatus :gpus="gpus" :selected-gpu-ids="selectedGpuIds" />
           <div class="surface training-preview-card">
             <div class="monitor-heading"><FileCode2 :size="17" /><strong>配置快照</strong></div>
             <p>提交前由后端校验。任务启动后会保存不可变的配置副本。</p>
             <pre>{{ preview || '# 点击“预览 TOML”生成配置' }}</pre>
           </div>
         </aside>
+      </div>
+
+      <div class="training-gpu-float" role="region" aria-label="GPU 实时状态悬浮面板">
+        <button type="button" class="training-gpu-float-toggle" :aria-expanded="gpuFloatOpen" @click="gpuFloatOpen = !gpuFloatOpen">
+          <Cpu :size="16" />
+          <span>{{ gpuFloatOpen ? '收起 GPU 状态' : `GPU 状态${gpus.length ? ` · ${gpus.length} 张` : ''}` }}</span>
+        </button>
+        <div v-show="gpuFloatOpen" class="training-gpu-float-panel">
+          <GpuLiveStatus :gpus="gpus" :selected-gpu-ids="selectedGpuIds" />
+        </div>
       </div>
     </section>
 
@@ -1227,6 +1243,15 @@ onBeforeUnmount(() => {
           </button>
         </aside>
         <TrainingMonitor v-if="selectedTrainingTask" :task-id="selectedTrainingTask.id" :active="['queued', 'running', 'pausing', 'paused', 'cancelling'].includes(selectedTrainingTask.status)" :visible="activeTab === 'monitor'" />
+      </div>
+      <div class="training-gpu-float training-gpu-float-left" role="region" aria-label="GPU 实时状态悬浮面板">
+        <button type="button" class="training-gpu-float-toggle" :aria-expanded="gpuFloatOpenMonitor" @click="gpuFloatOpenMonitor = !gpuFloatOpenMonitor">
+          <Cpu :size="16" />
+          <span>{{ gpuFloatOpenMonitor ? '收起 GPU 状态' : `GPU 状态${gpus.length ? ` · ${gpus.length} 张` : ''}` }}</span>
+        </button>
+        <div v-show="gpuFloatOpenMonitor" class="training-gpu-float-panel">
+          <GpuLiveStatus :gpus="gpus" :selected-gpu-ids="selectedGpuIds" />
+        </div>
       </div>
     </section>
     <LoraSvdAnalysis v-if="activeTab === 'svd'" :profiles="profiles" :training-tasks="trainingTasks" />

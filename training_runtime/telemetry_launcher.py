@@ -119,11 +119,14 @@ def _training_progress_metrics(step: int, values: dict[str, float]) -> None:
             values["train.max_steps"] = float(maximum)
             values["train.progress_percent"] = min(100.0, step / maximum * 100.0)
             values["train.eta_seconds"] = max(0.0, (maximum - step) / rate)
+        _LAST_STEP = step
+        _LAST_STEP_AT = now
     elif maximum > 0:
         values["train.max_steps"] = float(maximum)
         values["train.progress_percent"] = min(100.0, step / maximum * 100.0)
-    _LAST_STEP = step
-    _LAST_STEP_AT = now
+        if _LAST_STEP is None:
+            _LAST_STEP = step
+            _LAST_STEP_AT = now
 
 
 def _read_action() -> str | None:

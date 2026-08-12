@@ -1719,8 +1719,14 @@ impl Database {
     /// cascade keeps this operation atomic for callers that have already
     /// completed filesystem cleanup.
     pub fn delete_task(&self, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM tasks WHERE id=?1", [id])? == 1)
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let deleted = transaction.execute("DELETE FROM tasks WHERE id=?1", [id])? == 1;
+        if deleted {
+            transaction.execute("DELETE FROM task_items WHERE task_id=?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(deleted)
     }
 
     pub fn list_all_tasks(&self) -> rusqlite::Result<Vec<TaskRecord>> {

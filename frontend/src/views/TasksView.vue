@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { AlertCircle, Check, CirclePause, Download, History, ListTodo, Pause, Play, RefreshCw, RotateCcw, X } from '@lucide/vue'
+import { AlertCircle, Check, CirclePause, Download, History, ListTodo, Pause, Play, RefreshCw, RotateCcw, Trash2, X } from '@lucide/vue'
 import {
   createTask,
+  deleteTask,
   getDownloadHistory,
   getTaskDetails,
   type DownloadHistoryRecord,
@@ -24,6 +25,7 @@ const filter = ref<'all' | 'active' | 'completed' | 'failed'>('all')
 const section = ref<'tasks' | 'history'>('tasks')
 const controlling = ref<Set<string>>(new Set())
 const confirmingTask = ref<TaskSummary | null>(null)
+const deletingTask = ref<TaskSummary | null>(null)
 const historyItems = ref<DownloadHistoryRecord[]>([])
 const historyLoading = ref(false)
 const historyError = ref<string | null>(null)
@@ -46,7 +48,15 @@ const visibleTasks = computed(() => {
       : filter.value === 'failed'
         ? all.filter((task) => task.status === 'failed' || task.status === 'cancelled')
         : all
-  return [...filtered].sort((left, right) => Number(right.kind === 'training') - Number(left.kind === 'training'))
+  const priority = (task: TaskSummary): number => ({
+    running: 0, pausing: 1, queued: 2, paused: 3, cancelling: 4, awaiting_confirmation: 5,
+    completed: 6, failed: 7, cancelled: 8,
+  }[task.status] ?? 9)
+  return [...filtered].sort((left, right) => {
+    const byStatus = priority(left) - priority(right)
+    if (byStatus !== 0) return byStatus
+    return right.updated_at.localeCompare(left.updated_at)
+  })
 })
 
 const labels: Record<TaskStatus, string> = {
@@ -303,6 +313,26 @@ async function confirmReviewedTask(): Promise<void> {
   confirmingTask.value = null
 }
 
+async function confirmDeleteTask(): Promise<void> {
+  const task = deletingTask.value
+  if (!task) return
+  const next = new Set(controlling.value)
+  next.add(task.id)
+  controlling.value = next
+  try {
+    await deleteTask(task.id)
+    toast.success('任务记录已删除')
+  } catch (reason: unknown) {
+    toast.error('删除任务记录失败', reason instanceof Error ? reason.message : '请稍后重试')
+  } finally {
+    deletingTask.value = null
+    const done = new Set(controlling.value)
+    done.delete(task.id)
+    controlling.value = done
+    await tasks.loadSnapshot()
+  }
+}
+
 function confirmationLabel(_task: TaskSummary): string {
   return '移入隔离区'
 }
@@ -424,11 +454,11 @@ onBeforeUnmount(() => detailsController?.abort())
           <div class="progress-fill" :style="{ width: `${percent(task)}%` }" />
         </div>
         <div class="task-stats">
-          <span>{{ task.progress.completed.toLocaleString() }} / {{ task.progress.total.toLocaleString() }} 项</span>
-          <span>{{ percent(task) }}%</span>
-          <span v-if="task.progress.bytes_downloaded">{{ formatBytes(task.progress.bytes_downloaded) }}</span>
-          <span v-if="task.progress.speed_bytes_per_sec">{{ formatBytes(task.progress.speed_bytes_per_sec) }}/s</span>
-          <span v-if="task.status === 'running'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
+<span>{{ task.progress.completed.toLocaleString() }} / {{ task.progress.total.toLocaleString() }} {{ task.kind === 'training' ? '步' : '项' }}</span>
+<span>{{ percent(task) }}%</span>
+<span v-if="task.progress.bytes_downloaded && task.kind !== 'training'">{{ formatBytes(task.progress.bytes_downloaded) }}</span>
+<span v-if="task.progress.speed_bytes_per_sec && task.kind !== 'training'">{{ formatBytes(task.progress.speed_bytes_per_sec) }}/s</span>
+<span v-if="task.status === 'running' && task.kind !== 'training'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
         </div>
 
         <div v-if="task.training" class="training-queue-summary">
@@ -469,6 +499,7 @@ onBeforeUnmount(() => detailsController?.abort())
           >
             {{ expandedTaskId === task.id ? '收起详情' : '查看详情' }}
           </button>
+          <button v-if="['completed', 'failed', 'cancelled'].includes(task.status)" type="button" class="button button-small button-danger" :disabled="controlling.has(task.id)" @click="deletingTask = task"><Trash2 :size="14" /> 删除记录</button>
         </div>
 
         <section
@@ -645,6 +676,18 @@ onBeforeUnmount(() => detailsController?.abort())
       @confirm="confirmReviewedTask"
     >
       <p>只会处理上方已展示的根目录内相对路径。执行前后端还会重新校验清单，原文件不会被永久删除，而是移入隐藏隔离区。</p>
+    </ConfirmDialog>
+
+    <ConfirmDialog
+      :open="Boolean(deletingTask)"
+      title="删除任务记录"
+      confirm-label="删除"
+      :busy="deletingTask ? controlling.has(deletingTask.id) : false"
+      destructive
+      @cancel="deletingTask = null"
+      @confirm="confirmDeleteTask"
+    >
+      <p>将永久删除该任务记录及其项目明细（{{ deletingTask ? labels[deletingTask.status] : '' }} · {{ deletingTask ? kindLabels[deletingTask.kind] : '' }}）。已下载的媒体文件与下载历史不会被删除。</p>
     </ConfirmDialog>
   </div>
 </template>

@@ -157,6 +157,10 @@ export function taskAction(id: string, action: 'pause' | 'resume' | 'cancel' | '
   return apiClient.post<TaskSummary>(`/tasks/${encodeURIComponent(id)}/${action}`)
 }
 
+export function deleteTask(id: string): Promise<TaskSummary> {
+  return apiClient.delete<TaskSummary>(`/tasks/${encodeURIComponent(id)}`)
+}
+
 export type DownloadTaskRequest = ApiSchema<'DownloadTaskRequest'>
 
 export type CreateTaskRequest = ApiSchema<'CreateTaskRequest'>
@@ -657,6 +661,7 @@ export interface TrainingArtifact {
   size_bytes: number
   modified_at: number
   step?: number | null
+  prompt?: string | null
   url: string
 }
 

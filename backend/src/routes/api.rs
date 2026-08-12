@@ -1073,6 +1073,50 @@ fn parse_upstream_parser_catalog_export(
         .map_err(|error| format!("无法解析 kohya_ss 参数目录: {error}"))
 }
 
+static UPSTREAM_FIELDS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(u128, std::collections::HashMap<String, Vec<UpstreamParserField>>)>>,
+> = std::sync::OnceLock::new();
+
+fn upstream_fields_disk_cache_path(training_root: &Path) -> PathBuf {
+    training_root.join("upstream_fields_cache.json")
+}
+
+fn read_upstream_fields_disk_cache(
+    training_root: &Path,
+    cache_key: u128,
+) -> Option<HashMap<String, Vec<UpstreamParserField>>> {
+    let bytes = std::fs::read(upstream_fields_disk_cache_path(training_root)).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&bytes)).ok()?;
+    if value
+        .get("key")?
+        .as_str()?
+        .parse::<u128>()
+        .ok()? != cache_key
+    {
+        return None;
+    }
+    let fields = value.get("fields")?.clone();
+    let parsed = serde_json::from_value::<HashMap<String, Vec<UpstreamParserField>>>(fields).ok()?;
+    let mut cache = UPSTREAM_FIELDS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("upstream fields cache lock poisoned");
+    *cache = Some((cache_key, parsed.clone()));
+    Some(parsed)
+}
+
+fn write_upstream_fields_disk_cache(
+    training_root: &Path,
+    cache_key: u128,
+    fields: &HashMap<String, Vec<UpstreamParserField>>,
+) {
+    let path = upstream_fields_disk_cache_path(training_root);
+    let value = serde_json::json!({ "key": cache_key.to_string(), "fields": fields });
+    if let Err(error) = std::fs::write(&path, serde_json::to_vec(&value).unwrap_or_default()) {
+        tracing::debug!(%error, path = %path.display(), "无法写入上游字段缓存");
+    }
+}
+
 fn inspect_upstream_adapter_fields(
     training_root: &Path,
 ) -> Result<Option<HashMap<String, Vec<UpstreamParserField>>>, String> {
@@ -1093,35 +1137,135 @@ fn inspect_upstream_adapter_fields(
     if arguments.is_empty() {
         return Ok(None);
     }
-    for profile in available_training_runtime_profiles(training_root) {
-        if !profile.python.is_file() {
-            continue;
-        }
-        let mut command = training_runtime_python_command(&runtime_root, &profile)
-            .map_err(|error| format!("无法准备上游参数检查器: {error}"))?;
-        let output = match command.arg(&inspector).args(&arguments).output() {
-            Ok(output) => output,
-            Err(error) => {
-                tracing::debug!(profile = %profile.id, %error, "无法启动该训练环境的参数检查器，继续尝试其他环境");
-                continue;
-            }
-        };
-        if !output.status.success() {
-            tracing::debug!(
-                profile = %profile.id,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "参数检查器在该训练环境中不可用，继续尝试其他环境"
-            );
-            continue;
-        }
-        match parse_upstream_parser_catalog_export(&String::from_utf8_lossy(&output.stdout)) {
-            Ok(fields) => return Ok(Some(fields)),
-            Err(error) => {
-                tracing::debug!(profile = %profile.id, %error, "参数检查器输出无效，继续尝试其他环境")
-            }
+    // The cache key covers both the inspector source and the adapter list
+    // baked into this binary, so an upgrade that adds/renames an adapter
+    // invalidates the persisted cache instead of serving stale fields.
+    let mut arguments_hash = 0xcbf2_9ce4_8422_2325_u64;
+    for argument in &arguments {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        argument.hash(&mut hasher);
+        arguments_hash ^= hasher.finish();
+    }
+    let cache_key = ((arguments_hash as u128) << 64)
+        | inspector
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|modified| {
+                let seconds = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                (seconds as u128) << 32
+                    | (modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.subsec_nanos() as u128)
+                        .unwrap_or_default())
+            })
+            .unwrap_or(0);
+    let cache = UPSTREAM_FIELDS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("upstream fields cache lock poisoned");
+    if let Some((cached_key, cached)) = cache.as_ref() {
+        if *cached_key == cache_key {
+            return Ok(Some(cached.clone()));
         }
     }
-    Ok(None)
+    drop(cache);
+    if let Some(cached) = read_upstream_fields_disk_cache(training_root, cache_key) {
+        return Ok(Some(cached));
+    }
+    let profiles = available_training_runtime_profiles(training_root);
+    let runtime_root_for_threads = runtime_root.clone();
+    let result = std::thread::scope(|scope| -> Result<Option<HashMap<String, Vec<UpstreamParserField>>>, String> {
+        let found = std::sync::Mutex::new(None::<HashMap<String, Vec<UpstreamParserField>>>);
+        let mut handles = Vec::new();
+        for profile in profiles {
+            if !profile.python.is_file() {
+                continue;
+            }
+            let arguments = arguments.clone();
+            let inspector = inspector.clone();
+            let runtime_root = runtime_root_for_threads.clone();
+            handles.push(scope.spawn(move || {
+                let mut command = match training_runtime_python_command(&runtime_root, &profile) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        tracing::debug!(profile = %profile.id, %error, "无法准备上游参数检查器");
+                        return None;
+                    }
+                };
+                command.arg(&inspector).args(&arguments);
+                let mut child = match command.stdout(std::process::Stdio::piped()).spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        tracing::debug!(profile = %profile.id, %error, "无法启动该训练环境的参数检查器，继续尝试其他环境");
+                        return None;
+                    }
+                };
+                let mut stdout = child.stdout.take();
+                let reader = scope.spawn(move || {
+                    use std::io::Read;
+                    let mut buffer = Vec::new();
+                    if let Some(stream) = stdout.as_mut() {
+                        let _ = stream.read_to_end(&mut buffer);
+                    }
+                    buffer
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+                let status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                // Kill the inspector and give the stdout reader
+                                // a moment to drain EOF.  The bundled inspector
+                                // spawns no children, so the pipe closes right
+                                // away; a hypothetical grandchild inheriting the
+                                // pipe could keep the reader blocked, in which
+                                // case thread::scope would wait for it below.
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                tracing::debug!(profile = %profile.id, "参数检查器超时，已终止");
+                                return None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(error) => {
+                            tracing::debug!(profile = %profile.id, %error, "无法等待参数检查器");
+                            return None;
+                        }
+                    }
+                };
+                if !status.success() {
+                    tracing::debug!(profile = %profile.id, "参数检查器在该训练环境中不可用，继续尝试其他环境");
+                    return None;
+                }
+                let buffer = reader.join().unwrap_or_default();
+                parse_upstream_parser_catalog_export(&String::from_utf8_lossy(&buffer)).ok()
+            }));
+        }
+        for handle in handles {
+            if let Some(fields) = handle.join().ok().flatten() {
+                *found.lock().expect("upstream fields mutex poisoned") = Some(fields);
+                break;
+            }
+        }
+        let found_value = found.lock().expect("upstream fields mutex poisoned").clone();
+        if let Some(ref found_fields) = found_value {
+            let mut cache = UPSTREAM_FIELDS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("upstream fields cache lock poisoned");
+            *cache = Some((cache_key, found_fields.clone()));
+            drop(cache);
+            write_upstream_fields_disk_cache(training_root, cache_key, found_fields);
+        }
+        Ok(found_value)
+    });
+    result
 }
 
 fn augment_adapters_with_upstream_fields(
@@ -1700,7 +1844,7 @@ pub fn router_with_state(state: AppState) -> Router {
             axum::routing::post(restore_quarantine),
         )
         .route("/api/tasks", get(list_tasks).post(create_task))
-        .route("/api/tasks/{id}", get(task_detail))
+        .route("/api/tasks/{id}", get(task_detail).delete(task_delete))
         .route("/api/downloads/history", get(download_history))
         .route("/api/tasks/events", get(task_events))
         .route("/api/tasks/{id}/{action}", axum::routing::post(task_action))
@@ -2604,6 +2748,26 @@ fn training_sample_prompt_lines(
                 .map(|entry| entry.into_path())
                 .collect::<Vec<_>>();
             captions.sort();
+            // True random sample: partially shuffle the (sorted) list with a
+            // task-local seed, then take the first N entries.  Deterministic
+            // ordering would always pick the same few files for every task.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15);
+            let mut seed = nanos ^ (nanos << 21) ^ (nanos >> 7) ^ 0xD1B5_4A32_D192_ED03;
+            let mut next_random = move || {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let total = captions.len();
+            let selected = (settings.dataset_caption_count as usize).min(total);
+            for index in 0..selected {
+                let swap = index + (next_random() % (total - index) as u64) as usize;
+                captions.swap(index, swap);
+            }
             captions
                 .into_iter()
                 .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -4583,6 +4747,8 @@ struct TrainingArtifactResponse {
     modified_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
     url: String,
 }
 
@@ -4662,6 +4828,27 @@ fn safetensors_artifact_step(path: &Path) -> Option<u64> {
         .or_else(|| metadata.as_str()?.trim().parse::<u64>().ok())
 }
 
+/// Reads the prompt text accompanying a sample artifact.  kohya stores the
+/// prompt file next to the generated samples (`sample_prompts.txt` /
+/// `.toml` / `.json`), so the monitor can show the prompt that produced a
+/// given sample image.
+fn sample_prompt_text_for_artifact(sample_path: &Path) -> Option<String> {
+    let directory = sample_path.parent()?;
+    for name in ["sample_prompts.txt", "sample_prompts.toml", "sample_prompts.json"] {
+        let path = directory.join(name);
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let trimmed = text.trim();
+            return if trimmed.is_empty() {
+                None
+            } else {
+                Some(text)
+            };
+        }
+    }
+    None
+}
+
 fn collect_training_artifacts(
     state: &AppState,
     task_id: &str,
@@ -4734,6 +4921,9 @@ fn collect_training_artifact_files(
             let step = (kind == "lora")
                 .then(|| safetensors_artifact_step(&canonical))
                 .flatten();
+            let prompt = (kind == "sample")
+                .then(|| sample_prompt_text_for_artifact(&canonical))
+                .flatten();
             let response = TrainingArtifactResponse {
                 id: id.clone(),
                 kind,
@@ -4751,6 +4941,7 @@ fn collect_training_artifact_files(
                     .map(|duration| duration.as_secs())
                     .unwrap_or_default(),
                 step,
+                prompt,
                 url: format!("/api/training/tasks/{task_id}/artifacts/{id}"),
             };
             artifacts.push(TrainingArtifactFile {
@@ -6869,6 +7060,40 @@ async fn task_detail(
         .database
         .task_item_counts(&id)
         .map_err(|error| ApiError::internal(format!("无法统计任务项目: {error}")))?;
+    let has_item_records = counts.total > 0;
+    let fallback_count = |key: &str| {
+        task.result
+            .as_ref()
+            .and_then(|result| result.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let item_counts = TaskItemCountsResponse {
+        total: if has_item_records {
+            counts.total
+        } else {
+            task.total_items.unwrap_or(0)
+        },
+        queued: counts.queued,
+        completed: if has_item_records {
+            counts.completed
+        } else {
+            task.completed_items
+        },
+        skipped: if has_item_records {
+            counts.skipped
+        } else {
+            fallback_count("skipped")
+        },
+        failed: if has_item_records {
+            counts.failed
+        } else {
+            fallback_count("failed")
+                .max(u64::from(task.error.is_some()))
+        },
+        retryable_failed: counts.retryable_failed,
+        completed_bytes: counts.completed_bytes,
+    };
     let page = state
         .database
         .list_task_items_page(&id, query.item_status.as_deref(), after_id, item_limit)
@@ -6883,15 +7108,7 @@ async fn task_detail(
         data: TaskDetailResponse {
             task: task_summary_response(&state.database, task),
             result,
-            item_counts: TaskItemCountsResponse {
-                total: counts.total,
-                queued: counts.queued,
-                completed: counts.completed,
-                skipped: counts.skipped,
-                failed: counts.failed,
-                retryable_failed: counts.retryable_failed,
-                completed_bytes: counts.completed_bytes,
-            },
+            item_counts,
             items,
             next_cursor: page.next_cursor.map(encode_task_item_cursor),
         },
@@ -8411,6 +8628,20 @@ async fn task_action(
     }))
 }
 
+async fn task_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ApiSuccess<TaskSummaryResponse>>, ApiError> {
+    let task = state
+        .tasks
+        .delete_terminal(&id)
+        .map_err(map_task_manager_error)?;
+    Ok(Json(ApiSuccess {
+        data: task_summary_response(&state.database, task),
+        meta: None,
+    }))
+}
+
 fn map_task_manager_error(error: TaskManagerError) -> ApiError {
     match error {
         TaskManagerError::NotFound => ApiError::not_found("task_not_found", "任务不存在"),
@@ -9129,6 +9360,8 @@ async fn run_training_task(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let run_dir_for_process = run_dir.clone();
+    let run_dir_for_progress = run_dir.clone();
+    let state_for_progress = state.clone();
     let config_path_for_process = config_path.clone();
     let launcher_for_process = launcher.clone();
     let trainer_for_process = trainer.clone();
@@ -9294,12 +9527,30 @@ async fn run_training_task(
         let stderr_reader =
             std::thread::spawn(move || stream_training_output(stderr, &stderr_log_path, "stderr"));
         let mut stop_requested: Option<(String, Instant)> = None;
+        let started = Instant::now();
+        let mut last_progress_report = Instant::now();
         let status = loop {
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| format!("无法等待训练进程: {error}"))?
             {
                 break status;
+            }
+            if last_progress_report.elapsed() >= Duration::from_secs(1) {
+                last_progress_report = Instant::now();
+                if let Some((completed, total, _)) =
+                    read_training_metrics_progress(&run_dir_for_progress)
+                {
+                    let _ = report_task_progress(
+                        &state_for_progress,
+                        &task_id,
+                        completed,
+                        total,
+                        0,
+                        0,
+                        started,
+                    );
+                }
             }
             let requested =
                 task_manager
@@ -9959,7 +10210,7 @@ async fn run_resize_task(
         .as_ref()
         .and_then(|options| options.get("quality"))
         .and_then(Value::as_u64)
-        .unwrap_or(90);
+        .unwrap_or(100);
     if !(1..=8_192).contains(&max_size) || !(1..=100).contains(&quality) {
         return Err(TaskFailure {
             code: "invalid_resize_options".to_string(),
@@ -11787,6 +12038,9 @@ async fn run_download_task(
         verified_root.path().to_path_buf()
     };
     let client = state.danbooru.read().await.clone();
+    let blur_sensitive = state.settings.read().await.blur_sensitive_media;
+    let sensitive_rating_filter = blur_sensitive
+        .then(|| " -rating:questionable -rating:explicit".to_string());
     let target = request.limit.unwrap_or(1);
     let concurrency = usize::from(request.concurrency.unwrap_or(1)).clamp(1, 32);
     let template = request.filename_template.clone().unwrap_or_default();
@@ -11932,6 +12186,9 @@ async fn run_download_task(
         }
         DownloadSource::Query { query } => {
             let mut active_query = query.clone();
+            if let Some(filter) = sensitive_rating_filter.as_ref() {
+                active_query.push_str(filter);
+            }
             let mut custom_order = query
                 .split_whitespace()
                 .any(|token| token.starts_with("order:"));
@@ -11969,6 +12226,9 @@ async fn run_download_task(
                             "查询标签超额，切换到分段远程验证"
                         );
                         active_query = segmented_batch_anchor_query(&filter, &anchor_tag);
+                        if let Some(sensitive) = sensitive_rating_filter.as_ref() {
+                            active_query.push_str(sensitive);
+                        }
                         custom_order = false;
                         page_token = "1".to_string();
                         segmented_filter = Some((filter, anchor_tag));
@@ -11996,9 +12256,10 @@ async fn run_download_task(
                     .posts
                     .into_iter()
                     .filter(|post| {
-                        tracked_post_statuses
-                            .get(&post.id)
-                            .is_none_or(|status| status == "queued")
+                        (!blur_sensitive || matches!(post.rating.as_str(), "g" | "s"))
+                            && tracked_post_statuses
+                                .get(&post.id)
+                                .is_none_or(|status| status == "queued")
                     })
                     .collect::<Vec<_>>();
                 let mut posts = if let Some((filter, anchor_tag)) = segmented_filter.as_ref() {
@@ -12384,6 +12645,53 @@ fn report_download_run_progress(
         starting_bytes,
         started,
     )
+}
+
+/// Reads the tail of the training `metrics.jsonl` stream and derives the
+/// current optimizer step plus the configured maximum, so the task centre can
+/// show a real training progress bar instead of a permanent 0%.
+fn read_training_metrics_progress(run_dir: &std::path::Path) -> Option<(u64, u64, Option<u64>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = run_dir.join("metrics.jsonl");
+    let mut file = std::fs::File::open(&path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len == 0 {
+        return None;
+    }
+    let tail_len = file_len.min(16 * 1024);
+    file.seek(SeekFrom::End(-(tail_len as i64))).ok()?;
+    let mut bytes = Vec::with_capacity(tail_len as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut step: u64 = 0;
+    let mut max_steps: Option<u64> = None;
+    let mut eta_seconds: Option<u64> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(metrics) = value.get("metrics").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(parsed) = value.get("step").and_then(Value::as_u64) {
+            step = step.max(parsed);
+        }
+        if let Some(parsed) = metrics.get("train.max_steps").and_then(Value::as_u64) {
+            max_steps = Some(max_steps.map_or(parsed, |current| current.max(parsed)));
+        }
+        if let Some(parsed) = metrics.get("train.eta_seconds").and_then(Value::as_u64) {
+            eta_seconds = Some(parsed);
+        }
+    }
+    let total = max_steps?;
+    if total == 0 {
+        return None;
+    }
+    Some((step.min(total), total, eta_seconds))
 }
 
 fn report_task_progress(
@@ -15051,17 +15359,18 @@ mod security_contract_tests {
         );
     }
 
-    #[test]
-    fn dataset_caption_samples_keep_the_negative_prompt_steps_and_resolution_separate() {
+#[test]
+    fn dataset_caption_samples_shuffle_captions_and_keep_negative_prompt_steps_and_resolution_separate() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("beta.txt"), "second caption\n").unwrap();
         std::fs::write(directory.path().join("alpha.txt"), "first caption\n").unwrap();
+        std::fs::write(directory.path().join("gamma.txt"), "third caption\n").unwrap();
         let settings = TrainingSampleSettings {
             enabled: true,
             prompt_source: TrainingSamplePromptSource::DatasetCaptions,
             prompt: String::new(),
             negative_prompt: "low quality, blurry".to_string(),
-            dataset_caption_count: 1,
+            dataset_caption_count: 2,
             steps: 30,
             width: 1024,
             height: 768,
@@ -15071,10 +15380,18 @@ mod security_contract_tests {
         let lines =
             training_sample_prompt_lines(&settings, Some(directory.path()), ".txt").unwrap();
 
-        assert_eq!(
-            lines,
-            vec!["first caption --n low quality, blurry --w 1024 --h 768 --s 30"]
-        );
+        assert_eq!(lines.len(), 2);
+        let suffix = "--n low quality, blurry --w 1024 --h 768 --s 30";
+        let prefixes = lines
+            .iter()
+            .map(|line| line.split(" --n ").next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(prefixes.iter().all(|prefix| matches!(
+            *prefix,
+            "first caption" | "second caption" | "third caption"
+        )), "unexpected sample selection: {lines:?}");
+        assert_ne!(prefixes[0], prefixes[1], "sample must not repeat files: {lines:?}");
+        assert!(lines.iter().all(|line| line.ends_with(suffix)));
     }
 
     #[test]

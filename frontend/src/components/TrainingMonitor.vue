@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch, type ComponentPublicInstance } from 'vue'
-import { Activity, Gauge, Image, LineChart, MoveHorizontal, RefreshCw, RotateCcw, Timer, ZoomIn, ZoomOut } from '@lucide/vue'
+import { Activity, Gauge, Image, LineChart, MoveHorizontal, RefreshCw, RotateCcw, Timer, X, ZoomIn, ZoomOut } from '@lucide/vue'
 import { graphic, init, use, type ECharts } from 'echarts/core'
 import { LineChart as EChartsLineChart } from 'echarts/charts'
 import { DataZoomComponent, GridComponent, TooltipComponent } from 'echarts/components'
@@ -47,6 +47,15 @@ const logs = ref('')
 const logsLoading = ref(false)
 const artifacts = ref<TrainingArtifact[]>([])
 const artifactsLoading = ref(false)
+const lightboxArtifact = ref<TrainingArtifact | null>(null)
+
+function openSampleLightbox(artifact: TrainingArtifact): void {
+  lightboxArtifact.value = artifact
+}
+
+function closeSampleLightbox(): void {
+  lightboxArtifact.value = null
+}
 
 let chart: ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -472,9 +481,17 @@ function setChartHost(host: Element | ComponentPublicInstance | null): void {
   attachChart(element)
 }
 
-onMounted(() => attachChart(chartHost.value))
+onMounted(() => {
+  attachChart(chartHost.value)
+  document.addEventListener('keydown', onLightboxKeydown)
+})
+
+function onLightboxKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && lightboxArtifact.value) closeSampleLightbox()
+}
 
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onLightboxKeydown)
   stopMonitorActivity()
   requestController?.abort()
   if (renderFrame !== null) cancelAnimationFrame(renderFrame)
@@ -547,7 +564,11 @@ onBeforeUnmount(() => {
     </template>
     <section class="training-artifacts training-monitor-panel" aria-label="样图与训练产物">
       <header><div><Image :size="15" /><strong>样图与产物 <InfoTooltip title="样图与产物" description="样图用于定性对照，权重文件用于 checkpoint 与 SVD 分析；两者都应结合验证集或固定 Prompt 判断。" /></strong><small>{{ artifactsLoading ? '正在索引…' : `${artifacts.length} 项` }}</small></div><button class="button button-small" type="button" :disabled="artifactsLoading" @click="loadArtifacts"><RefreshCw :size="13" /> 刷新产物</button></header>
-      <div v-if="sampleArtifacts.length" class="training-sample-grid"><a v-for="artifact in sampleArtifacts" :key="artifact.id" :href="artifact.url" target="_blank" rel="noreferrer"><img :src="artifact.url" loading="lazy" :alt="artifact.name" /><span>{{ artifact.name }}</span></a></div>
+      <div v-if="sampleArtifacts.length" class="training-sample-grid">
+        <button v-for="artifact in sampleArtifacts" :key="artifact.id" type="button" class="training-sample-thumb" :title="artifact.step != null ? `Step ${artifact.step} · 单击放大` : '单击放大'" @click="openSampleLightbox(artifact)">
+          <img :src="artifact.url" loading="lazy" :alt="artifact.name" /><span>{{ artifact.name }}</span>
+        </button>
+      </div>
       <p v-else class="training-monitor-empty">训练样图生成后将在这里显示。</p>
       <div v-if="loraArtifacts.length" class="training-artifact-list"><a v-for="artifact in loraArtifacts" :key="artifact.id" :href="artifact.url" target="_blank" rel="noreferrer"><span><b>LoRA</b>{{ artifact.name }}</span><small>{{ (artifact.size_bytes / 1024 / 1024).toFixed(2) }} MiB</small></a></div>
     </section>
@@ -555,5 +576,20 @@ onBeforeUnmount(() => {
       <header><strong><Timer :size="14" />运行日志 <InfoTooltip title="运行日志" description="保留上游训练器的控制台输出，用于定位参数、数据集和 CUDA 失败；日志内容不是结构化指标。" /></strong><button class="button button-small" type="button" :disabled="logsLoading" @click="loadLogs"><RefreshCw :size="13" /> 刷新日志</button></header>
       <pre>{{ logs || '训练启动后会在这里持续显示控制台输出。' }}</pre>
     </section>
+
+    <Transition name="toast">
+      <div v-if="lightboxArtifact" class="sample-lightbox" role="dialog" aria-modal="true" aria-label="样图放大预览" @click.self="closeSampleLightbox">
+        <button type="button" class="sample-lightbox-close" aria-label="关闭预览" @click="closeSampleLightbox"><X :size="20" /></button>
+        <figure>
+          <img :src="lightboxArtifact.url" :alt="lightboxArtifact.name" />
+          <figcaption>
+            <strong>{{ lightboxArtifact.name }}</strong>
+            <span v-if="lightboxArtifact.step != null">Step {{ lightboxArtifact.step }}</span>
+          </figcaption>
+        </figure>
+        <pre v-if="lightboxArtifact.prompt" class="sample-lightbox-prompt"><strong>Sample Prompt</strong>{{ lightboxArtifact.prompt }}</pre>
+        <a v-else class="sample-lightbox-open" :href="lightboxArtifact.url" target="_blank" rel="noreferrer">在新窗口打开原图</a>
+      </div>
+    </Transition>
   </section>
 </template>

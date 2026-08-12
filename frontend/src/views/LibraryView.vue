@@ -252,6 +252,32 @@ function toggleAllMatching(): void {
   excludedMediaIds.value = new Set()
 }
 
+function invertSelection(): void {
+  const items = page.value?.items ?? []
+  if (allMatchingSelected.value) {
+    const nextExcluded = new Set(excludedMediaIds.value)
+    for (const media of items) {
+      if (nextExcluded.has(media.id)) nextExcluded.delete(media.id)
+      else nextExcluded.add(media.id)
+    }
+    excludedMediaIds.value = nextExcluded
+    return
+  }
+  const next = new Set(selected.value)
+  const nextMedia = new Map(selectedMedia.value)
+  for (const media of items) {
+    if (next.has(media.id)) {
+      next.delete(media.id)
+      nextMedia.delete(media.id)
+    } else {
+      next.add(media.id)
+      nextMedia.set(media.id, media)
+    }
+  }
+  selected.value = next
+  selectedMedia.value = nextMedia
+}
+
 async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' | 'vllm_tag' | 'delete_selected'): Promise<void> {
   if (!activeRootId.value || !selectedCount.value) return
   if (type === 'heic_convert' && !heicSelectionEligible.value) return
@@ -592,7 +618,7 @@ onBeforeUnmount(() => {
       </div>
       <div v-else class="empty-state"><div><Images :size="30" /><strong>没有匹配的媒体</strong><p>尝试减少标签或清空查询。</p></div></div>
 
-      <nav v-if="page?.items.length" class="pagination" aria-label="图库分页">
+      <nav v-if="page?.items.length" class="pagination" :class="{ 'pagination-below-selection': selectedCount }" aria-label="图库分页">
         <button type="button" class="button button-small" :disabled="currentPage <= 1" @click="previousPage"><ChevronLeft :size="15" /> 上一页</button>
         <span class="pagination-info">第 {{ currentPage }} / {{ totalPages }} 页 · 共 {{ totalPages }} 页</span>
         <label class="inline" for="library-page-jump">
@@ -618,6 +644,7 @@ onBeforeUnmount(() => {
           <strong>已选择 {{ selectedCount }} 项</strong>
           <span class="selection-copy">任务只接收受控媒体 ID</span>
           <div class="selection-actions">
+            <button type="button" class="button button-quiet" :disabled="creatingBatchTask" @click="invertSelection">反选</button>
             <button type="button" class="button button-quiet" :disabled="creatingBatchTask" @click="clearSelection">清除</button>
             <label class="inline" for="library-resize-max-size">
               <span class="field-help">最长边</span>
