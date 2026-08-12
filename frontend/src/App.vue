@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { GraduationCap, Images, ListTodo, Search, Settings, Wrench } from '@lucide/vue'
 import ToastContainer from './components/ToastContainer.vue'
 import { useConfigStore } from './stores/config'
@@ -35,6 +35,20 @@ onMounted(() => {
   health.start()
   void tasks.connect()
 })
+
+function applyBackground(): void {
+  const root = document.documentElement
+  const image = config.config.background_image
+  if (image) {
+    root.style.setProperty('--app-background-image', `url("${image}")`)
+  } else {
+    root.style.removeProperty('--app-background-image')
+  }
+  root.style.setProperty('--app-background-opacity', String(Math.max(0, Math.min(100, config.config.background_opacity ?? 0))))
+}
+
+watch(() => [config.config.background_image, config.config.background_opacity], applyBackground, { deep: true })
+watch(() => config.loaded, (loaded) => { if (loaded) applyBackground() })
 
 onUnmounted(() => {
   health.stop()

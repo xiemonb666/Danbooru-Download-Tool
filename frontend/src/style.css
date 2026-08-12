@@ -32,7 +32,11 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: var(--page);
+  background-image: var(--app-background-image, none);
+  background-color: rgb(247 247 245 / calc(1 - var(--app-background-opacity, 0) / 100 * 0.78));
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;

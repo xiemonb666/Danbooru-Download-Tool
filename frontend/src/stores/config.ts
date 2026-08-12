@@ -22,6 +22,8 @@ const defaults: AppConfig = {
   filename_template: '{id}_score_{score}.{ext}',
   ugoira_policy: 'webm_and_zip',
   blur_sensitive_media: true,
+  background_image: '',
+  background_opacity: 18,
 }
 
 export const useConfigStore = defineStore('config', () => {

@@ -849,6 +849,9 @@ export interface components {
         };
         ApiSuccess_AppConfig: {
             data: {
+                background_image: string;
+                /** Format: int32 */
+                background_opacity: number;
                 blur_sensitive_media: boolean;
                 danbooru_api_key_configured: boolean;
                 danbooru_username: string;
@@ -1464,6 +1467,9 @@ export interface components {
             } | null;
         };
         AppConfig: {
+            background_image: string;
+            /** Format: int32 */
+            background_opacity: number;
             blur_sensitive_media: boolean;
             danbooru_api_key_configured: boolean;
             danbooru_username: string;
@@ -2104,7 +2110,7 @@ export interface components {
         /** @enum {string} */
         TaskItemStatus: "queued" | "completed" | "skipped" | "failed";
         /** @enum {string} */
-        TaskKind: "download" | "index_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training";
+        TaskKind: "download" | "index_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training" | "runtime_install";
         TaskPreview: {
             candidates?: components["schemas"]["TaskPreviewCandidate"][] | null;
             pairs?: components["schemas"]["NearDuplicatePair"][] | null;
@@ -2444,6 +2450,9 @@ export interface components {
         /** @enum {string} */
         UgoiraPolicy: "webm_and_zip" | "webm_only" | "zip_only";
         UpdateConfigRequest: {
+            background_image: string;
+            /** Format: int32 */
+            background_opacity: number;
             blur_sensitive_media: boolean;
             danbooru_username: string;
             download_concurrency: number;

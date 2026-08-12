@@ -113,6 +113,8 @@ pub struct AppConfig {
     pub filename_template: String,
     pub ugoira_policy: UgoiraPolicy,
     pub blur_sensitive_media: bool,
+    pub background_image: String,
+    pub background_opacity: u8,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -134,6 +136,8 @@ pub struct UpdateConfigRequest {
     pub filename_template: String,
     pub ugoira_policy: UgoiraPolicy,
     pub blur_sensitive_media: bool,
+    pub background_image: String,
+    pub background_opacity: u8,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -279,6 +283,7 @@ pub enum TaskKind {
     VllmTag,
     DatasetAugmentation,
     Training,
+    RuntimeInstall,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]

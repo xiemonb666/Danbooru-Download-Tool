@@ -3,6 +3,8 @@ import { nextTick, onMounted, ref } from 'vue'
 import { Check, FolderPlus, FolderTree, KeyRound, Pencil, Plus, Save, Server, Trash2 } from '@lucide/vue'
 import DownloadDestinationPicker from '../components/DownloadDestinationPicker.vue'
 import {
+  deleteBackground,
+  uploadBackground,
   createMediaRoot,
   deleteMediaRoot,
   deleteSecret,
@@ -35,6 +37,50 @@ const vllmSecret = ref('')
 const allowedHosts = ref('')
 const credentialSaving = ref<SecretKind | null>(null)
 const vllmLoading = ref(false)
+const backgroundUploading = ref(false)
+const backgroundPicker = ref<HTMLInputElement | null>(null)
+
+async function pickBackgroundFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  if (file.size > 16 * 1024 * 1024) {
+    toast.error('背景图片不能超过 16 MiB')
+    return
+  }
+  backgroundUploading.value = true
+  try {
+    const data = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = String(reader.result ?? '')
+        const comma = result.indexOf(',')
+        resolve(comma >= 0 ? result.slice(comma + 1) : result)
+      }
+      reader.onerror = () => reject(new Error('无法读取图片文件'))
+      reader.readAsDataURL(file)
+    })
+    config.config = await uploadBackground(file.name, data)
+    toast.success('背景图片已设置')
+  } catch (reason: unknown) {
+    toast.error('背景图片上传失败', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    backgroundUploading.value = false
+  }
+}
+
+async function removeBackground(): Promise<void> {
+  backgroundUploading.value = true
+  try {
+    config.config = await deleteBackground()
+    toast.success('背景图片已移除')
+  } catch (reason: unknown) {
+    toast.error('背景移除失败', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    backgroundUploading.value = false
+  }
+}
 const vllmUnloading = ref(false)
 
 const vllmPromptPresets = {
@@ -297,6 +343,26 @@ onMounted(() => {
                 <input id="blur-sensitive" v-model="config.config.blur_sensitive_media" type="checkbox">
                 <span class="field-help">开启后，Questionable、Explicit 与未知分级需手动揭示；关闭后直接显示。同时批量下载（标签/搜索）将跳过 Questionable 与 Explicit 内容。</span>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="surface">
+          <header class="surface-header"><div><h2 class="section-title">界面背景</h2><p class="section-copy">上传一张图片作为应用背景；透明度默认较低，避免遮挡内容。</p></div></header>
+          <div class="surface-body form-grid">
+            <div class="field span-full">
+              <label class="field-label" for="background-picker">背景图片</label>
+              <div class="inline" style="gap: 10px; flex-wrap: wrap">
+                <input id="background-picker" ref="backgroundPicker" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" style="display: none" @change="pickBackgroundFile">
+                <button class="button" type="button" :disabled="backgroundUploading" @click="backgroundPicker?.click()"><FolderPlus :size="15" /> {{ config.config.background_image ? '更换背景' : '上传背景' }}</button>
+                <button v-if="config.config.background_image" class="button button-danger" type="button" :disabled="backgroundUploading" @click="removeBackground"><Trash2 :size="15" /> 移除背景</button>
+                <span v-if="config.config.background_image" class="field-help">已设置背景（16 MiB 以内 · png / jpg / webp / gif / bmp）</span>
+              </div>
+            </div>
+            <div class="field span-full">
+              <label class="field-label" for="background-opacity">背景透明度 <span class="field-help">{{ config.config.background_opacity }}%</span></label>
+              <input id="background-opacity" v-model.number="config.config.background_opacity" class="input" type="range" min="0" max="100" step="1" style="max-width: 420px">
+              <small class="field-help">数值越大背景越明显；建议 10–30% 保持内容可读。</small>
             </div>
           </div>
         </section>

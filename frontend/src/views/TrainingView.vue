@@ -814,13 +814,11 @@ async function installActiveRuntime(): Promise<void> {
   if (!activeProfile.value || runtimeActionLoading.value) return
   runtimeActionLoading.value = true
   try {
-    const profile = await installTrainingRuntime(activeProfile.value.id)
-    profiles.value = profiles.value.map((item) => item.id === profile.id ? profile : item)
+    await installTrainingRuntime(activeProfile.value.id)
+    await refreshRuntimeProfiles()
     toast.success(
-      activeProfile.value.managed ? '训练运行时安装已开始' : '训练源码同步已开始',
-      activeProfile.value.managed
-        ? '源码、隔离 Python 与 CUDA 依赖会在后台准备；完成后将自动刷新状态。'
-        : '将把锁定的 kohya_ss v26.0.0 源码与其依赖同步到所选环境；请确认这是你要修改的 Conda 环境。',
+      activeProfile.value.managed ? '训练运行时安装任务已加入队列' : '训练源码同步任务已加入队列',
+      '可前往任务中心查看安装进度与结果。',
     )
   } catch (reason: unknown) {
     toast.error('无法启动训练运行时安装', reason instanceof Error ? reason.message : '未知错误')

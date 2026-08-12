@@ -67,7 +67,7 @@ const labels: Record<TaskStatus, string> = {
 const kindLabels: Record<string, string> = {
   download: '下载', index_library: '刷新图库', integrity_scan: '完整性检查', exact_dedup: '精确去重',
   near_dedup: '相似图片检查', resize: '缩放图片', heic_convert: 'HEIC 转换', delete_by_tag: '按标签隔离', delete_selected: '删除所选媒体',
-  tag_pipeline: '标签处理', vllm_tag: '视觉模型打标', dataset_augmentation: '数据集增广', training: 'LoRA 训练',
+  tag_pipeline: '标签处理', vllm_tag: '视觉模型打标', dataset_augmentation: '数据集增广', training: 'LoRA 训练', runtime_install: '运行时安装',
 }
 
 function percent(task: TaskSummary): number {
@@ -454,11 +454,11 @@ onBeforeUnmount(() => detailsController?.abort())
           <div class="progress-fill" :style="{ width: `${percent(task)}%` }" />
         </div>
         <div class="task-stats">
-<span>{{ task.progress.completed.toLocaleString() }} / {{ task.progress.total.toLocaleString() }} {{ task.kind === 'training' ? '步' : '项' }}</span>
+<span>{{ task.kind === 'training' || task.kind === 'runtime_install' ? `${task.progress.completed.toLocaleString()} / ${task.progress.total.toLocaleString()} 阶段` : `${task.progress.completed.toLocaleString()} / ${task.progress.total.toLocaleString()} 项` }}</span>
 <span>{{ percent(task) }}%</span>
-<span v-if="task.progress.bytes_downloaded && task.kind !== 'training'">{{ formatBytes(task.progress.bytes_downloaded) }}</span>
-<span v-if="task.progress.speed_bytes_per_sec && task.kind !== 'training'">{{ formatBytes(task.progress.speed_bytes_per_sec) }}/s</span>
-<span v-if="task.status === 'running' && task.kind !== 'training'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
+<span v-if="task.progress.bytes_downloaded && task.kind !== 'training' && task.kind !== 'runtime_install'">{{ formatBytes(task.progress.bytes_downloaded) }}</span>
+<span v-if="task.progress.speed_bytes_per_sec && task.kind !== 'training' && task.kind !== 'runtime_install'">{{ formatBytes(task.progress.speed_bytes_per_sec) }}/s</span>
+<span v-if="task.status === 'running' && task.kind !== 'training' && task.kind !== 'runtime_install'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
         </div>
 
         <div v-if="task.training" class="training-queue-summary">

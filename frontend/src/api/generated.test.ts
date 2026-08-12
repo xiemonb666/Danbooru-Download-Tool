@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+﻿import { describe, expect, it } from 'vitest'
 
 import type { AppConfig, DanbooruPost, DownloadHistoryPage, HealthStatus, LocalMedia, TaskDetails } from './index'
 import type { components } from './generated'
@@ -34,6 +34,8 @@ describe('generated OpenAPI contracts', () => {
       filename_template: '{id}_score_{score}.{ext}',
       ugoira_policy: 'webm_and_zip',
       blur_sensitive_media: true,
+      background_image: '',
+      background_opacity: 18,
     } satisfies components['schemas']['AppConfig']
 
     const usesGeneratedContract: Equal<AppConfig, components['schemas']['AppConfig']> = true
@@ -51,3 +53,4 @@ describe('generated OpenAPI contracts', () => {
     expect(usesGeneratedHealth).toBe(true)
   })
 })
+

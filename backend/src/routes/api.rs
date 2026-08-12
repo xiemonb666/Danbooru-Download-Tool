@@ -357,6 +357,7 @@ pub struct AppState {
     root_writes: RootWriteCoordinator,
     root_registry: Arc<Mutex<()>>,
     thumbnail_cache_dir: PathBuf,
+    backgrounds_dir: PathBuf,
     vllm_launcher_root: Option<PathBuf>,
     vllm_loads: VllmLoadCoordinator,
     worker_slots: Arc<Semaphore>,
@@ -555,6 +556,9 @@ impl AppState {
             )?;
         }
         let thumbnail_cache_dir = paths.data_dir.join("cache").join("thumbnails");
+        let backgrounds_dir = paths.data_dir.join("backgrounds");
+        std::fs::create_dir_all(&backgrounds_dir)
+            .map_err(|error| format!("无法创建背景目录 {}: {error}", backgrounds_dir.display()))?;
         let vllm_launcher_root = find_vllm_launcher_root(&paths);
         let mut settings = load_settings(&settings_path)?;
         let vllm_base_url_override = std::env::var("VLLM_BASE_URL").ok();
@@ -587,6 +591,7 @@ impl AppState {
             root_writes: RootWriteCoordinator::default(),
             root_registry: Arc::new(Mutex::new(())),
             thumbnail_cache_dir,
+            backgrounds_dir,
             vllm_launcher_root,
             vllm_loads: VllmLoadCoordinator::default(),
             worker_slots: Arc::new(Semaphore::new(4)),
@@ -805,12 +810,48 @@ impl ResolvedTrainingRuntimeProfile {
     }
 }
 
+fn platform_python_executable(env_root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        env_root.join("Scripts").join("python.exe")
+    } else {
+        env_root.join("bin").join("python")
+    }
+}
+
+fn platform_conda_executable(prefix: &Path) -> PathBuf {
+    if cfg!(windows) {
+        prefix.join("Scripts").join("conda.exe")
+    } else {
+        prefix.join("bin").join("conda")
+    }
+}
+
+/// Conda environments keep the interpreter at the environment root
+/// (`python.exe` on Windows, `bin/python` on POSIX); `Scripts/` only holds
+/// activation and package executables.
+fn conda_python_executable(env_root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        env_root.join("python.exe")
+    } else {
+        env_root.join("bin").join("python")
+    }
+}
+
+fn platform_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    } else {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
 fn training_runtime_profile_paths(
     runtime_root: &Path,
     profile: &str,
 ) -> Result<TrainingRuntimeProfilePaths, String> {
     let python = match profile {
-        "windows" => runtime_root.join("venv").join("Scripts").join("python.exe"),
+        "windows" => platform_python_executable(&runtime_root.join("venv")),
+        "linux" => runtime_root.join("venv").join("bin").join("python"),
         "wsl" => runtime_root.join("venv").join("bin").join("python"),
         _ => return Err("不支持的训练运行时配置档".to_string()),
     };
@@ -824,6 +865,7 @@ fn managed_training_runtime_profile(
     let paths = training_runtime_profile_paths(runtime_root, profile)?;
     let (label, kind) = match profile {
         "windows" => ("Windows 原生 Python", "windows"),
+        "linux" => ("Linux 原生 Python", "linux"),
         "wsl" => ("WSL Python / CUDA", "wsl"),
         _ => return Err("不支持的内置训练运行时配置档".to_string()),
     };
@@ -883,9 +925,9 @@ fn parse_conda_environment_profiles(
             label: format!("Conda · {name}"),
             kind: "conda",
             // A Conda environment keeps its interpreter at the environment
-            // root.  `Scripts/` contains activation and package executables,
-            // not the environment Python itself.
-            python: root.join("python.exe"),
+            // root (`python.exe` / `bin/python`); `Scripts/` (Windows)
+            // contains activation and package executables.
+            python: conda_python_executable(&root),
             managed: false,
         });
     }
@@ -902,20 +944,29 @@ fn conda_executable() -> Option<PathBuf> {
         }
     }
     let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        let home = PathBuf::from(home);
+    if let Some(home) = platform_home_dir() {
         for distribution in ["anaconda3", "miniconda3", "mambaforge", "miniforge3"] {
-            candidates.push(home.join(distribution).join("Scripts").join("conda.exe"));
+            candidates.push(platform_conda_executable(&home.join(distribution)));
+            if !cfg!(windows) {
+                candidates.push(platform_conda_executable(&home.join(format!(".{distribution}"))));
+            }
         }
     }
-    for root in ["C:/ProgramData", "C:/"] {
-        for distribution in ["anaconda3", "miniconda3", "mambaforge", "miniforge3"] {
-            candidates.push(
-                PathBuf::from(root)
-                    .join(distribution)
-                    .join("Scripts")
-                    .join("conda.exe"),
-            );
+    if cfg!(windows) {
+        for root in ["C:/ProgramData", "C:/"] {
+            for distribution in ["anaconda3", "miniconda3", "mambaforge", "miniforge3"] {
+                candidates.push(platform_conda_executable(
+                    &PathBuf::from(root).join(distribution),
+                ));
+            }
+        }
+    } else {
+        for root in ["/opt", "/usr/local"] {
+            for distribution in ["anaconda3", "miniconda3", "mambaforge", "miniforge3"] {
+                candidates.push(platform_conda_executable(
+                    &PathBuf::from(root).join(distribution),
+                ));
+            }
         }
     }
     candidates.into_iter().find(|path| path.is_file())
@@ -942,7 +993,7 @@ fn external_venv_profile(
     root: &Path,
     used_ids: &mut HashSet<String>,
 ) -> Option<ResolvedTrainingRuntimeProfile> {
-    let python = root.join("Scripts").join("python.exe");
+    let python = platform_python_executable(root);
     if !python.is_file() {
         return None;
     }
@@ -998,9 +1049,11 @@ fn system_venv_search_roots() -> Vec<PathBuf> {
     if let Some(workon_home) = std::env::var_os("WORKON_HOME").map(PathBuf::from) {
         roots.push(workon_home);
     }
-    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+    if let Some(home) = platform_home_dir() {
         roots.push(home.join(".virtualenvs"));
-        roots.push(home.join("Envs"));
+        if cfg!(windows) {
+            roots.push(home.join("Envs"));
+        }
     }
     roots
 }
@@ -1013,8 +1066,13 @@ fn available_training_runtime_profiles(
     training_root: &Path,
 ) -> Vec<ResolvedTrainingRuntimeProfile> {
     let runtime_root = installed_training_runtime_root(training_root);
-    let mut profiles = ["windows", "wsl"]
-        .into_iter()
+    let managed_ids = if cfg!(windows) {
+        ["windows", "wsl"].as_slice()
+    } else {
+        ["linux"].as_slice()
+    };
+    let mut profiles = managed_ids
+        .iter()
         .filter_map(|profile| managed_training_runtime_profile(&runtime_root, profile).ok())
         .collect::<Vec<_>>();
     match discover_conda_runtime_profiles() {
@@ -1819,6 +1877,11 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/vllm/load", axum::routing::post(vllm_load))
         .route("/api/vllm/unload", axum::routing::post(vllm_unload))
         .route("/api/config", get(get_config).put(update_config))
+        .route(
+            "/api/settings/background",
+            axum::routing::put(upload_background).delete(delete_background),
+        )
+        .route("/api/settings/background/image", get(background_image_file))
         .route(
             "/api/secrets/{kind}",
             axum::routing::put(put_secret).delete(delete_secret),
@@ -3113,7 +3176,34 @@ fn training_runtime_profile_response(
     runtime_root: &Path,
     profile: &ResolvedTrainingRuntimeProfile,
 ) -> TrainingRuntimeProfileResponse {
-    let install_state = state.training_runtime_installs.state(&profile.id);
+    let install_tasks = state
+        .tasks
+        .snapshot()
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|task| {
+            task.kind == "runtime_install"
+                && task.payload.get("profile_id").and_then(Value::as_str) == Some(profile.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let installing = install_tasks.iter().any(|task| {
+        matches!(task.status, TaskStatus::Queued | TaskStatus::Running)
+    });
+    let latest_success = install_tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .max_by_key(|task| task.updated_at);
+    let install_error = latest_success
+        .is_none()
+        .then(|| {
+            install_tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Failed)
+                .max_by_key(|task| task.updated_at)
+        })
+        .flatten()
+        .and_then(|task| task.error.clone().map(|error| error.message));
     TrainingRuntimeProfileResponse {
         id: profile.id.clone(),
         label: profile.label.clone(),
@@ -3124,8 +3214,8 @@ fn training_runtime_profile_response(
             .is_file()
             && runtime_root.join("RUNTIME_MANIFEST.json").is_file()
             && profile.python.is_file(),
-        installing: install_state.active,
-        last_error: install_state.error,
+        installing,
+        last_error: install_error,
         runtime_root: runtime_root.to_string_lossy().to_string(),
         python_path: profile.python.to_string_lossy().to_string(),
     }
@@ -3161,10 +3251,23 @@ async fn training_runtime_diagnostics(
 async fn install_training_runtime(
     State(state): State<AppState>,
     AxumPath(profile): AxumPath<String>,
-) -> Result<Json<ApiSuccess<TrainingRuntimeProfileResponse>>, ApiError> {
-    let resolved = resolve_training_runtime_profile(&state.training_root, &profile)
+) -> Result<Json<ApiSuccess<TaskSummaryResponse>>, ApiError> {
+    resolve_training_runtime_profile(&state.training_root, &profile)
         .map_err(|error| ApiError::bad_request("invalid_training_runtime", error))?;
-    if !state.training_runtime_installs.begin(&profile) {
+    let already_installing = state
+        .tasks
+        .snapshot()
+        .map_err(map_task_manager_error)?
+        .into_iter()
+        .any(|task| {
+            task.kind == "runtime_install"
+                && task.payload.get("profile_id").and_then(Value::as_str) == Some(profile.as_str())
+                && matches!(
+                    task.status,
+                    TaskStatus::Queued | TaskStatus::Running
+                )
+        });
+    if already_installing {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "training_runtime_installing".to_string(),
@@ -3173,27 +3276,88 @@ async fn install_training_runtime(
             fields: None,
         });
     }
-    let root = state.training_root.clone();
-    let coordinator = state.training_runtime_installs.clone();
-    let profile_for_worker = profile.clone();
-    let resolved_for_worker = resolved.clone();
-    tokio::task::spawn_blocking(move || {
-        let result = install_training_runtime_profile(&root, &resolved_for_worker);
-        coordinator.complete(&profile_for_worker, result);
-    });
-    let runtime_root = installed_training_runtime_root(&state.training_root);
+    let task = state
+        .tasks
+        .create(
+            "runtime_install".to_string(),
+            serde_json::json!({ "profile_id": profile }),
+        )
+        .map_err(map_task_manager_error)?;
+    spawn_task_worker(state.clone(), task.id.clone()).await;
     Ok(Json(ApiSuccess {
-        data: training_runtime_profile_response(&state, &runtime_root, &resolved),
+        data: task_summary_response(&state.database, task),
         meta: None,
     }))
+}
+
+async fn run_runtime_install_task(
+    state: &AppState,
+    task: &TaskSnapshot,
+) -> Result<WorkerOutcome, TaskFailure> {
+    let payload: Value = serde_json::from_value(task.payload.clone()).map_err(|error| {
+        TaskFailure {
+            code: "invalid_task_payload".to_string(),
+            message: error.to_string(),
+            retryable: false,
+        }
+    })?;
+    let profile_id = payload
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TaskFailure {
+            code: "missing_profile_id".to_string(),
+            message: "安装任务缺少 profile_id".to_string(),
+            retryable: false,
+        })?
+        .to_string();
+    let training_root = state.training_root.clone();
+    let task_id = task.id.clone();
+    let task_id_for_worker = task_id.clone();
+    let profile_for_worker = profile_id.clone();
+    let state_for_worker = state.clone();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), TaskFailure> {
+        let profile = resolve_training_runtime_profile(&training_root, &profile_for_worker).map_err(
+            |error| TaskFailure {
+                code: "invalid_training_runtime".to_string(),
+                message: error,
+                retryable: false,
+            },
+        )?;
+        let report = |completed: u64, total: u64| {
+            let _ = report_task_progress(&state_for_worker, &task_id_for_worker, completed, total, 0, 0, started);
+        };
+        install_training_runtime_profile(&training_root, &profile, &report).map_err(|message| {
+            TaskFailure {
+                code: "runtime_install_failed".to_string(),
+                message,
+                retryable: true,
+            }
+        })
+    })
+    .await
+    .map_err(join_task_failure)?;
+    match result {
+        Ok(()) => {
+            let _ = report_task_progress(state, &task_id, 1, 1, 0, 0, started);
+            Ok(WorkerOutcome::Complete(serde_json::json!({
+                "profile_id": profile_id,
+                "installed": true,
+            })))
+        }
+        Err(failure) => Err(failure),
+    }
 }
 
 fn install_training_runtime_profile(
     training_root: &Path,
     profile: &ResolvedTrainingRuntimeProfile,
+    report: &dyn Fn(u64, u64),
 ) -> Result<(), String> {
     let runtime_root = installed_training_runtime_root(training_root);
+    report(1, 4);
     install_bundled_training_runtime_source(&runtime_root)?;
+    report(2, 4);
     if profile.managed {
         if !profile.python.is_file() {
             create_training_runtime_venv(&runtime_root, profile)?;
@@ -3204,6 +3368,7 @@ fn install_training_runtime_profile(
     // read-only while allowing the user-selected `conda:lora` profile to be
     // brought to the pinned upstream dependency set.
     let scripts_root = runtime_root.join("sd-scripts");
+    report(2, 4);
     run_training_runtime_python(
         &scripts_root,
         profile,
@@ -3217,6 +3382,7 @@ fn install_training_runtime_profile(
         ["-m", "pip", "install", "-r", &requirements],
         "安装 kohya_ss v26.0.0 训练依赖",
     )?;
+    report(3, 4);
     let checks = collect_training_runtime_diagnostics(&runtime_root, profile);
     if checks.iter().any(|check| {
         matches!(
@@ -3226,6 +3392,7 @@ fn install_training_runtime_profile(
     }) {
         return Err("训练环境安装完成但健康检查未通过，请打开诊断查看详情".to_string());
     }
+    report(4, 4);
     Ok(())
 }
 
@@ -3584,16 +3751,7 @@ fn create_training_runtime_venv(
     profile: &ResolvedTrainingRuntimeProfile,
 ) -> Result<(), String> {
     let venv = runtime_root.join("venv");
-    if !profile.is_wsl() {
-        let python =
-            std::env::var("DANBOORU_TRAINING_WINDOWS_PYTHON").unwrap_or_else(|_| "py".to_string());
-        let mut command = Command::new(&python);
-        if python.eq_ignore_ascii_case("py") || python.eq_ignore_ascii_case("py.exe") {
-            command.arg("-3");
-        }
-        command.args(["-m", "venv"]).arg(&venv);
-        run_training_install_command(command, "创建 Windows 隔离 Python 环境")
-    } else {
+    if profile.is_wsl() {
         let wsl_venv = runtime_argument_path(&venv, profile)?;
         let mut command = Command::new("wsl.exe");
         if let Ok(distro) = std::env::var("DANBOORU_TRAINING_WSL_DISTRO") {
@@ -3603,6 +3761,21 @@ fn create_training_runtime_venv(
         }
         command.args(["--exec", "python3", "-m", "venv", &wsl_venv]);
         run_training_install_command(command, "创建 WSL 隔离 Python 环境")
+    } else if cfg!(windows) {
+        let python =
+            std::env::var("DANBOORU_TRAINING_WINDOWS_PYTHON").unwrap_or_else(|_| "py".to_string());
+        let mut command = Command::new(&python);
+        if python.eq_ignore_ascii_case("py") || python.eq_ignore_ascii_case("py.exe") {
+            command.arg("-3");
+        }
+        command.args(["-m", "venv"]).arg(&venv);
+        run_training_install_command(command, "创建 Windows 隔离 Python 环境")
+    } else {
+        let python =
+            std::env::var("DANBOORU_TRAINING_LINUX_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let mut command = Command::new(&python);
+        command.args(["-m", "venv"]).arg(&venv);
+        run_training_install_command(command, "创建 Linux 隔离 Python 环境")
     }
 }
 
@@ -5317,6 +5490,10 @@ struct UpdateConfigRequest {
     filename_template: String,
     ugoira_policy: crate::config::UgoiraPolicy,
     blur_sensitive_media: bool,
+    #[serde(default)]
+    background_image: String,
+    #[serde(default)]
+    background_opacity: u8,
 }
 
 async fn update_config(
@@ -5359,6 +5536,8 @@ async fn update_config(
     updated.filename_template = request.filename_template;
     updated.ugoira_policy = request.ugoira_policy;
     updated.blur_sensitive_media = request.blur_sensitive_media;
+    updated.background_image = request.background_image;
+    updated.background_opacity = request.background_opacity.min(100);
     updated
         .validate()
         .map_err(|error| ApiError::bad_request("invalid_config", error.message))?;
@@ -5369,6 +5548,141 @@ async fn update_config(
     *state.danbooru.write().await = client;
     state.clear_danbooru_post_cache();
     Ok(get_config(State(state)).await)
+}
+
+const BACKGROUND_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const BACKGROUND_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+
+#[derive(Debug, serde::Deserialize)]
+struct BackgroundUploadRequest {
+    name: String,
+    data: String,
+}
+
+async fn upload_background(
+    State(state): State<AppState>,
+    Json(request): Json<BackgroundUploadRequest>,
+) -> Result<Json<ApiSuccess<PublicConfig>>, ApiError> {
+    if request.data.len() > BACKGROUND_IMAGE_MAX_BYTES * 4 / 3 + 8 {
+        return Err(ApiError::bad_request(
+            "background_too_large",
+            "背景图片不能超过 16 MiB",
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(request.data.as_bytes())
+        .map_err(|_| ApiError::bad_request("background_invalid_data", "背景图片数据无效"))?;
+    if bytes.is_empty() || bytes.len() > BACKGROUND_IMAGE_MAX_BYTES {
+        return Err(ApiError::bad_request(
+            "background_too_large",
+            "背景图片不能超过 16 MiB",
+        ));
+    }
+    let name = request.name.trim().to_string();
+    let extension = Path::new(&name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| BACKGROUND_IMAGE_EXTENSIONS.contains(&extension.as_str()))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "background_invalid_extension",
+                "背景图片仅支持 png / jpg / jpeg / webp / gif / bmp",
+            )
+        })?;
+    if bytes.len() < 12 {
+        return Err(ApiError::bad_request(
+            "background_invalid_data",
+            "背景图片数据无效",
+        ));
+    }
+    for existing in std::fs::read_dir(&state.backgrounds_dir)
+        .map_err(|error| ApiError::internal(format!("无法读取背景目录: {error}")))?
+        .filter_map(Result::ok)
+    {
+        let _ = std::fs::remove_file(existing.path());
+    }
+    let file_name = format!("{}.{}", uuid::Uuid::new_v4(), extension);
+    let target = state.backgrounds_dir.join(&file_name);
+    std::fs::write(&target, &bytes)
+        .map_err(|error| ApiError::internal(format!("无法保存背景图片: {error}")))?;
+    let mut settings = state.settings.write().await;
+    settings.background_image = format!("/api/settings/background/image?file={file_name}");
+    save_settings(&state.settings_path, &settings).map_err(ApiError::internal)?;
+    Ok(Json(ApiSuccess {
+        data: PublicConfig::from_settings(
+            &settings,
+            state
+                .secrets
+                .get_for_internal_use(SecretKind::Danbooru)
+                .is_ok(),
+            state
+                .secrets
+                .get_for_internal_use(SecretKind::Vllm)
+                .is_ok(),
+        ),
+        meta: None,
+    }))
+}
+
+async fn delete_background(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<PublicConfig>>, ApiError> {
+    for existing in std::fs::read_dir(&state.backgrounds_dir)
+        .map_err(|error| ApiError::internal(format!("无法读取背景目录: {error}")))?
+        .filter_map(Result::ok)
+    {
+        let _ = std::fs::remove_file(existing.path());
+    }
+    let mut settings = state.settings.write().await;
+    settings.background_image = String::new();
+    save_settings(&state.settings_path, &settings).map_err(ApiError::internal)?;
+    Ok(Json(ApiSuccess {
+        data: PublicConfig::from_settings(
+            &settings,
+            state
+                .secrets
+                .get_for_internal_use(SecretKind::Danbooru)
+                .is_ok(),
+            state
+                .secrets
+                .get_for_internal_use(SecretKind::Vllm)
+                .is_ok(),
+        ),
+        meta: None,
+    }))
+}
+
+async fn background_image_file(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let requested = query.get("file").map(String::as_str).unwrap_or_default();
+    if requested.is_empty()
+        || requested.contains('/')
+        || requested.contains('\\')
+        || requested.contains("..")
+    {
+        return Err(ApiError::not_found("background_not_found", "背景图片不存在"));
+    }
+    let path = state.backgrounds_dir.join(requested);
+    if !path.is_file() {
+        return Err(ApiError::not_found("background_not_found", "背景图片不存在"));
+    }
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let bytes = std::fs::read(&path)
+        .map_err(|error| ApiError::internal(format!("无法读取背景图片: {error}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=86400".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -8719,6 +9033,7 @@ async fn spawn_task_worker(state: AppState, task_id: String) {
                     "tag_pipeline" => run_tag_pipeline_task(&state, &task).await,
                     "dataset_augmentation" => run_dataset_augmentation_task(&state, &task).await,
                     "training" => run_training_task(&state, &task).await,
+                    "runtime_install" => run_runtime_install_task(&state, &task).await,
                     _ => Err(TaskFailure {
                         code: "task_not_implemented".to_string(),
                         message: "该工具任务尚未接入执行器".to_string(),

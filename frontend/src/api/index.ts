@@ -695,8 +695,16 @@ export function getTrainingRuntimeDiagnostics(profileId: string): Promise<Traini
   return apiClient.get<TrainingRuntimeDiagnostics>(`/training/runtime-profiles/${encodeURIComponent(profileId)}/diagnostics`)
 }
 
-export function installTrainingRuntime(profileId: string): Promise<TrainingRuntimeProfile> {
-  return apiClient.post<TrainingRuntimeProfile>(`/training/runtime-profiles/${encodeURIComponent(profileId)}/install`)
+export function installTrainingRuntime(profileId: string): Promise<TaskSummary> {
+  return apiClient.post<TaskSummary>(`/training/runtime-profiles/${encodeURIComponent(profileId)}/install`)
+}
+
+export function uploadBackground(name: string, data: string): Promise<AppConfig> {
+  return apiClient.put<AppConfig>('/settings/background', { name, data })
+}
+
+export function deleteBackground(): Promise<AppConfig> {
+  return apiClient.delete<AppConfig>('/settings/background')
 }
 
 export function getVisionCropRuntimeHealth(profileId: string): Promise<VisionCropRuntimeHealth> {

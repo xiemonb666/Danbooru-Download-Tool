@@ -1,4 +1,4 @@
-import { createPinia, setActivePinia } from 'pinia'
+﻿import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AppConfig } from '../api'
 import { useConfigStore } from './config'
@@ -17,6 +17,7 @@ describe('config store', () => {
       proxy_url: null, download_concurrency: 8,
       filename_template: '{id}_score_{score}.{ext}', ugoira_policy: 'webm_and_zip',
       blur_sensitive_media: true,
+      background_image: '', background_opacity: 18,
     } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
     const store = useConfigStore()
@@ -39,6 +40,7 @@ describe('config store', () => {
       proxy_url: null, download_concurrency: 8,
       filename_template: '{id}_score_{score}.{ext}', ugoira_policy: 'webm_and_zip',
       blur_sensitive_media: true,
+      background_image: '', background_opacity: 18,
     }
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
       JSON.stringify({ data: response }),
@@ -59,3 +61,4 @@ describe('config store', () => {
     vi.unstubAllGlobals()
   })
 })
+

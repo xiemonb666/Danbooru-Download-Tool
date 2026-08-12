@@ -32,6 +32,10 @@ pub struct StoredSettings {
     pub filename_template: String,
     pub ugoira_policy: UgoiraPolicy,
     pub blur_sensitive_media: bool,
+    /// URL path of the uploaded background image, empty when unset.
+    pub background_image: String,
+    /// Background overlay opacity as a percentage in 0..=100.
+    pub background_opacity: u8,
     pub legacy_media_path_suggestion: Option<String>,
 }
 
@@ -56,6 +60,8 @@ impl Default for StoredSettings {
             filename_template: crate::services::danbooru::DEFAULT_FILENAME_TEMPLATE.to_string(),
             ugoira_policy: UgoiraPolicy::WebmAndZip,
             blur_sensitive_media: true,
+            background_image: String::new(),
+            background_opacity: 18,
             legacy_media_path_suggestion: None,
         }
     }
@@ -525,6 +531,8 @@ pub struct PublicConfig {
     pub filename_template: String,
     pub ugoira_policy: UgoiraPolicy,
     pub blur_sensitive_media: bool,
+    pub background_image: String,
+    pub background_opacity: u8,
 }
 
 impl PublicConfig {
@@ -557,6 +565,8 @@ impl PublicConfig {
             filename_template: settings.filename_template.clone(),
             ugoira_policy: settings.ugoira_policy,
             blur_sensitive_media: settings.blur_sensitive_media,
+            background_image: settings.background_image.clone(),
+            background_opacity: settings.background_opacity,
         }
     }
 }
