@@ -73,7 +73,7 @@ function resetMonitorMocks(): void {
     { id: 'lora', kind: 'lora', name: 'odette.safetensors', path: 'C:/output/odette.safetensors', size_bytes: 1024, modified_at: 1_700_000_020, url: '/lora' },
     { id: 'config', kind: 'config', name: 'config.toml', path: 'C:/run/config.toml', size_bytes: 512, modified_at: 1_700_000_020, url: '/config' },
   ] })
-  mocks.getTrainingLogs.mockResolvedValue({ text: '' })
+  mocks.getTrainingLogs.mockResolvedValue({ text: '', cursor: 0, truncated: false })
   mocks.trainingMetricEventsUrl.mockReturnValue('/api/training/tasks/test/events')
 }
 
@@ -110,7 +110,8 @@ describe('TrainingMonitor', () => {
   it('keeps every generated sample visible instead of truncating the gallery to eight cards', async () => {
     const view = render(TrainingMonitor, { props: { taskId: 'task-1', active: false } })
 
-    expect((await view.findAllByRole('link')).filter((link) => link.getAttribute('href')?.startsWith('/sample-'))).toHaveLength(10)
+    await view.findByAltText('epoch-0.png')
+    expect(view.container.querySelectorAll('.training-sample-thumb')).toHaveLength(10)
   })
 
   it('keeps the artifact list focused on exported LoRA weights', async () => {
@@ -131,14 +132,14 @@ describe('TrainingMonitor', () => {
     expect(option.series[0].lineStyle.width).toBe(3.5)
   })
 
-  it('maps smoothing directly to the chart without a locally emphasized segment', async () => {
+  it('uses statistical smoothing without enabling chart interpolation or a locally emphasized segment', async () => {
     const view = render(TrainingMonitor, { props: { taskId: 'task-1', active: false } })
 
     expect(await view.findByLabelText('曲线平滑程度')).toHaveValue('0')
     await fireEvent.update(view.getByLabelText('曲线平滑程度'), '100')
     await waitFor(() => expect(mocks.chart.setOption).toHaveBeenCalled())
     const option = mocks.chart.setOption.mock.calls[mocks.chart.setOption.mock.calls.length - 1]?.[0] as { series: Array<{ smooth: false | number }> }
-    expect(option.series[0].smooth).toBe(1)
+    expect(option.series[0].smooth).toBe(false)
     expect(view.container.querySelector('.training-chart-line-emphasis')).toBeNull()
   })
 

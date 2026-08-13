@@ -7,12 +7,14 @@ const apiMocks = vi.hoisted(() => ({
   discoverTrainingGalleryAugmentations: vi.fn(),
   getTrainingCleanupPreview: vi.fn(),
   deleteTrainingTask: vi.fn(),
+  preflightTraining: vi.fn(),
 }))
 
 vi.mock('../api', () => ({
   createTrainingTask: apiMocks.createTrainingTask,
   getTrainingCleanupPreview: apiMocks.getTrainingCleanupPreview,
   deleteTrainingTask: apiMocks.deleteTrainingTask,
+  preflightTraining: apiMocks.preflightTraining,
   getTrainingAdapters: vi.fn().mockResolvedValue([{
     id: 'sdxl-lora', version: 'test', label: 'SDXL LoRA', trainer: 'trainer.py',
     groups: [
@@ -71,6 +73,8 @@ describe('TrainingView', () => {
     apiMocks.getTrainingCleanupPreview.mockResolvedValue({ deletable: [], retained: [] })
     apiMocks.deleteTrainingTask.mockReset()
     apiMocks.deleteTrainingTask.mockResolvedValue({ task_id: 'training-1', deleted: [], retained: [] })
+    apiMocks.preflightTraining.mockReset()
+    apiMocks.preflightTraining.mockResolvedValue({ ready: true, checks: [], suggestions: [], effective_steps: 1000, estimated_vram_mib: 12000 })
   })
 
   it('uses detected GPUs in the training workbench', async () => {

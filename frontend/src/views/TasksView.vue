@@ -65,9 +65,13 @@ const labels: Record<TaskStatus, string> = {
 }
 
 const kindLabels: Record<string, string> = {
-  download: '下载', index_library: '刷新图库', integrity_scan: '完整性检查', exact_dedup: '精确去重',
+  download: '下载', index_library: '刷新图库', reindex_library: '重建图库索引', integrity_scan: '完整性检查', exact_dedup: '精确去重',
   near_dedup: '相似图片检查', resize: '缩放图片', heic_convert: 'HEIC 转换', delete_by_tag: '按标签隔离', delete_selected: '删除所选媒体',
   tag_pipeline: '标签处理', vllm_tag: '视觉模型打标', dataset_augmentation: '数据集增广', training: 'LoRA 训练', runtime_install: '运行时安装',
+}
+
+const resourceLabels: Record<string, string> = {
+  network: '网络', io: '磁盘 I/O', cpu: 'CPU 重任务', gpu: 'GPU 独占', maintenance: '维护',
 }
 
 function percent(task: TaskSummary): number {
@@ -169,6 +173,22 @@ function taskResultItems(value: unknown): ResultItem[] {
   })
 }
 
+const smartCropReasonLabels: Record<string, string> = {
+  detection_failed: '检测失败',
+  analysis_dimension_mismatch: '检测尺寸不一致',
+  no_primary_person: '未找到主人物',
+  ambiguous_overlapping_people: '多人严重重叠',
+  no_head_or_face: '缺少头部或人脸',
+  incomplete_pose: '姿态不完整',
+  lower_body_evidence_missing: '下半身证据不足',
+  feet_evidence_missing: '完整脚部证据不足',
+  complete_both_feet_required: '未满足完整双脚',
+  secondary_person_included: '无法排除其他人物',
+  native_resolution_too_low: '原生分辨率不足',
+  family_limit: '达到 family 数量上限',
+  quality_rule_rejected: '未通过构图质量规则',
+}
+
 function taskResultSummary(kind: string, value: unknown): ResultSummary[] {
   const entries: ResultSummary[] = []
   const addCount = (key: string, label: string) => {
@@ -221,11 +241,30 @@ function taskResultSummary(kind: string, value: unknown): ResultSummary[] {
           ['horizontal_flip', '水平翻转'],
           ['portrait', '肖像裁剪'],
           ['upper_body', '上半身裁剪'],
+          ['cowboy_shot', '牛仔视角裁剪'],
           ['full_body_tight', '紧凑全身裁剪'],
+          ['lower_body', '下半身裁剪'],
+          ['feet', '脚部视角裁剪'],
         ]
         for (const [variant, label] of variantLabels) {
           const count = variants?.[variant]
           if (typeof count === 'number' && Number.isFinite(count)) entries.push({ label, value: `${count.toLocaleString()} 项` })
+        }
+        const byVariant = nestedResultObject(nestedResultObject(value, 'smart_crop'), 'by_variant')
+        for (const [variant, label] of variantLabels.slice(1)) {
+          const details = asResultObject(byVariant?.[variant])
+          if (!details) continue
+          const requested = typeof details.requested === 'number' ? details.requested : 0
+          const generated = typeof details.generated === 'number' ? details.generated : 0
+          const rejected = typeof details.rejected === 'number' ? details.rejected : 0
+          entries.push({ label: `${label}结果`, value: `${requested} 请求 / ${generated} 生成 / ${rejected} 拒绝` })
+          const reasons = asResultObject(details.rejection_reasons)
+          if (reasons) {
+            const leading = Object.entries(reasons)
+              .filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]))
+              .sort((left, right) => right[1] - left[1])[0]
+            if (leading) entries.push({ label: `${label}主要拒绝`, value: `${smartCropReasonLabels[leading[0]] ?? leading[0]} ${leading[1]} 项` })
+          }
         }
       }
       {
@@ -235,7 +274,10 @@ function taskResultSummary(kind: string, value: unknown): ResultSummary[] {
         const coverageLabels: Array<[string, string]> = [
           ['portrait', '肖像平均保留'],
           ['upper_body', '上半身平均保留'],
+          ['cowboy_shot', '牛仔视角平均保留'],
           ['full_body_tight', '紧凑全身平均保留'],
+          ['lower_body', '下半身平均保留'],
+          ['feet', '脚部视角平均保留'],
         ]
         for (const [variant, label] of coverageLabels) {
           const average = asResultObject(coverage?.[variant])?.average
@@ -459,7 +501,12 @@ onBeforeUnmount(() => detailsController?.abort())
 <span v-if="task.progress.bytes_downloaded && task.kind !== 'training' && task.kind !== 'runtime_install'">{{ formatBytes(task.progress.bytes_downloaded) }}</span>
 <span v-if="task.progress.speed_bytes_per_sec && task.kind !== 'training' && task.kind !== 'runtime_install'">{{ formatBytes(task.progress.speed_bytes_per_sec) }}/s</span>
 <span v-if="task.status === 'running' && task.kind !== 'training' && task.kind !== 'runtime_install'">剩余 {{ formatEta(task.progress.eta_seconds) }}</span>
+<span v-if="task.scheduling">{{ resourceLabels[task.scheduling?.resource_class ?? ''] ?? task.scheduling?.resource_class }}</span>
+<span v-if="task.scheduling?.queue_position">队列第 {{ task.scheduling.queue_position }} 位</span>
+<span v-if="task.scheduling?.wait_reason">{{ task.scheduling.wait_reason }}</span>
+<span v-if="task.scheduling?.estimated_wait_seconds">预计等待 {{ formatEta(task.scheduling.estimated_wait_seconds) }}</span>
         </div>
+        <p v-if="task.scheduling?.blocking_task_ids.length" class="task-blockers">阻塞任务：{{ task.scheduling.blocking_task_ids.join('、') }}</p>
 
         <div v-if="task.training" class="training-queue-summary">
           <strong>{{ task.training.adapter_id }} · {{ task.training.runtime_profile_id }}</strong>

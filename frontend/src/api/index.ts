@@ -300,17 +300,21 @@ export function createMediaDirectory(rootId: string, relativePath: string): Prom
 export type LocalMedia = ApiSchema<'LocalMedia'>
 
 export type LibraryPage = ApiSchema<'LibraryPage'>
+export type LibraryFacets = ApiSchema<'LibraryFacets'>
 
 export interface LibraryParams {
   rootId: string
   query?: string
   cursor?: string
+  before?: boolean
   page?: number
   scoreMin?: number
   scoreMax?: number
   minResolution?: number
   resolutionMin?: number
   resolutionMax?: number
+  postCreatedFrom?: number
+  postCreatedTo?: number
   directory?: string
   limit?: number
 }
@@ -319,14 +323,31 @@ export function getLibrary(params: LibraryParams, signal?: AbortSignal): Promise
   const query = new URLSearchParams({ root_id: params.rootId, limit: String(params.limit ?? 60) })
   if (params.query) query.set('q', params.query)
   if (params.cursor) query.set('cursor', params.cursor)
+  if (params.before) query.set('before', 'true')
   if (params.page !== undefined) query.set('page', String(params.page))
   if (params.scoreMin !== undefined) query.set('score_min', String(params.scoreMin))
   if (params.scoreMax !== undefined) query.set('score_max', String(params.scoreMax))
   if (params.minResolution !== undefined) query.set('min_resolution', String(params.minResolution))
   if (params.resolutionMin !== undefined) query.set('resolution_min', String(params.resolutionMin))
   if (params.resolutionMax !== undefined) query.set('resolution_max', String(params.resolutionMax))
+  if (params.postCreatedFrom !== undefined) query.set('post_created_from', String(params.postCreatedFrom))
+  if (params.postCreatedTo !== undefined) query.set('post_created_to', String(params.postCreatedTo))
   if (params.directory !== undefined) query.set('directory', params.directory)
   return apiClient.get<LibraryPage>(`/library/items?${query}`, { signal })
+}
+
+export function getLibraryFacets(params: Omit<LibraryParams, 'cursor' | 'before' | 'page' | 'limit'>, signal?: AbortSignal): Promise<LibraryFacets> {
+  const query = new URLSearchParams({ root_id: params.rootId })
+  if (params.query) query.set('q', params.query)
+  if (params.scoreMin !== undefined) query.set('score_min', String(params.scoreMin))
+  if (params.scoreMax !== undefined) query.set('score_max', String(params.scoreMax))
+  if (params.minResolution !== undefined) query.set('min_resolution', String(params.minResolution))
+  if (params.resolutionMin !== undefined) query.set('resolution_min', String(params.resolutionMin))
+  if (params.resolutionMax !== undefined) query.set('resolution_max', String(params.resolutionMax))
+  if (params.postCreatedFrom !== undefined) query.set('post_created_from', String(params.postCreatedFrom))
+  if (params.postCreatedTo !== undefined) query.set('post_created_to', String(params.postCreatedTo))
+  if (params.directory !== undefined) query.set('directory', params.directory)
+  return apiClient.get<LibraryFacets>(`/library/facets?${query}`, { signal })
 }
 
 export function getLibraryItem(id: string, signal?: AbortSignal): Promise<LocalMedia> {
@@ -564,6 +585,8 @@ export interface TrainingMetricQuery {
 
 export interface TrainingLogs {
   text: string
+  cursor: number
+  truncated: boolean
 }
 
 export interface TrainingGalleryDataset {
@@ -587,7 +610,7 @@ export interface TrainingGalleryDatasetPreview {
 
 export interface TrainingAugmentationSubset {
   task_id: string
-  id: 'horizontal_flip' | 'portrait' | 'upper_body' | 'full_body_tight'
+  id: 'horizontal_flip' | 'portrait' | 'upper_body' | 'cowboy_shot' | 'full_body_tight' | 'lower_body' | 'feet'
   label: string
   relative_directory: string
   caption_extension: string
@@ -771,8 +794,38 @@ export function getTrainingArtifacts(id: string): Promise<{ artifacts: TrainingA
   return apiClient.get<{ artifacts: TrainingArtifact[] }>(`/training/tasks/${encodeURIComponent(id)}/artifacts`)
 }
 
-export function getTrainingLogs(taskId: string, tail = 300): Promise<TrainingLogs> {
-  return apiClient.get<TrainingLogs>(`/training/tasks/${encodeURIComponent(taskId)}/logs?tail=${Math.max(1, Math.min(2000, tail))}`)
+export function getTrainingLogs(taskId: string, options: { tail?: number; after?: number; limit?: number } = {}): Promise<TrainingLogs> {
+  const query = new URLSearchParams()
+  if (options.after !== undefined) query.set('after', String(Math.max(0, options.after)))
+  else query.set('tail', String(Math.max(1, Math.min(2000, options.tail ?? 300))))
+  if (options.limit !== undefined) query.set('limit', String(Math.max(1, Math.min(1024 * 1024, options.limit))))
+  return apiClient.get<TrainingLogs>(`/training/tasks/${encodeURIComponent(taskId)}/logs?${query}`)
+}
+
+export interface TrainingPreflightCheck {
+  id: string
+  ok: boolean
+  severity: string
+  message: string
+  recovery?: string
+}
+
+export interface TrainingParameterSuggestion {
+  field: string
+  value: unknown
+  reason: string
+}
+
+export interface TrainingPreflight {
+  ready: boolean
+  checks: TrainingPreflightCheck[]
+  suggestions: TrainingParameterSuggestion[]
+  effective_steps: number
+  estimated_vram_mib: number
+}
+
+export function preflightTraining(request: TrainingPresetInput['training']): Promise<TrainingPreflight> {
+  return apiClient.post<TrainingPreflight>('/training/preflight', request)
 }
 
 export function previewTraining(adapterId: string, parameters: Record<string, unknown>): Promise<TrainingPreview> {

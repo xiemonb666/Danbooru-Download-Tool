@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { analyzeLoraSvd, apiClient, getDanbooruPosts, getDownloadHistory, getLibraryItem, getTaskDetails, saveSecret } from './index'
+import { analyzeLoraSvd, apiClient, getDanbooruPosts, getDownloadHistory, getLibrary, getLibraryFacets, getLibraryItem, getTaskDetails, saveSecret } from './index'
 
 describe('apiClient', () => {
   afterEach(() => vi.unstubAllGlobals())
@@ -96,6 +96,30 @@ describe('apiClient', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/library/items/media%2F1',
       expect.objectContaining({ method: 'GET', signal: controller.signal }),
+    )
+  })
+
+  it('sends inclusive post publication boundaries to library pages and facets', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ data: { items: [], total: 0 } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await getLibrary({ rootId: 'root-1', postCreatedFrom: 1_700_000_000, postCreatedTo: 1_700_086_399 })
+    await getLibraryFacets({ rootId: 'root-1', postCreatedFrom: 1_700_000_000, postCreatedTo: 1_700_086_399 })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/library/items?root_id=root-1&limit=60&post_created_from=1700000000&post_created_to=1700086399',
+      expect.objectContaining({ method: 'GET' }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/library/facets?root_id=root-1&post_created_from=1700000000&post_created_to=1700086399',
+      expect.objectContaining({ method: 'GET' }),
     )
   })
 

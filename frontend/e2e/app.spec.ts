@@ -46,6 +46,7 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
     size_bytes: 400_000,
     rating: 'g',
     tags: ['cat', `fixture_${index + 1}`],
+    post_created_at: '2026-01-01T08:30:00Z',
     created_at: '2026-01-01T00:00:00Z',
   }))
   let online = true
@@ -147,7 +148,7 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
       return
     }
     if (/^\/api\/training\/tasks\/[^/]+\/logs$/.test(path)) {
-      await route.fulfill({ json: { data: { text: 'fixture training log' } } })
+      await route.fulfill({ json: { data: { text: 'fixture training log', cursor: 20, truncated: false } } })
       return
     }
     if (/^\/api\/training\/tasks\/[^/]+\/cleanup-preview$/.test(path)) {
@@ -181,6 +182,15 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
         items: libraryItems,
         total: librarySize,
         next_cursor: librarySize > libraryItems.length ? 'cursor-60' : null,
+      } } })
+      return
+    }
+    if (path === '/api/library/facets') {
+      await route.fulfill({ json: { data: {
+        catalog_revision: 1,
+        total: librarySize,
+        score_ranges: [],
+        resolution_ranges: [],
       } } })
       return
     }
@@ -226,7 +236,7 @@ async function mockApi(page: Page, options: MockApiOptions = {}): Promise<MockAp
 
 test('every product area remains bounded across supported viewport widths', async ({ page }) => {
   await mockApi(page)
-  for (const width of [390, 1024, 1440]) {
+  for (const width of [390, 1024, 1440, 2560]) {
     await page.setViewportSize({ width, height: 900 })
     for (const [path, heading] of [
       ['/explore?q=cat', '探索与下载'], ['/tasks', '任务中心'], ['/library', '本地图库'],
@@ -286,7 +296,8 @@ test('a non-root route survives a direct load and refresh', async ({ page }) => 
 
   await page.reload()
 
-  await expect(page).toHaveURL(/\/library$/)
+  await expect(page).toHaveURL(/\/library(?:\?|$)/)
+  await expect(page.getByLabel('图库文件夹')).toHaveValue('人物/爱丽丝')
   await expect(page.getByRole('heading', { name: '本地图库' })).toBeVisible()
 })
 
@@ -310,8 +321,10 @@ test('query, reveal, select and enqueue download remain one coherent flow', asyn
 
   await page.getByRole('button', { name: /下载所选/ }).click()
 
-  await expect(page).toHaveURL(/\/tasks$/)
-  await expect(page.getByText('下载所选媒体')).toBeVisible()
+  await expect(page).toHaveURL(/\/explore(?:\?|$)/)
+  const taskOverview = page.getByRole('link', { name: '查看进行中的任务' })
+  await expect(taskOverview).toBeVisible()
+  await expect(taskOverview).toContainText('1 个任务进行中')
 })
 
 test('legacy-style tag conditions enqueue a bounded batch download', async ({ page }) => {
@@ -373,6 +386,58 @@ test('a 10,000 item library keeps the first page and DOM bounded', async ({ page
   await expect(page.getByText('10,000 项本地媒体')).toBeVisible()
   await expect(page.locator('.library-card')).toHaveCount(60)
   expect(await page.locator('body *').count()).toBeLessThan(1_200)
+})
+
+test('library filters, cursor, selection and scroll survive navigation away and back', async ({ page }) => {
+  await mockApi(page, { librarySize: 120 })
+  await page.setViewportSize({ width: 1024, height: 700 })
+  await page.goto('/library')
+
+  await page.getByLabel('图库文件夹').selectOption('人物/爱丽丝')
+  await page.getByPlaceholder(/精确标签/).fill('cat')
+  await page.getByRole('button', { name: '搜索' }).click()
+  await page.getByRole('checkbox', { name: '选择 1_score_5.jpg' }).check()
+  await page.getByRole('button', { name: '下一批' }).click()
+  await expect(page.getByText('第 2 批')).toBeVisible()
+  await page.evaluate(() => window.scrollTo(0, 900))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(500)
+
+  await page.getByRole('link', { name: '任务', exact: true }).click()
+  await expect(page.getByRole('heading', { name: '任务中心' })).toBeVisible()
+  await page.getByRole('link', { name: '图库', exact: true }).click()
+
+  await expect(page.getByLabel('图库文件夹')).toHaveValue('人物/爱丽丝')
+  await expect(page.getByPlaceholder(/精确标签/)).toHaveValue('cat')
+  await expect(page.getByText('第 2 批')).toBeVisible()
+  await expect(page.getByRole('checkbox', { name: '选择 1_score_5.jpg' })).toBeChecked()
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(500)
+})
+
+test('library post date filters send inclusive local-day boundaries and show publication time', async ({ page }) => {
+  const libraryRequests: URL[] = []
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (url.pathname === '/api/library/items') libraryRequests.push(url)
+  })
+  await mockApi(page, { librarySize: 1 })
+  await page.goto('/library')
+
+  const expected = await page.evaluate(() => {
+    const from = new Date('2026-01-02T00:00:00')
+    const afterTo = new Date('2026-01-04T00:00:00')
+    return {
+      from: String(Math.floor(from.getTime() / 1000)),
+      to: String(Math.floor(afterTo.getTime() / 1000) - 1),
+    }
+  })
+  await page.getByLabel('帖子发布日期起').fill('2026-01-02')
+  await page.getByLabel('帖子发布日期止').fill('2026-01-03')
+
+  await expect.poll(() => libraryRequests.some((url) => (
+    url.searchParams.get('post_created_from') === expected.from
+    && url.searchParams.get('post_created_to') === expected.to
+  ))).toBe(true)
+  await expect(page.getByText(/帖子发布于/).first()).toBeVisible()
 })
 
 test('a static local image can enter the mock vLLM task pipeline by media ID', async ({ page }) => {

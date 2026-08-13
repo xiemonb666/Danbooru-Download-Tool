@@ -195,7 +195,7 @@ describe('TasksView destructive preflight', () => {
       result: {
         generated: 120,
         rejected: 3,
-        derived_relative_directory: 'dataset-expanded/task-1/derived',
+        derived_relative_directory: 'characters/.augmentation/task-1/derived',
       },
       item_counts: { total: 0, queued: 0, completed: 0, skipped: 0, failed: 0, retryable_failed: 0 },
       items: [],
@@ -208,7 +208,7 @@ describe('TasksView destructive preflight', () => {
 
     expect(await view.findByText('已生成 120 项')).toBeVisible()
     expect(view.getByText('已拒绝 3 项')).toBeVisible()
-    expect(view.getByText('训练目录 dataset-expanded/task-1/derived')).toBeVisible()
+    expect(view.getByText('训练目录 characters/.augmentation/task-1/derived')).toBeVisible()
   })
 
   it('explains smart-crop output counts, crop coverage, and rejection diagnostics', async () => {
@@ -219,11 +219,16 @@ describe('TasksView destructive preflight', () => {
       result: {
         source_images: 12,
         generated: 24,
-        variant_counts: { portrait: 5, upper_body: 4, full_body_tight: 3 },
+        variant_counts: { portrait: 5, upper_body: 4, cowboy_shot: 3, full_body_tight: 2, lower_body: 2, feet: 1 },
         smart_crop: {
-          generated: 12,
+          requested: 72,
+          generated: 14,
           rejected: 2,
-          coverage_percent: { portrait: { average: 42 } },
+          coverage_percent: { portrait: { average: 42 }, cowboy_shot: { average: 68 }, lower_body: { average: 38 }, feet: { average: 21 } },
+          by_variant: {
+            lower_body: { requested: 12, generated: 2, rejected: 10, rejection_reasons: { lower_body_evidence_missing: 8 } },
+            feet: { requested: 12, generated: 1, rejected: 11, rejection_reasons: { complete_both_feet_required: 7 } },
+          },
         },
         rejection_reasons: { '智能裁剪拒绝：多人主体重叠': 2 },
         next_step: '派生图已生成；请在图库的派生图文件夹中核对构图。',
@@ -240,9 +245,18 @@ describe('TasksView destructive preflight', () => {
     expect(await view.findByText('源原图（未复制） 12 项')).toBeVisible()
     expect(view.getByText('肖像裁剪 5 项')).toBeVisible()
     expect(view.getByText('上半身裁剪 4 项')).toBeVisible()
-    expect(view.getByText('紧凑全身裁剪 3 项')).toBeVisible()
+    expect(view.getByText('牛仔视角裁剪 3 项')).toBeVisible()
+    expect(view.getByText('紧凑全身裁剪 2 项')).toBeVisible()
+    expect(view.getByText('下半身裁剪 2 项')).toBeVisible()
+    expect(view.getByText('脚部视角裁剪 1 项')).toBeVisible()
     expect(view.getByText('智能裁剪拒绝 2 项')).toBeVisible()
     expect(view.getByText('肖像平均保留 42%')).toBeVisible()
+    expect(view.getByText('牛仔视角平均保留 68%')).toBeVisible()
+    expect(view.getByText('下半身平均保留 38%')).toBeVisible()
+    expect(view.getByText('脚部视角平均保留 21%')).toBeVisible()
+    expect(view.getByText('下半身裁剪结果 12 请求 / 2 生成 / 10 拒绝')).toBeVisible()
+    expect(view.getByText('下半身裁剪主要拒绝 下半身证据不足 8 项')).toBeVisible()
+    expect(view.getByText('脚部视角裁剪主要拒绝 未满足完整双脚 7 项')).toBeVisible()
     expect(view.getByText('智能裁剪拒绝：多人主体重叠 2 项')).toBeVisible()
     expect(view.getByText('派生图已生成；请在图库的派生图文件夹中核对构图。')).toBeVisible()
   })

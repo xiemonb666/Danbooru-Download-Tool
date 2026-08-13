@@ -37,8 +37,8 @@ test('a real root can be indexed, listed, ranged and observed in history', async
   const rootResponse = await request.post('/api/library/roots', {
     data: {
       name: 'Real E2E media',
-      windows_path: process.platform === 'win32' ? mediaDir : null,
-      linux_path: process.platform === 'win32' ? null : mediaDir,
+      windows_path: process.env.REAL_E2E_BACKEND_PLATFORM === 'windows' ? mediaDir : null,
+      linux_path: process.env.REAL_E2E_BACKEND_PLATFORM === 'windows' ? null : mediaDir,
     },
   })
   expect(rootResponse.status()).toBe(201)

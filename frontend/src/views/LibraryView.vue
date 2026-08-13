@@ -1,36 +1,45 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { Bot, ChevronLeft, ChevronRight, Eye, FileImage, FolderPlus, Images, Play, RefreshCw, Search, Tags, Trash2, X } from '@lucide/vue'
-import { createTask, getLibrary, getLibraryItem, getMediaDirectories, getMediaRoots, libraryMediaUrl, type CreateTaskRequest, type LibraryPage, type LocalMedia, type MediaRoot } from '../api'
+import { createTask, getLibrary, getLibraryFacets, getLibraryItem, getMediaDirectories, getMediaRoots, libraryMediaUrl, type CreateTaskRequest, type LibraryFacets, type LibraryPage, type LocalMedia, type MediaRoot } from '../api'
 import { useConfigStore } from '../stores/config'
 import { useTasksStore } from '../stores/tasks'
 import { useToastStore } from '../stores/toast'
 import { requiresContentReveal } from '../utils/contentRating'
 import { scrollToPageTop } from '../utils/pageScroll'
+import { loadLibraryViewState, resolveLibraryViewState, saveLibraryViewState, type LibraryViewState } from '../utils/libraryViewState'
+import { formatPostCreatedAt, localDateEndEpochSeconds, localDateStartEpochSeconds } from '../utils/postDateRange'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
 const config = useConfigStore()
 const tasks = useTasksStore()
 const toast = useToastStore()
+const restoredView = resolveLibraryViewState(loadLibraryViewState(), route.query)
 const roots = ref<MediaRoot[]>([])
 const activeRootId = ref('')
 const folderDirectories = ref<string[]>([])
-const activeDirectory = ref('')
-const queryInput = ref('')
-const loadedQuery = ref('')
+const activeDirectory = ref(restoredView.state.directory)
+const queryInput = ref(restoredView.state.query)
+const loadedQuery = ref(restoredView.state.query)
 const page = ref<LibraryPage | null>(null)
-const currentPage = ref(1)
-const jumpPageInput = ref('1')
-const scoreRangeInput = ref('')
-const resolutionRangeInput = ref('')
+const facets = ref<LibraryFacets | null>(null)
+const cursor = ref(restoredView.state.cursor)
+const cursorBefore = ref(restoredView.state.before)
+const cursorDepth = ref(restoredView.state.cursorDepth)
+const scoreRangeInput = ref(restoredView.state.scoreRange)
+const resolutionRangeInput = ref(restoredView.state.resolutionRange)
+const postCreatedFromDate = ref(restoredView.state.postCreatedFromDate)
+const postCreatedToDate = ref(restoredView.state.postCreatedToDate)
 const loading = ref(false)
 const error = ref<string | null>(null)
 const detail = ref<LocalMedia | null>(null)
 const detailRevealed = ref(false)
 const detailPanel = ref<HTMLElement | null>(null)
 const indexing = ref(false)
+const reindexConfirmationOpen = ref(false)
 const selected = ref<Set<string>>(new Set())
 const selectedMedia = ref<Map<string, LocalMedia>>(new Map())
 const allMatchingSelected = ref(false)
@@ -40,6 +49,8 @@ const selectedScoreMin = ref<number | undefined>()
 const selectedScoreMax = ref<number | undefined>()
 const selectedResolutionMin = ref<number | undefined>()
 const selectedResolutionMax = ref<number | undefined>()
+const selectedPostCreatedFrom = ref<number | undefined>()
+const selectedPostCreatedTo = ref<number | undefined>()
 const excludedMediaIds = ref<Set<string>>(new Set())
 const revealedMedia = ref<Set<string>>(new Set())
 const fullSizePreviews = ref<Set<string>>(new Set())
@@ -51,11 +62,15 @@ let controller: AbortController | null = null
 let detailController: AbortController | null = null
 let detailOpener: HTMLElement | null = null
 let originalPreviewOpener: HTMLElement | null = null
+let savedBeforeRouteLeave = false
 
 const activeRoot = computed(() => roots.value.find((root) => root.id === activeRootId.value) ?? null)
-const totalPages = computed(() => page.value?.total_pages ?? 0)
-const scoreRanges = computed(() => page.value?.score_ranges ?? [])
-const resolutionRanges = computed(() => page.value?.resolution_ranges ?? [])
+const scoreRanges = computed(() => page.value?.score_ranges?.length
+  ? page.value.score_ranges
+  : (facets.value?.score_ranges ?? []))
+const resolutionRanges = computed(() => page.value?.resolution_ranges?.length
+  ? page.value.resolution_ranges
+  : (facets.value?.resolution_ranges ?? []))
 const selectedCount = computed(() => allMatchingSelected.value
   ? Math.max(0, allMatchingTotal.value - excludedMediaIds.value.size)
   : selected.value.size)
@@ -70,12 +85,17 @@ const detailObscured = computed(() => detail.value !== null
   && config.config.blur_sensitive_media
   && requiresContentReveal(detail.value.rating)
   && !detailRevealed.value)
+const postDateRangeInvalid = computed(() => {
+  const from = localDateStartEpochSeconds(postCreatedFromDate.value)
+  const to = localDateEndEpochSeconds(postCreatedToDate.value)
+  return from !== undefined && to !== undefined && from > to
+})
 
 async function loadRoots(): Promise<void> {
   roots.value = await getMediaRoots()
-  const requested = typeof route.query.root === 'string' ? route.query.root : ''
+  const requested = restoredView.state.rootId
   activeRootId.value = roots.value.some((root) => root.id === requested) ? requested : (roots.value[0]?.id ?? '')
-  activeDirectory.value = typeof route.query.directory === 'string' ? route.query.directory : ''
+  if (requested && activeRootId.value !== requested) activeDirectory.value = ''
   void loadDirectories()
 }
 
@@ -94,6 +114,8 @@ function isPlainRootBrowse(): boolean {
     && queryInput.value.trim() === ''
     && scoreRangeInput.value === ''
     && resolutionRangeInput.value === ''
+    && postCreatedFromDate.value === ''
+    && postCreatedToDate.value === ''
 }
 
 function enterFirstDirectoryIfEmptyRoot(): boolean {
@@ -117,6 +139,11 @@ async function loadPage(): Promise<void> {
     page.value = null
     return
   }
+  if (postDateRangeInvalid.value) {
+    error.value = null
+    page.value = null
+    return
+  }
   controller?.abort()
   const requestController = new AbortController()
   controller = requestController
@@ -126,24 +153,39 @@ async function loadPage(): Promise<void> {
     const query = queryInput.value.trim()
     const [scoreMin, scoreMax] = parseScoreRange(scoreRangeInput.value)
     const [resolutionMin, resolutionMax] = parseNumericRange(resolutionRangeInput.value)
-    const response = await getLibrary({
+    const postCreatedFrom = localDateStartEpochSeconds(postCreatedFromDate.value)
+    const postCreatedTo = localDateEndEpochSeconds(postCreatedToDate.value)
+    const parameters = {
       rootId: activeRootId.value,
       query,
-      page: currentPage.value,
+      ...(cursor.value ? { cursor: cursor.value, before: cursorBefore.value } : {}),
       ...(scoreMin === undefined ? {} : { scoreMin }),
       ...(scoreMax === undefined ? {} : { scoreMax }),
       ...(resolutionMin === undefined ? {} : { resolutionMin }),
       ...(resolutionMax === undefined ? {} : { resolutionMax }),
+      ...(postCreatedFrom === undefined ? {} : { postCreatedFrom }),
+      ...(postCreatedTo === undefined ? {} : { postCreatedTo }),
       directory: activeDirectory.value,
       limit: 60,
-    }, requestController.signal)
+    }
+    const response = await getLibrary(parameters, requestController.signal)
     if (controller === requestController) {
       page.value = response
       loadedQuery.value = query
-      if (Number.isInteger(response.page) && response.page > 0) {
-        currentPage.value = response.page
-        jumpPageInput.value = String(response.page)
-      }
+      void router.replace({
+        path: '/library',
+        query: {
+          root: activeRootId.value,
+          directory: activeDirectory.value,
+          ...(query ? { q: query } : {}),
+          ...(scoreRangeInput.value ? { score: scoreRangeInput.value } : {}),
+          ...(resolutionRangeInput.value ? { resolution: resolutionRangeInput.value } : {}),
+          ...(postCreatedFromDate.value ? { post_created_from: postCreatedFromDate.value } : {}),
+          ...(postCreatedToDate.value ? { post_created_to: postCreatedToDate.value } : {}),
+          ...(cursor.value ? { cursor: cursor.value, before: cursorBefore.value ? '1' : '0' } : {}),
+          ...(cursor.value && cursorDepth.value > 1 ? { cursor_depth: String(cursorDepth.value) } : {}),
+        },
+      })
       if (enterFirstDirectoryIfEmptyRoot()) return
     }
   } catch (reason: unknown) {
@@ -156,6 +198,29 @@ async function loadPage(): Promise<void> {
   }
 }
 
+async function loadFacets(): Promise<void> {
+  if (!activeRootId.value || postDateRangeInvalid.value) return
+  const [scoreMin, scoreMax] = parseScoreRange(scoreRangeInput.value)
+  const [resolutionMin, resolutionMax] = parseNumericRange(resolutionRangeInput.value)
+  const postCreatedFrom = localDateStartEpochSeconds(postCreatedFromDate.value)
+  const postCreatedTo = localDateEndEpochSeconds(postCreatedToDate.value)
+  try {
+    facets.value = await getLibraryFacets({
+      rootId: activeRootId.value,
+      query: queryInput.value.trim(),
+      ...(scoreMin === undefined ? {} : { scoreMin }),
+      ...(scoreMax === undefined ? {} : { scoreMax }),
+      ...(resolutionMin === undefined ? {} : { resolutionMin }),
+      ...(resolutionMax === undefined ? {} : { resolutionMax }),
+      ...(postCreatedFrom === undefined ? {} : { postCreatedFrom }),
+      ...(postCreatedTo === undefined ? {} : { postCreatedTo }),
+      directory: activeDirectory.value,
+    })
+  } catch {
+    facets.value = null
+  }
+}
+
 function selectRoot(id: string): void {
   activeRootId.value = id
   activeDirectory.value = ''
@@ -164,6 +229,7 @@ function selectRoot(id: string): void {
   void router.replace({ path: '/library', query: { root: id, directory: '' } })
   void loadDirectories()
   void loadPage()
+  void loadFacets()
 }
 
 function selectDirectory(): void {
@@ -174,6 +240,7 @@ function selectDirectory(): void {
     query: { root: activeRootId.value, directory: activeDirectory.value },
   })
   void loadPage()
+  void loadFacets()
 }
 
 function parseScoreRange(value: string): [number | undefined, number | undefined] {
@@ -181,7 +248,7 @@ function parseScoreRange(value: string): [number | undefined, number | undefined
 }
 
 function parseNumericRange(value: string): [number | undefined, number | undefined] {
-  const [minimum, maximum] = value.split(':').map(Number)
+  const [minimum, maximum] = (value ?? '').split(':').map(Number)
   if (!Number.isInteger(minimum) || !Number.isInteger(maximum) || minimum > maximum) {
     return [undefined, undefined]
   }
@@ -189,8 +256,9 @@ function parseNumericRange(value: string): [number | undefined, number | undefin
 }
 
 function resetToFirstPage(): void {
-  currentPage.value = 1
-  jumpPageInput.value = '1'
+  cursor.value = ''
+  cursorBefore.value = false
+  cursorDepth.value = 1
 }
 
 function clearSelection(): void {
@@ -203,6 +271,8 @@ function clearSelection(): void {
   selectedScoreMax.value = undefined
   selectedResolutionMin.value = undefined
   selectedResolutionMax.value = undefined
+  selectedPostCreatedFrom.value = undefined
+  selectedPostCreatedTo.value = undefined
   excludedMediaIds.value = new Set()
 }
 
@@ -247,6 +317,8 @@ function toggleAllMatching(): void {
   const [resolutionMin, resolutionMax] = parseNumericRange(resolutionRangeInput.value)
   selectedResolutionMin.value = resolutionMin
   selectedResolutionMax.value = resolutionMax
+  selectedPostCreatedFrom.value = localDateStartEpochSeconds(postCreatedFromDate.value)
+  selectedPostCreatedTo.value = localDateEndEpochSeconds(postCreatedToDate.value)
   selected.value = new Set()
   selectedMedia.value = new Map()
   excludedMediaIds.value = new Set()
@@ -287,10 +359,13 @@ async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' 
   const selection = allMatchingSelected.value
     ? {
         library_query: selectedQuery.value,
+        library_relative_directory: activeDirectory.value,
         ...(selectedScoreMin.value === undefined ? {} : { library_score_min: selectedScoreMin.value }),
         ...(selectedScoreMax.value === undefined ? {} : { library_score_max: selectedScoreMax.value }),
         ...(selectedResolutionMin.value === undefined ? {} : { library_resolution_min: selectedResolutionMin.value }),
         ...(selectedResolutionMax.value === undefined ? {} : { library_resolution_max: selectedResolutionMax.value }),
+        ...(selectedPostCreatedFrom.value === undefined ? {} : { library_post_created_from: selectedPostCreatedFrom.value }),
+        ...(selectedPostCreatedTo.value === undefined ? {} : { library_post_created_to: selectedPostCreatedTo.value }),
         excluded_media_ids: Array.from(excludedMediaIds.value).sort((left, right) => left.localeCompare(right)),
       }
     : { media_ids: mediaIds }
@@ -309,8 +384,7 @@ async function createBatchTask(type: 'resize' | 'heic_convert' | 'tag_pipeline' 
       delete_selected: '删除任务已加入队列',
     }[type]
     if (type === 'delete_selected') {
-      toast.success(successMessage, '请在任务页确认后，所选媒体及同名标签文件会移入隔离区，可在隔离区恢复。')
-      void router.push('/tasks')
+      toast.success(successMessage, '请通过任务概览审阅确认；确认后媒体及同名标签文件会移入隔离区，可在隔离区恢复。')
     } else {
       toast.success(successMessage)
     }
@@ -325,34 +399,36 @@ function search(): void {
   clearSelection()
   resetToFirstPage()
   void loadPage()
+  void loadFacets()
 }
 
 function applyFilters(): void {
+  if (postDateRangeInvalid.value) {
+    toast.warning('发布时间范围无效', '起始日期不能晚于结束日期。')
+    return
+  }
   clearSelection()
   resetToFirstPage()
   void loadPage()
+  void loadFacets()
 }
 
-function goToPage(value: number): void {
-  if (!totalPages.value || !Number.isFinite(value)) return
-  currentPage.value = Math.min(totalPages.value, Math.max(1, Math.trunc(value)))
-  jumpPageInput.value = String(currentPage.value)
+function nextPage(): void {
+  if (!page.value?.next_cursor) return
+  cursor.value = page.value.next_cursor
+  cursorBefore.value = false
+  cursorDepth.value += 1
   scrollToPageTop()
   void loadPage()
 }
 
-function nextPage(): void {
-  if (currentPage.value >= totalPages.value) return
-  goToPage(currentPage.value + 1)
-}
-
 function previousPage(): void {
-  if (currentPage.value <= 1) return
-  goToPage(currentPage.value - 1)
-}
-
-function jumpToPage(): void {
-  goToPage(Number(jumpPageInput.value))
+  if (!page.value?.previous_cursor) return
+  cursor.value = page.value.previous_cursor
+  cursorBefore.value = true
+  cursorDepth.value = Math.max(1, cursorDepth.value - 1)
+  scrollToPageTop()
+  void loadPage()
 }
 
 async function refreshLibrary(): Promise<void> {
@@ -362,9 +438,23 @@ async function refreshLibrary(): Promise<void> {
     await createTask({ type: 'index_library', root_id: activeRootId.value })
     await tasks.loadSnapshot()
     toast.success('图库刷新已加入队列', '会读取文件夹内容以同步新增图片，不会移动或删除现有媒体。')
-    void router.push('/tasks')
   } catch (reason: unknown) {
     toast.error('无法刷新图库', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    indexing.value = false
+  }
+}
+
+async function rebuildLibrary(): Promise<void> {
+  if (!activeRootId.value) return
+  reindexConfirmationOpen.value = false
+  indexing.value = true
+  try {
+    await createTask({ type: 'reindex_library', root_id: activeRootId.value })
+    await tasks.loadSnapshot()
+    toast.success('图库重建已加入维护队列', '元数据数据库会先备份；原媒体不会移动或删除。')
+  } catch (reason: unknown) {
+    toast.error('无法创建图库重建任务', reason instanceof Error ? reason.message : '未知错误')
   } finally {
     indexing.value = false
   }
@@ -495,17 +585,80 @@ watch(activeRootId, () => {
   clearSelection()
 })
 
+function restoreSavedSelection(): void {
+  if (!restoredView.restoreSelection) return
+  const state = restoredView.state
+  selected.value = new Set(state.selectedIds)
+  selectedMedia.value = new Map(state.selectedMedia
+    .filter((media) => state.selectedIds.includes(media.id))
+    .map((media) => [media.id, media as unknown as LocalMedia]))
+  allMatchingSelected.value = state.allMatchingSelected
+  allMatchingTotal.value = state.allMatchingTotal
+  selectedQuery.value = state.selectedQuery
+  selectedScoreMin.value = state.selectedScoreMin
+  selectedScoreMax.value = state.selectedScoreMax
+  selectedResolutionMin.value = state.selectedResolutionMin
+  selectedResolutionMax.value = state.selectedResolutionMax
+  selectedPostCreatedFrom.value = state.selectedPostCreatedFrom
+  selectedPostCreatedTo.value = state.selectedPostCreatedTo
+  excludedMediaIds.value = new Set(state.excludedMediaIds)
+}
+
+function currentViewState(): LibraryViewState {
+  return {
+    version: 1,
+    rootId: activeRootId.value,
+    directory: activeDirectory.value,
+    query: loadedQuery.value,
+    scoreRange: scoreRangeInput.value,
+    resolutionRange: resolutionRangeInput.value,
+    postCreatedFromDate: postCreatedFromDate.value,
+    postCreatedToDate: postCreatedToDate.value,
+    cursor: cursor.value,
+    before: cursorBefore.value,
+    cursorDepth: cursorDepth.value,
+    scrollY: Math.max(0, window.scrollY),
+    selectedIds: Array.from(selected.value),
+    selectedMedia: Array.from(selectedMedia.value.values()),
+    allMatchingSelected: allMatchingSelected.value,
+    allMatchingTotal: allMatchingTotal.value,
+    selectedQuery: selectedQuery.value,
+    selectedScoreMin: selectedScoreMin.value,
+    selectedScoreMax: selectedScoreMax.value,
+    selectedResolutionMin: selectedResolutionMin.value,
+    selectedResolutionMax: selectedResolutionMax.value,
+    selectedPostCreatedFrom: selectedPostCreatedFrom.value,
+    selectedPostCreatedTo: selectedPostCreatedTo.value,
+    excludedMediaIds: Array.from(excludedMediaIds.value),
+  }
+}
+
+function persistViewState(): void {
+  saveLibraryViewState(currentViewState())
+}
+
+onBeforeRouteLeave(() => {
+  persistViewState()
+  savedBeforeRouteLeave = true
+})
+
 onMounted(async () => {
-  queryInput.value = typeof route.query.q === 'string' ? route.query.q : ''
   try {
     await loadRoots()
     await loadPage()
+    await loadFacets()
+    restoreSavedSelection()
+    if (restoredView.restoreScroll && restoredView.state.scrollY > 0) {
+      await nextTick()
+      window.scrollTo({ top: restoredView.state.scrollY, behavior: 'auto' })
+    }
   } catch (reason: unknown) {
     error.value = reason instanceof Error ? reason.message : '无法读取媒体库'
   }
 })
 
 onBeforeUnmount(() => {
+  if (!savedBeforeRouteLeave) persistViewState()
   controller?.abort()
   detailController?.abort()
 })
@@ -523,6 +676,7 @@ onBeforeUnmount(() => {
         <button v-if="activeRoot" type="button" class="button" :disabled="indexing" @click="refreshLibrary">
           <RefreshCw :size="16" /> {{ indexing ? '正在创建' : '刷新图库' }}
         </button>
+        <button v-if="activeRoot" type="button" class="button" :disabled="indexing" @click="reindexConfirmationOpen = true">重建索引</button>
         <RouterLink to="/settings" class="button"><FolderPlus :size="16" /> 管理根目录</RouterLink>
       </span>
     </header>
@@ -549,7 +703,7 @@ onBeforeUnmount(() => {
         <button type="submit" class="button button-primary search-submit"><Search :size="15" /> 搜索</button>
       </form>
 
-      <div class="inline" style="margin-top: 12px; flex-wrap: wrap; gap: 12px" aria-label="图库筛选">
+      <div class="library-filter-grid" aria-label="图库筛选">
         <label class="inline" for="library-directory">
           <span class="field-help">文件夹</span>
           <select id="library-directory" v-model="activeDirectory" class="input" aria-label="图库文件夹" @change="selectDirectory">
@@ -575,6 +729,31 @@ onBeforeUnmount(() => {
             </option>
           </select>
         </label>
+        <label class="inline" for="library-post-created-from">
+          <span class="field-help">帖子发布日期起</span>
+          <input
+            id="library-post-created-from"
+            v-model="postCreatedFromDate"
+            class="input"
+            type="date"
+            aria-label="帖子发布日期起"
+            :max="postCreatedToDate || undefined"
+            @input="applyFilters"
+          >
+        </label>
+        <label class="inline" for="library-post-created-to">
+          <span class="field-help">帖子发布日期止</span>
+          <input
+            id="library-post-created-to"
+            v-model="postCreatedToDate"
+            class="input"
+            type="date"
+            aria-label="帖子发布日期止"
+            :min="postCreatedFromDate || undefined"
+            @input="applyFilters"
+          >
+        </label>
+        <span v-if="postDateRangeInvalid" class="field-error" role="alert">起始日期不能晚于结束日期</span>
       </div>
 
       <div class="result-summary">
@@ -613,30 +792,19 @@ onBeforeUnmount(() => {
           <button v-if="isObscured(media)" type="button" class="reveal-button" :aria-label="`显示 ${media.filename}`" @click="revealMedia(media.id)">
             <Eye :size="16" /> 显示内容
           </button>
-          <footer><span>{{ media.filename }}</span><span>{{ formatBytes(media.size_bytes) }}</span></footer>
+          <footer class="library-card-footer">
+            <span>{{ media.filename }}</span>
+            <span>{{ formatBytes(media.size_bytes) }}</span>
+            <time v-if="media.post_created_at" :datetime="media.post_created_at">帖子发布于 {{ formatPostCreatedAt(media.post_created_at) }}</time>
+          </footer>
         </article>
       </div>
       <div v-else class="empty-state"><div><Images :size="30" /><strong>没有匹配的媒体</strong><p>尝试减少标签或清空查询。</p></div></div>
 
       <nav v-if="page?.items.length" class="pagination" :class="{ 'pagination-below-selection': selectedCount }" aria-label="图库分页">
-        <button type="button" class="button button-small" :disabled="currentPage <= 1" @click="previousPage"><ChevronLeft :size="15" /> 上一页</button>
-        <span class="pagination-info">第 {{ currentPage }} / {{ totalPages }} 页 · 共 {{ totalPages }} 页</span>
-        <label class="inline" for="library-page-jump">
-          <span class="sr-only">跳转至页码</span>
-          <input
-            id="library-page-jump"
-            v-model="jumpPageInput"
-            class="input"
-            style="width: 76px"
-            type="number"
-            min="1"
-            :max="totalPages || 1"
-            aria-label="跳转至页码"
-            @keyup.enter="jumpToPage"
-          >
-          <button type="button" class="button button-small" :disabled="!totalPages" @click="jumpToPage">跳转</button>
-        </label>
-        <button type="button" class="button button-small" :disabled="currentPage >= totalPages" @click="nextPage">下一页 <ChevronRight :size="15" /></button>
+        <button type="button" class="button button-small" :disabled="!page.previous_cursor" @click="previousPage"><ChevronLeft :size="15" /> 上一批</button>
+        <span class="pagination-info">第 {{ cursorDepth }} 批 · 共 {{ page.total.toLocaleString() }} 项</span>
+        <button type="button" class="button button-small" :disabled="!page.next_cursor" @click="nextPage">下一批 <ChevronRight :size="15" /></button>
       </nav>
 
       <Transition name="toast">
@@ -711,6 +879,7 @@ onBeforeUnmount(() => {
             <div class="detail-stat"><small>文件大小</small><strong>{{ formatBytes(detail.size_bytes) }}</strong></div>
             <div class="detail-stat"><small>尺寸</small><strong>{{ detail.width && detail.height ? `${detail.width} × ${detail.height}` : '未知' }}</strong></div>
             <div class="detail-stat"><small>帖子</small><strong>{{ detail.post_id ? `#${detail.post_id}` : '本地文件' }}</strong></div>
+            <div class="detail-stat"><small>帖子发布时间</small><strong>{{ formatPostCreatedAt(detail.post_created_at) }}</strong></div>
           </div>
           <div class="tag-section"><h3>精确标签</h3><div class="tag-list"><button v-for="tag in detail.tags" :key="tag" type="button" class="tag" @click="appendTagToSearch(tag)">{{ tag }}</button></div></div>
           <div class="tag-section"><h3>相对路径</h3><code style="font-size: 11px; color: var(--text-secondary); word-break: break-all">{{ detail.relative_path }}</code></div>
@@ -731,5 +900,15 @@ onBeforeUnmount(() => {
         <img :src="libraryMediaUrl(detail.id)" :alt="`${detail.filename} 原图`">
       </div>
     </template>
+    <ConfirmDialog
+      :open="reindexConfirmationOpen"
+      title="后台重建图库索引"
+      confirm-label="备份并开始重建"
+      :busy="indexing"
+      @cancel="reindexConfirmationOpen = false"
+      @confirm="rebuildLibrary"
+    >
+      <p>系统会先创建 SQLite 一致性备份，再分批扫描并更新索引。原媒体文件不会移动或删除；任务可在任务中心暂停、恢复或取消。</p>
+    </ConfirmDialog>
   </div>
 </template>

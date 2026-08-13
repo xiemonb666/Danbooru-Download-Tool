@@ -223,13 +223,16 @@ pub struct LocalMedia {
     pub size_bytes: u64,
     pub rating: Option<ContentRating>,
     pub tags: Vec<String>,
+    pub post_created_at: Option<String>,
     pub created_at: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LibraryPage {
     pub items: Vec<LocalMedia>,
+    pub previous_cursor: Option<String>,
     pub next_cursor: Option<String>,
+    pub catalog_revision: u64,
     pub total: u64,
     pub page: u64,
     pub total_pages: u64,
@@ -272,6 +275,7 @@ pub struct PurgeResponse {
 pub enum TaskKind {
     Download,
     IndexLibrary,
+    ReindexLibrary,
     IntegrityScan,
     ExactDedup,
     NearDedup,
@@ -319,6 +323,62 @@ pub struct TaskProgress {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct LibraryFacets {
+    pub catalog_revision: u64,
+    pub total: u64,
+    pub score_ranges: Vec<LibraryScoreRange>,
+    pub resolution_ranges: Vec<LibraryResolutionRange>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DatabasePoolDiagnostics {
+    pub total: usize,
+    pub in_use: usize,
+    pub idle: usize,
+    pub capacity: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SchedulerResourceDiagnostics {
+    pub capacity: usize,
+    pub available: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ThumbnailCacheDiagnostics {
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SystemDiagnostics {
+    pub database_pool: DatabasePoolDiagnostics,
+    pub scheduler: BTreeMap<String, SchedulerResourceDiagnostics>,
+    pub thumbnail_cache: ThumbnailCacheDiagnostics,
+    pub active_workers: usize,
+    pub queued_tasks: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResourceClass {
+    Network,
+    Io,
+    Cpu,
+    Gpu,
+    Maintenance,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TaskScheduling {
+    pub resource_class: TaskResourceClass,
+    pub queue_position: Option<u64>,
+    pub wait_reason: Option<String>,
+    pub blocking_task_ids: Vec<String>,
+    pub estimated_wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TaskPreviewCandidate {
     pub relative_path: String,
     pub companion_paths: Option<Vec<String>>,
@@ -348,6 +408,7 @@ pub struct TaskSummary {
     pub revision: u64,
     pub title: String,
     pub progress: TaskProgress,
+    pub scheduling: TaskScheduling,
     pub failures: Vec<TaskFailure>,
     pub preview: Option<TaskPreview>,
     pub training: Option<TrainingTaskSummary>,
@@ -475,6 +536,7 @@ macro_rules! literal_task_type {
 }
 
 literal_task_type!(IndexLibraryTaskType, IndexLibrary);
+literal_task_type!(ReindexLibraryTaskType, ReindexLibrary);
 literal_task_type!(IntegrityScanTaskType, IntegrityScan);
 literal_task_type!(ExactDedupTaskType, ExactDedup);
 literal_task_type!(NearDedupTaskType, NearDedup);
@@ -492,7 +554,10 @@ pub struct MediaIdsTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
     pub library_query: Option<String>,
+    pub library_relative_directory: Option<String>,
     pub excluded_media_ids: Option<Vec<String>>,
+    pub library_post_created_from: Option<i64>,
+    pub library_post_created_to: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -506,7 +571,10 @@ pub struct ResizeTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
     pub library_query: Option<String>,
+    pub library_relative_directory: Option<String>,
     pub excluded_media_ids: Option<Vec<String>>,
+    pub library_post_created_from: Option<i64>,
+    pub library_post_created_to: Option<i64>,
     pub max_size: Option<u32>,
     pub quality: Option<u8>,
 }
@@ -537,7 +605,10 @@ pub struct TagPipelineTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
     pub library_query: Option<String>,
+    pub library_relative_directory: Option<String>,
     pub excluded_media_ids: Option<Vec<String>>,
+    pub library_post_created_from: Option<i64>,
+    pub library_post_created_to: Option<i64>,
     pub artist_prefix: Option<ArtistPrefix>,
 }
 
@@ -546,7 +617,10 @@ pub struct DatasetAugmentationTaskOptions {
     pub media_ids: Option<Vec<String>>,
     pub relative_directory: Option<String>,
     pub library_query: Option<String>,
+    pub library_relative_directory: Option<String>,
     pub excluded_media_ids: Option<Vec<String>>,
+    pub library_post_created_from: Option<i64>,
+    pub library_post_created_to: Option<i64>,
     pub output_directory: Option<String>,
     pub min_megapixels: Option<f64>,
     pub min_long_side: Option<u32>,
@@ -568,7 +642,11 @@ pub struct SmartCropTaskOptions {
     pub quality_profile: Option<String>,
     pub portrait: Option<bool>,
     pub upper_body: Option<bool>,
+    pub cowboy_shot: Option<bool>,
     pub full_body_tight: Option<bool>,
+    pub lower_body: Option<bool>,
+    pub feet: Option<bool>,
+    pub require_both_feet: Option<bool>,
     pub max_derived_per_family: Option<u8>,
 }
 
@@ -582,6 +660,13 @@ pub struct DerivedRetaggingTaskOptions {
 pub struct IndexLibraryTaskRequest {
     #[serde(rename = "type")]
     pub task_type: IndexLibraryTaskType,
+    pub root_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReindexLibraryTaskRequest {
+    #[serde(rename = "type")]
+    pub task_type: ReindexLibraryTaskType,
     pub root_id: String,
 }
 
@@ -875,6 +960,8 @@ pub struct TrainingCleanupResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrainingLogsResponse {
     pub text: String,
+    pub cursor: u64,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1133,6 +1220,7 @@ pub struct LoraSvdAnalysisResult {
     mapping(
         ("download" = "#/components/schemas/DownloadTaskRequest"),
         ("index_library" = "#/components/schemas/IndexLibraryTaskRequest"),
+        ("reindex_library" = "#/components/schemas/ReindexLibraryTaskRequest"),
         ("integrity_scan" = "#/components/schemas/IntegrityScanTaskRequest"),
         ("exact_dedup" = "#/components/schemas/ExactDedupTaskRequest"),
         ("near_dedup" = "#/components/schemas/NearDedupTaskRequest"),
@@ -1149,6 +1237,7 @@ pub struct LoraSvdAnalysisResult {
 pub enum CreateTaskRequest {
     Download(DownloadTaskRequest),
     IndexLibrary(IndexLibraryTaskRequest),
+    ReindexLibrary(ReindexLibraryTaskRequest),
     IntegrityScan(IntegrityScanTaskRequest),
     ExactDedup(ExactDedupTaskRequest),
     NearDedup(NearDedupTaskRequest),
@@ -1255,6 +1344,9 @@ mod paths {
     #[utoipa::path(get, path = "/api/health", responses((status = 200, body = ApiSuccess<HealthStatus>), (status = 503, body = ApiFailure)))]
     pub async fn health() {}
 
+    #[utoipa::path(get, path = "/api/diagnostics", responses((status = 200, body = ApiSuccess<SystemDiagnostics>)))]
+    pub async fn diagnostics() {}
+
     #[utoipa::path(get, path = "/api/vllm/health", responses((status = 200, body = ApiSuccess<VllmHealthStatus>), (status = 400, body = ApiFailure)))]
     pub async fn vllm_health() {}
 
@@ -1294,8 +1386,11 @@ mod paths {
     #[utoipa::path(post, path = "/api/library/roots/{id}/directories", request_body = CreateMediaDirectoryRequest, params(("id" = String, Path)), responses((status = 201, body = ApiSuccess<MediaDirectory>), (status = 400, body = ApiFailure), (status = 404, body = ApiFailure)))]
     pub async fn create_root_directory() {}
 
-    #[utoipa::path(get, path = "/api/library/items", params(("root_id" = String, Query), ("q" = Option<String>, Query), ("cursor" = Option<String>, Query), ("page" = Option<usize>, Query), ("score_min" = Option<i64>, Query), ("score_max" = Option<i64>, Query), ("min_resolution" = Option<i64>, Query), ("resolution_min" = Option<i64>, Query), ("resolution_max" = Option<i64>, Query), ("directory" = Option<String>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<LibraryPage>), (status = 400, body = ApiFailure)))]
+    #[utoipa::path(get, path = "/api/library/items", params(("root_id" = String, Query), ("q" = Option<String>, Query), ("cursor" = Option<String>, Query), ("page" = Option<usize>, Query), ("score_min" = Option<i64>, Query), ("score_max" = Option<i64>, Query), ("min_resolution" = Option<i64>, Query), ("resolution_min" = Option<i64>, Query), ("resolution_max" = Option<i64>, Query), ("post_created_from" = Option<i64>, Query), ("post_created_to" = Option<i64>, Query), ("directory" = Option<String>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<LibraryPage>), (status = 400, body = ApiFailure)))]
     pub async fn list_library_items() {}
+
+    #[utoipa::path(get, path = "/api/library/facets", params(("root_id" = String, Query), ("q" = Option<String>, Query), ("score_min" = Option<i64>, Query), ("score_max" = Option<i64>, Query), ("resolution_min" = Option<i64>, Query), ("resolution_max" = Option<i64>, Query), ("post_created_from" = Option<i64>, Query), ("post_created_to" = Option<i64>, Query), ("directory" = Option<String>, Query)), responses((status = 200, body = ApiSuccess<LibraryFacets>), (status = 400, body = ApiFailure), (status = 404, body = ApiFailure)))]
+    pub async fn library_facets() {}
 
     #[utoipa::path(get, path = "/api/library/items/{id}", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<LocalMedia>), (status = 404, body = ApiFailure)))]
     pub async fn library_item() {}
@@ -1381,6 +1476,9 @@ mod paths {
     #[utoipa::path(post, path = "/api/training/preview", request_body = TrainingPreviewRequest, responses((status = 200, body = ApiSuccess<TrainingPreviewResponse>), (status = 400, body = ApiFailure)))]
     pub async fn training_preview() {}
 
+    #[utoipa::path(post, path = "/api/training/preflight", request_body = TrainingRunRequest, responses((status = 200, body = ApiSuccess<TrainingPreflightResponse>), (status = 400, body = ApiFailure)))]
+    pub async fn training_preflight() {}
+
     #[utoipa::path(post, path = "/api/training/lora-svd/analyses", request_body = LoraSvdAnalysisRequest, responses((status = 200, body = ApiSuccess<LoraSvdAnalysisResult>), (status = 400, body = ApiFailure)))]
     pub async fn create_lora_svd_analysis() {}
 
@@ -1390,7 +1488,7 @@ mod paths {
     #[utoipa::path(get, path = "/api/training/lora-svd/analyses/{id}/export", params(("id" = String, Path)), responses((status = 200, body = ApiSuccess<LoraSvdAnalysisResult>), (status = 404, body = ApiFailure)))]
     pub async fn export_lora_svd_analysis() {}
 
-    #[utoipa::path(get, path = "/api/training/tasks/{id}/logs", params(("id" = String, Path), ("tail" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<TrainingLogsResponse>), (status = 400, body = ApiFailure)))]
+    #[utoipa::path(get, path = "/api/training/tasks/{id}/logs", params(("id" = String, Path), ("tail" = Option<usize>, Query), ("after" = Option<u64>, Query), ("limit" = Option<usize>, Query)), responses((status = 200, body = ApiSuccess<TrainingLogsResponse>), (status = 400, body = ApiFailure)))]
     pub async fn training_logs() {}
 
     #[utoipa::path(get, path = "/api/training/tasks/{id}/metrics", params(("id" = String, Path), ("series" = Vec<String>, Query), ("max_points" = Option<usize>, Query), ("from_step" = Option<u64>, Query), ("to_step" = Option<u64>, Query), ("from_timestamp" = Option<u64>, Query), ("to_timestamp" = Option<u64>, Query)), responses((status = 200, body = ApiSuccess<TrainingMetricsResponse>)))]
@@ -1438,6 +1536,7 @@ mod paths {
     info(title = "DanbooruDownload Tool Pro API", version = "2.0.0"),
     paths(
         paths::health,
+        paths::diagnostics,
         paths::vllm_health,
         paths::vllm_load,
         paths::vllm_unload,
@@ -1452,6 +1551,7 @@ mod paths {
         paths::list_root_directories,
         paths::create_root_directory,
         paths::list_library_items,
+        paths::library_facets,
         paths::library_item,
         paths::library_media,
         paths::list_quarantine,
@@ -1480,6 +1580,7 @@ mod paths {
         paths::update_training_preset_from_toml,
         paths::export_training_preset,
         paths::training_preview,
+        paths::training_preflight,
         paths::create_lora_svd_analysis,
         paths::lora_svd_module,
         paths::export_lora_svd_analysis,
@@ -1510,16 +1611,20 @@ mod paths {
         MediaDirectory,
         LocalMedia,
         LibraryPage,
+        LibraryFacets,
         LibraryScoreRange,
         LibraryResolutionRange,
         QuarantineEntry,
         TaskSummary,
+        TaskScheduling,
+        TaskResourceClass,
         TaskSnapshot,
         TaskEvent,
         TaskItem,
         TaskItemCounts,
         TaskDetails,
         CreateTaskRequest,
+        ReindexLibraryTaskRequest,
         DatasetAugmentationTaskRequest,
         DatasetAugmentationTaskOptions,
         SmartCropTaskOptions,
@@ -1528,6 +1633,9 @@ mod paths {
         TrainingSamplePromptSource,
         TrainingSampleSettings,
         TrainingRunRequest,
+        TrainingPreflightCheck,
+        TrainingParameterSuggestion,
+        TrainingPreflightResponse,
         TrainingTaskRequest,
         TrainingTaskSummary,
         TrainingAdapterField,
@@ -1581,6 +1689,10 @@ mod paths {
         DanbooruCount,
         TagSuggestion,
         HealthStatus,
+        DatabasePoolDiagnostics,
+        SchedulerResourceDiagnostics,
+        ThumbnailCacheDiagnostics,
+        SystemDiagnostics,
         VllmHealthStatus,
         VllmLoadStatus,
         VllmUnloadStatus,
@@ -1614,7 +1726,7 @@ mod tests {
         let document = document();
         // Training runtime discovery, diagnostics, installation and live logs
         // are public API operations and must stay represented in the contract.
-        assert_eq!(document.paths.paths.len(), 52);
+        assert_eq!(document.paths.paths.len(), 55);
         let operation_count = document
             .paths
             .paths
@@ -1635,7 +1747,7 @@ mod tests {
                 .count()
             })
             .sum::<usize>();
-        assert_eq!(operation_count, 60);
+        assert_eq!(operation_count, 63);
         for path in [
             "/api/training/runtime-profiles",
             "/api/training/runtime-profiles/{id}/diagnostics",
@@ -1728,6 +1840,39 @@ mod tests {
     }
 
     #[test]
+    fn library_contract_exposes_post_created_time_and_filters() {
+        let json = serde_json::to_value(document()).unwrap();
+        let schemas = &json["components"]["schemas"];
+        assert_eq!(
+            schemas["LocalMedia"]["properties"]["post_created_at"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        for path in ["/api/library/items", "/api/library/facets"] {
+            let parameter_names = json["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|parameter| parameter["name"].as_str())
+                .collect::<Vec<_>>();
+            assert!(parameter_names.contains(&"post_created_from"));
+            assert!(parameter_names.contains(&"post_created_to"));
+        }
+        for schema in [
+            "MediaIdsTaskOptions",
+            "ResizeTaskOptions",
+            "TagPipelineTaskOptions",
+            "DatasetAugmentationTaskOptions",
+        ] {
+            assert!(schemas[schema]["properties"]
+                .get("library_post_created_from")
+                .is_some());
+            assert!(schemas[schema]["properties"]
+                .get("library_post_created_to")
+                .is_some());
+        }
+    }
+
+    #[test]
     fn health_contract_uses_literal_ok_states() {
         let json = serde_json::to_value(document()).unwrap();
         let schemas = &json["components"]["schemas"];
@@ -1737,4 +1882,44 @@ mod tests {
             serde_json::json!(["ok"])
         );
     }
+
+    #[test]
+    fn task_summary_exposes_server_owned_scheduling_metadata() {
+        let json = serde_json::to_value(document()).unwrap();
+        let schemas = &json["components"]["schemas"];
+
+        assert_eq!(
+            schemas["TaskSummary"]["properties"]["scheduling"]["$ref"],
+            "#/components/schemas/TaskScheduling"
+        );
+        assert_eq!(
+            schemas["TaskResourceClass"]["enum"],
+            serde_json::json!(["network", "io", "cpu", "gpu", "maintenance"])
+        );
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPreflightCheck {
+    pub id: String,
+    pub ok: bool,
+    pub severity: String,
+    pub message: String,
+    pub recovery: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingParameterSuggestion {
+    pub field: String,
+    pub value: Value,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrainingPreflightResponse {
+    pub ready: bool,
+    pub checks: Vec<TrainingPreflightCheck>,
+    pub suggestions: Vec<TrainingParameterSuggestion>,
+    pub effective_steps: u64,
+    pub estimated_vram_mib: u64,
 }

@@ -21,6 +21,26 @@ let runRoot
 let backendOutput = ''
 let cleaning = false
 
+function isWindowsExecutable(command) {
+  return process.platform !== 'win32' && /\.exe$/i.test(command)
+}
+
+function convertWslPath(pathname, flag) {
+  const converted = spawnSync('wslpath', [flag, pathname], { encoding: 'utf8' })
+  if (converted.status !== 0 || !converted.stdout.trim()) {
+    throw new Error(`无法转换 WSL/Windows 路径: ${pathname}`)
+  }
+  return converted.stdout.trim()
+}
+
+function pathForWindowsProcess(pathname, command) {
+  return isWindowsExecutable(command) ? convertWslPath(pathname, '-w') : pathname
+}
+
+function executableForNode(pathname, command) {
+  return isWindowsExecutable(command) ? convertWslPath(pathname, '-u') : pathname
+}
+
 function findCargo() {
   const candidates = process.env.CARGO
     ? [process.env.CARGO]
@@ -39,9 +59,10 @@ function findCargo() {
 }
 
 function buildBackend(cargo) {
+  const manifestPath = pathForWindowsProcess(backendManifest, cargo)
   const result = spawnSync(
     cargo,
-    ['build', '--manifest-path', backendManifest, '--locked', '--message-format=json-render-diagnostics'],
+    ['build', '--manifest-path', manifestPath, '--locked', '--message-format=json-render-diagnostics'],
     { cwd: projectDir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true },
   )
   if (result.stderr) process.stderr.write(result.stderr)
@@ -66,7 +87,7 @@ function buildBackend(cargo) {
     )?.executable
 
   if (!executable) throw new Error('Cargo 未返回后端二进制路径。')
-  return executable
+  return executableForNode(executable, cargo)
 }
 
 async function reserveLoopbackPort() {
@@ -89,15 +110,23 @@ function captureBackendOutput(stream) {
   })
 }
 
-async function waitForHealth(baseUrl) {
+async function waitForHealth(baseUrl, windowsBackend = false) {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     if (backendProcess.exitCode !== null) {
       throw new Error(`Rust 后端提前退出（${backendProcess.exitCode}）。\n${backendOutput}`)
     }
     try {
-      const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1_000) })
-      if (response.ok) return
+      if (windowsBackend) {
+        const result = spawnSync('node.exe', ['-e', `fetch(${JSON.stringify(`${baseUrl}/api/health`)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))`], {
+          timeout: 1_500,
+          windowsHide: true,
+        })
+        if (result.status === 0) return
+      } else {
+        const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1_000) })
+        if (response.ok) return
+      }
     } catch {
       // The listener may not be ready yet.
     }
@@ -106,21 +135,91 @@ async function waitForHealth(baseUrl) {
   throw new Error(`等待 Rust 后端启动超时。\n${backendOutput}`)
 }
 
+async function startBackend(executable, cargo, dataDir) {
+  const windowsBackend = isWindowsExecutable(cargo)
+  const windowsPortStart = 20_000 + Math.floor(Math.random() * 30_000)
+  const crossProcessVariables = ['APP_ISOLATED_MODE', 'HOST', 'PORT', 'DATA_DIR', 'STATIC_DIR', 'DEV_CORS', 'RUST_LOG']
+  const inheritedWslEnv = (process.env.WSLENV ?? '').split(':').filter(Boolean)
+  const wslEnv = [...new Set([...inheritedWslEnv, ...crossProcessVariables])].join(':')
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const port = windowsBackend ? windowsPortStart + attempt : await reserveLoopbackPort()
+    const baseUrl = `http://127.0.0.1:${port}`
+    backendOutput = ''
+    backendProcess = spawn(executable, [], {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        APP_ISOLATED_MODE: '1',
+        HOST: '127.0.0.1',
+        PORT: String(port),
+        DATA_DIR: pathForWindowsProcess(dataDir, cargo),
+        STATIC_DIR: pathForWindowsProcess(staticDir, cargo),
+        DEV_CORS: '0',
+        RUST_LOG: process.env.RUST_LOG ?? 'danbooru_download_tool_pro=warn',
+        ...(windowsBackend ? { WSLENV: wslEnv } : {}),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    captureBackendOutput(backendProcess.stdout)
+    captureBackendOutput(backendProcess.stderr)
+    try {
+      await waitForHealth(baseUrl, windowsBackend)
+      return baseUrl
+    } catch (error) {
+      const addressInUse = /10048|AddrInUse|address.*in use/i.test(backendOutput)
+      await stopBackend()
+      if (!addressInUse || attempt === 7) throw error
+    }
+  }
+  throw new Error('无法为真实后端测试分配空闲端口。')
+}
+
+function findWindowsNode() {
+  for (const command of ['node.exe']) {
+    const result = spawnSync(command, ['--version'], { encoding: 'utf8', windowsHide: true })
+    if (!result.error && result.status === 0) return command
+  }
+  throw new Error('Windows 后端需要 Windows Node.js 执行真实 E2E 请求。')
+}
+
 async function stopBackend() {
   if (!backendProcess || backendProcess.exitCode !== null) return
   backendProcess.kill()
-  await Promise.race([
+  const exited = await Promise.race([
     once(backendProcess, 'exit'),
-    new Promise((resolve) => setTimeout(resolve, 3_000)),
+    new Promise((resolve) => setTimeout(() => resolve(null), 3_000)),
   ])
-  if (backendProcess.exitCode === null) backendProcess.kill('SIGKILL')
+  if (exited === null && backendProcess.exitCode === null) {
+    backendProcess.kill('SIGKILL')
+    await Promise.race([
+      once(backendProcess, 'exit'),
+      new Promise((resolve) => setTimeout(resolve, 3_000)),
+    ])
+  }
+}
+
+async function removeRunRoot() {
+  if (!runRoot) return
+  let lastError
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await rm(runRoot, { recursive: true, force: true })
+      return
+    } catch (error) {
+      lastError = error
+      if (!['EACCES', 'EPERM', 'EBUSY', 'ENOTEMPTY'].includes(error?.code)) throw error
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt))
+    }
+  }
+  throw lastError
 }
 
 async function cleanup() {
   if (cleaning) return
   cleaning = true
   await stopBackend()
-  if (runRoot) await rm(runRoot, { recursive: true, force: true })
+  await removeRunRoot()
   try {
     await rmdir(temporaryBase)
   } catch (error) {
@@ -143,37 +242,28 @@ async function main() {
 
   const cargo = findCargo()
   const executable = buildBackend(cargo)
-  const port = await reserveLoopbackPort()
-  const baseUrl = `http://127.0.0.1:${port}`
-  backendProcess = spawn(executable, [], {
-    cwd: projectDir,
-    env: {
-      ...process.env,
-      APP_ISOLATED_MODE: '1',
-      HOST: '127.0.0.1',
-      PORT: String(port),
-      DATA_DIR: dataDir,
-      STATIC_DIR: staticDir,
-      DEV_CORS: '0',
-      RUST_LOG: process.env.RUST_LOG ?? 'danbooru_download_tool_pro=warn',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  })
-  captureBackendOutput(backendProcess.stdout)
-  captureBackendOutput(backendProcess.stderr)
-  await waitForHealth(baseUrl)
+  const windowsBackend = isWindowsExecutable(cargo)
+  const baseUrl = await startBackend(executable, cargo, dataDir)
+  const testNode = windowsBackend ? findWindowsNode() : process.execPath
+  const testCli = windowsBackend ? pathForWindowsProcess(playwrightCli, cargo) : playwrightCli
+  const testConfig = windowsBackend
+    ? pathForWindowsProcess(path.join(frontendDir, 'playwright.real.config.ts'), cargo)
+    : path.join(frontendDir, 'playwright.real.config.ts')
+  const realE2eVariables = ['REAL_E2E_BASE_URL', 'REAL_E2E_DATA_DIR', 'REAL_E2E_MEDIA_DIR', 'REAL_E2E_BACKEND_PLATFORM']
+  const testWslEnv = [...new Set([...(process.env.WSLENV ?? '').split(':').filter(Boolean), ...realE2eVariables])].join(':')
 
   const playwright = spawn(
-    process.execPath,
-    [playwrightCli, 'test', '--config', path.join(frontendDir, 'playwright.real.config.ts'), ...process.argv.slice(2)],
+    testNode,
+    [testCli, 'test', '--config', testConfig, ...process.argv.slice(2)],
     {
       cwd: frontendDir,
       env: {
         ...process.env,
         REAL_E2E_BASE_URL: baseUrl,
-        REAL_E2E_DATA_DIR: dataDir,
-        REAL_E2E_MEDIA_DIR: mediaDir,
+        REAL_E2E_DATA_DIR: windowsBackend ? pathForWindowsProcess(dataDir, cargo) : dataDir,
+        REAL_E2E_MEDIA_DIR: windowsBackend ? pathForWindowsProcess(mediaDir, cargo) : mediaDir,
+        REAL_E2E_BACKEND_PLATFORM: windowsBackend ? 'windows' : process.platform,
+        ...(windowsBackend ? { WSLENV: testWslEnv } : {}),
       },
       stdio: 'inherit',
       windowsHide: true,

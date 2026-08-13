@@ -1,11 +1,123 @@
 use crate::models::DownloadConfig;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 pub struct Database {
-    conn: Mutex<Connection>,
+    conn: ConnectionPool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabasePoolDiagnostics {
+    pub total: usize,
+    pub in_use: usize,
+    pub idle: usize,
+    pub capacity: usize,
+}
+
+struct ConnectionPool {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+    available: Condvar,
+    total: AtomicUsize,
+    capacity: usize,
+}
+
+struct PooledConnection<'a> {
+    pool: &'a ConnectionPool,
+    connection: Option<Connection>,
+}
+
+impl ConnectionPool {
+    fn new(path: &Path, connection: Connection) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            idle: Mutex::new(vec![connection]),
+            available: Condvar::new(),
+            total: AtomicUsize::new(1),
+            capacity: 4,
+        }
+    }
+
+    fn open_connection(&self) -> rusqlite::Result<Connection> {
+        let connection = Connection::open(&self.path)?;
+        configure_connection(&connection)?;
+        Ok(connection)
+    }
+
+    fn lock(&self) -> Result<PooledConnection<'_>, rusqlite::Error> {
+        let started = std::time::Instant::now();
+        let mut idle = self.idle.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        loop {
+            if let Some(connection) = idle.pop() {
+                let waited = started.elapsed();
+                if waited >= std::time::Duration::from_millis(50) {
+                    tracing::warn!(wait_ms = waited.as_millis() as u64, "SQLite 连接池等待较慢");
+                }
+                return Ok(PooledConnection { pool: self, connection: Some(connection) });
+            }
+            let total = self.total.load(Ordering::Acquire);
+            if total < self.capacity && self.total.compare_exchange(total, total + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                drop(idle);
+                return match self.open_connection() {
+                    Ok(connection) => {
+                        let waited = started.elapsed();
+                        if waited >= std::time::Duration::from_millis(50) {
+                            tracing::warn!(wait_ms = waited.as_millis() as u64, "SQLite 新连接创建较慢");
+                        }
+                        Ok(PooledConnection { pool: self, connection: Some(connection) })
+                    },
+                    Err(error) => {
+                        self.total.fetch_sub(1, Ordering::AcqRel);
+                        self.available.notify_one();
+                        Err(error)
+                    }
+                };
+            }
+            idle = self.available.wait(idle).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        }
+    }
+
+    fn diagnostics(&self) -> DatabasePoolDiagnostics {
+        let idle = self.idle.lock().map(|connections| connections.len()).unwrap_or_default();
+        let total = self.total.load(Ordering::Acquire);
+        DatabasePoolDiagnostics { total, in_use: total.saturating_sub(idle), idle, capacity: self.capacity }
+    }
+}
+
+impl Deref for PooledConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().expect("pooled connection already returned")
+    }
+}
+
+impl DerefMut for PooledConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().expect("pooled connection already returned")
+    }
+}
+
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            if let Ok(mut idle) = self.pool.idle.lock() {
+                idle.push(connection);
+                self.pool.available.notify_one();
+            } else {
+                self.pool.total.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA foreign_keys=ON;")
 }
 
 fn migrate_partial_v1_tables(conn: &Connection) -> rusqlite::Result<()> {
@@ -18,6 +130,7 @@ fn migrate_partial_v1_tables(conn: &Connection) -> rusqlite::Result<()> {
                 ("windows_path", "TEXT"),
                 ("linux_path", "TEXT"),
                 ("indexing_status", "TEXT NOT NULL DEFAULT 'not_indexed'"),
+                ("catalog_revision", "INTEGER NOT NULL DEFAULT 1"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
@@ -59,12 +172,24 @@ fn migrate_partial_v1_tables(conn: &Connection) -> rusqlite::Result<()> {
                 ("width", "INTEGER"),
                 ("height", "INTEGER"),
                 ("duration", "REAL"),
+                ("catalog_seq", "INTEGER"),
+                ("directory_key", "TEXT NOT NULL DEFAULT ''"),
+                ("short_edge", "INTEGER"),
+                ("file_mtime", "INTEGER NOT NULL DEFAULT 0"),
+                ("catalog_revision", "INTEGER NOT NULL DEFAULT 1"),
                 ("status", "TEXT NOT NULL DEFAULT 'active'"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
         )?;
         backfill_timestamps(conn, "media_files")?;
+    }
+    if table_exists(conn, "library_reindex_staging")? {
+        ensure_columns(
+            conn,
+            "library_reindex_staging",
+            &[("file_mtime", "INTEGER NOT NULL DEFAULT 0")],
+        )?;
     }
     if table_exists(conn, "task_items")? {
         ensure_columns(
@@ -115,6 +240,7 @@ fn migrate_partial_v1_tables(conn: &Connection) -> rusqlite::Result<()> {
                 ("file_size", "INTEGER"),
                 ("source", "TEXT"),
                 ("duration", "REAL"),
+                ("posted_at", "INTEGER"),
                 ("status", "TEXT NOT NULL DEFAULT 'available'"),
                 ("tag_string", "TEXT NOT NULL DEFAULT ''"),
                 ("tag_string_general", "TEXT NOT NULL DEFAULT ''"),
@@ -223,6 +349,7 @@ pub struct RootRecord {
     pub windows_path: Option<String>,
     pub linux_path: Option<String>,
     pub indexing_status: String,
+    pub catalog_revision: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -262,11 +389,22 @@ pub struct MediaFileInput {
     pub duration: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaIndexFingerprint {
+    pub id: String,
+    pub byte_size: i64,
+    pub file_mtime: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LibraryMediaPage {
     pub items: Vec<MediaFileRecord>,
     pub total: i64,
+    pub previous_cursor: Option<String>,
     pub next_cursor: Option<String>,
+    pub catalog_revision: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -275,6 +413,8 @@ pub struct LibraryMediaFilters {
     pub score_max: Option<i64>,
     pub min_resolution: Option<i64>,
     pub max_resolution: Option<i64>,
+    pub post_created_from: Option<i64>,
+    pub post_created_to: Option<i64>,
     pub relative_directory: Option<String>,
 }
 
@@ -339,6 +479,20 @@ fn library_query_filter_parts(
             " AND COALESCE((SELECT score FROM posts p WHERE p.id=m.post_id), 0)<=?{parameter}"
         ));
         values.push(rusqlite::types::Value::Integer(score_max));
+    }
+    if let Some(post_created_from) = filters.post_created_from {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(
+            " AND (SELECT posted_at FROM posts p WHERE p.id=m.post_id)>=?{parameter}"
+        ));
+        values.push(rusqlite::types::Value::Integer(post_created_from));
+    }
+    if let Some(post_created_to) = filters.post_created_to {
+        let parameter = values.len() + 1;
+        clause.push_str(&format!(
+            " AND (SELECT posted_at FROM posts p WHERE p.id=m.post_id)<=?{parameter}"
+        ));
+        values.push(rusqlite::types::Value::Integer(post_created_to));
     }
     let minimum_resolution = filters.min_resolution.filter(|value| *value > 0);
     if minimum_resolution.is_some() || filters.max_resolution.is_some() {
@@ -422,6 +576,8 @@ pub struct PostRecordInput {
     pub file_size: Option<i64>,
     pub source: Option<String>,
     pub duration: Option<f64>,
+    #[serde(default)]
+    pub post_created_at: Option<String>,
     pub status: String,
     pub tag_string: String,
     pub tag_string_general: String,
@@ -448,6 +604,7 @@ pub struct PostLibraryTag {
 pub struct PostLibraryMetadata {
     pub post_id: i64,
     pub rating: String,
+    pub post_created_at: Option<i64>,
     pub tags: Vec<PostLibraryTag>,
 }
 
@@ -570,13 +727,18 @@ pub struct QuarantineRecord {
 impl Database {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        configure_connection(&conn)?;
 
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: ConnectionPool::new(path, conn),
         };
         db.init_tables()?;
         Ok(db)
+    }
+
+    pub fn pool_diagnostics(&self) -> DatabasePoolDiagnostics {
+        self.conn.diagnostics()
     }
 
     pub fn health_check(&self) -> rusqlite::Result<()> {
@@ -650,6 +812,7 @@ impl Database {
                 windows_path TEXT,
                 linux_path TEXT,
                 indexing_status TEXT NOT NULL DEFAULT 'not_indexed',
+                catalog_revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 CHECK (windows_path IS NOT NULL OR linux_path IS NOT NULL)
@@ -667,6 +830,7 @@ impl Database {
                 file_size INTEGER,
                 source TEXT,
                 duration REAL,
+                posted_at INTEGER,
                 status TEXT NOT NULL DEFAULT 'available',
                 tag_string TEXT NOT NULL DEFAULT '',
                 tag_string_general TEXT NOT NULL DEFAULT '',
@@ -678,6 +842,8 @@ impl Database {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_md5
                 ON posts(md5) WHERE md5 IS NOT NULL AND md5 != '';
+            CREATE INDEX IF NOT EXISTS idx_posts_posted_at
+                ON posts(posted_at, id) WHERE posted_at IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS media_files (
                 id TEXT PRIMARY KEY,
@@ -692,16 +858,69 @@ impl Database {
                 width INTEGER,
                 height INTEGER,
                 duration REAL,
+                catalog_seq INTEGER,
+                directory_key TEXT NOT NULL DEFAULT '',
+                short_edge INTEGER,
+                file_mtime INTEGER NOT NULL DEFAULT 0,
+                catalog_revision INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(root_id, relative_path)
             );
             CREATE INDEX IF NOT EXISTS idx_media_root_id ON media_files(root_id, id);
+            CREATE INDEX IF NOT EXISTS idx_media_catalog_cursor
+                ON media_files(root_id, catalog_revision, catalog_seq, id) WHERE status='active';
+            CREATE INDEX IF NOT EXISTS idx_media_root_cursor
+                ON media_files(root_id, catalog_seq, id) WHERE status='active';
+            CREATE INDEX IF NOT EXISTS idx_media_directory_cursor
+                ON media_files(root_id, catalog_revision, directory_key, catalog_seq, id)
+                WHERE status='active';
+            CREATE INDEX IF NOT EXISTS idx_media_short_edge
+                ON media_files(root_id, catalog_revision, short_edge, catalog_seq)
+                WHERE status='active';
+            CREATE TRIGGER IF NOT EXISTS trg_media_catalog_seq
+            AFTER INSERT ON media_files
+            WHEN NEW.catalog_seq IS NULL
+            BEGIN
+                UPDATE media_files SET catalog_seq=NEW.rowid WHERE rowid=NEW.rowid;
+            END;
             CREATE INDEX IF NOT EXISTS idx_media_post_id ON media_files(post_id);
             CREATE INDEX IF NOT EXISTS idx_media_md5 ON media_files(md5);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_media_root_path_unique
                 ON media_files(root_id, relative_path);
+
+            CREATE TABLE IF NOT EXISTS library_reindex_staging (
+                task_id TEXT NOT NULL,
+                root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                id TEXT NOT NULL,
+                post_id INTEGER,
+                relative_path TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                sha256 TEXT,
+                md5 TEXT,
+                width INTEGER,
+                height INTEGER,
+                duration REAL,
+                catalog_seq INTEGER NOT NULL,
+                directory_key TEXT NOT NULL,
+                short_edge INTEGER,
+                file_mtime INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(task_id, id),
+                UNIQUE(task_id, root_id, relative_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_library_reindex_staging_root
+                ON library_reindex_staging(task_id, root_id, catalog_seq);
+            CREATE TABLE IF NOT EXISTS library_reindex_post_staging (
+                task_id TEXT NOT NULL,
+                root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                post_id INTEGER NOT NULL,
+                post_json TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                PRIMARY KEY(task_id, post_id)
+            );
 
             CREATE TABLE IF NOT EXISTS downloaded_post_locations (
                 root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
@@ -791,8 +1010,21 @@ impl Database {
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
-            PRAGMA user_version=3;
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+            PRAGMA user_version=4;
             ",
+        )?;
+        transaction.execute_batch(
+            "UPDATE media_files
+             SET catalog_seq=COALESCE(catalog_seq, rowid),
+                 short_edge=CASE
+                     WHEN width IS NULL OR height IS NULL THEN NULL
+                     WHEN width < height THEN width ELSE height END,
+                 catalog_revision=COALESCE(
+                     (SELECT roots.catalog_revision FROM roots WHERE roots.id=media_files.root_id),
+                     1
+                 )
+             WHERE catalog_seq IS NULL OR short_edge IS NULL;",
         )?;
         backfill_downloaded_post_locations(&transaction)?;
         transaction.commit()
@@ -1102,7 +1334,7 @@ impl Database {
     pub fn list_roots(&self) -> rusqlite::Result<Vec<RootRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT id, name, windows_path, linux_path, indexing_status, created_at, updated_at
+            "SELECT id, name, windows_path, linux_path, indexing_status, catalog_revision, created_at, updated_at
              FROM roots ORDER BY created_at, id",
         )?;
         let roots = statement
@@ -1129,6 +1361,21 @@ impl Database {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         query_root(&conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    pub fn advance_catalog_revision(&self, root_id: &str) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE roots
+             SET catalog_revision=catalog_revision+1, updated_at=datetime('now')
+             WHERE id=?1",
+            [root_id],
+        )?;
+        conn.query_row(
+            "SELECT catalog_revision FROM roots WHERE id=?1",
+            [root_id],
+            |row| row.get(0),
+        )
     }
 
     pub fn remove_root_catalog(&self, id: &str) -> rusqlite::Result<bool> {
@@ -1228,6 +1475,38 @@ impl Database {
         Ok(media)
     }
 
+    pub fn list_active_source_media_in_directory(
+        &self,
+        root_id: &str,
+        relative_directory: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<MediaFileRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 10_001) as i64;
+        let mut statement = conn.prepare(
+            r#"SELECT id, root_id, post_id, relative_path, variant, mime_type, byte_size,
+                    sha256, md5, width, height, duration, status, created_at, updated_at
+             FROM media_files
+             WHERE root_id=?1 AND status='active'
+               AND (
+                    ?2=''
+                    OR (
+                        substr(relative_path, 1, length(?2))=?2
+                        AND substr(relative_path, length(?2) + 1, 1)='/'
+                    )
+               )
+               AND lower('/' || replace(relative_path, '\', '/') || '/') NOT LIKE '%/.augmentation/%'
+               AND lower('/' || replace(relative_path, '\', '/') || '/') NOT LIKE '%/.augmentation-metadata/%'
+               AND lower('/' || replace(relative_path, '\', '/') || '/') NOT LIKE '%/.danbooru-quarantine/%'
+             ORDER BY relative_path COLLATE BINARY, id
+             LIMIT ?3"#,
+        )?;
+        let media = statement
+            .query_map(params![root_id, relative_directory, limit], map_media_file)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(media)
+    }
+
     pub fn list_library_media(
         &self,
         root_id: &str,
@@ -1252,35 +1531,86 @@ impl Database {
         exact_tag_query: &str,
         filters: &LibraryMediaFilters,
     ) -> rusqlite::Result<LibraryMediaPage> {
+        self.list_library_media_bidirectional(
+            root_id,
+            after_id,
+            false,
+            limit,
+            exact_tag_query,
+            filters,
+        )
+    }
+
+    pub fn list_library_media_bidirectional(
+        &self,
+        root_id: &str,
+        cursor_id: Option<&str>,
+        before: bool,
+        limit: usize,
+        exact_tag_query: &str,
+        filters: &LibraryMediaFilters,
+    ) -> rusqlite::Result<LibraryMediaPage> {
         let limit = limit.clamp(1, 200);
         let (filter_clause, filter_values) =
             library_query_filter_parts(root_id, exact_tag_query, filters);
         let conn = self.conn.lock().unwrap();
+        let catalog_revision = conn
+            .query_row(
+                "SELECT catalog_revision FROM roots WHERE id=?1",
+                [root_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(1);
         let count_sql = format!(
             "SELECT COUNT(*) FROM media_files m
              WHERE m.root_id=?1 AND m.status='active'{filter_clause}"
         );
+        let base_values = filter_values;
         let total = conn.query_row(
             &count_sql,
-            rusqlite::params_from_iter(filter_values.iter()),
+            rusqlite::params_from_iter(base_values.iter()),
             |row| row.get(0),
         )?;
-        let cursor_parameter = filter_values.len() + 1;
-        let limit_parameter = cursor_parameter + 1;
+        let cursor = cursor_id
+            .map(|cursor| {
+                conn.query_row(
+                    "SELECT catalog_seq, id FROM media_files
+                     WHERE root_id=?1 AND id=?2",
+                    params![root_id, cursor],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .transpose()?;
+        let comparison = if before { "<" } else { ">" };
+        let order = if before { "DESC" } else { "ASC" };
+        let (cursor_clause, limit_parameter) = if cursor.is_some() {
+            let cursor_seq_parameter = base_values.len() + 1;
+            let cursor_id_parameter = cursor_seq_parameter + 1;
+            (
+                format!(
+                    " AND (m.catalog_seq {comparison} ?{cursor_seq_parameter}
+                            OR (m.catalog_seq=?{cursor_seq_parameter}
+                                AND m.id {comparison} ?{cursor_id_parameter}))"
+                ),
+                cursor_id_parameter + 1,
+            )
+        } else {
+            (String::new(), base_values.len() + 1)
+        };
         let page_sql = format!(
             "SELECT m.id, m.root_id, m.post_id, m.relative_path, m.variant, m.mime_type,
                     m.byte_size, m.sha256, m.md5, m.width, m.height, m.duration, m.status,
                     m.created_at, m.updated_at
              FROM media_files m
-             WHERE m.root_id=?1 AND m.status='active'{filter_clause}
-                   AND (?{cursor_parameter} IS NULL OR m.id > ?{cursor_parameter})
-             ORDER BY m.id LIMIT ?{limit_parameter}"
+             WHERE m.root_id=?1 AND m.status='active'{filter_clause}{cursor_clause}
+             ORDER BY m.catalog_seq {order}, m.id {order} LIMIT ?{limit_parameter}"
         );
-        let mut page_values = filter_values;
-        page_values.push(match after_id {
-            Some(cursor) => rusqlite::types::Value::Text(cursor.to_string()),
-            None => rusqlite::types::Value::Null,
-        });
+        let mut page_values = base_values;
+        if let Some((sequence, id)) = cursor {
+            page_values.push(rusqlite::types::Value::Integer(sequence));
+            page_values.push(rusqlite::types::Value::Text(id));
+        }
         page_values.push(rusqlite::types::Value::Integer((limit + 1) as i64));
         let mut statement = conn.prepare(&page_sql)?;
         let mut items = statement
@@ -1291,11 +1621,19 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = items.len() > limit;
         items.truncate(limit);
-        let next_cursor = has_more.then(|| items.last().expect("non-empty page").id.clone());
+        if before {
+            items.reverse();
+        }
+        let previous_cursor = (!items.is_empty() && (before && has_more || !before && cursor_id.is_some()))
+            .then(|| items.first().expect("non-empty page").id.clone());
+        let next_cursor = (!items.is_empty() && (!before && has_more || before && cursor_id.is_some()))
+            .then(|| items.last().expect("non-empty page").id.clone());
         Ok(LibraryMediaPage {
             items,
             total,
+            previous_cursor,
             next_cursor,
+            catalog_revision,
         })
     }
 
@@ -1357,6 +1695,8 @@ impl Database {
         let score_filters = LibraryMediaFilters {
             min_resolution: filters.min_resolution,
             max_resolution: filters.max_resolution,
+            post_created_from: filters.post_created_from,
+            post_created_to: filters.post_created_to,
             relative_directory: filters.relative_directory.clone(),
             ..LibraryMediaFilters::default()
         };
@@ -1389,6 +1729,8 @@ impl Database {
         let resolution_filters = LibraryMediaFilters {
             score_min: filters.score_min,
             score_max: filters.score_max,
+            post_created_from: filters.post_created_from,
+            post_created_to: filters.post_created_to,
             relative_directory: filters.relative_directory.clone(),
             ..LibraryMediaFilters::default()
         };
@@ -1432,48 +1774,18 @@ impl Database {
     }
 
     pub fn upsert_media_file(&self, media: &MediaFileInput) -> rusqlite::Result<MediaFileRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO media_files(id, root_id, post_id, relative_path, variant, mime_type,
-                                     byte_size, sha256, md5, width, height, duration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET
-                root_id=excluded.root_id, post_id=excluded.post_id,
-                relative_path=excluded.relative_path, variant=excluded.variant,
-                mime_type=excluded.mime_type, byte_size=excluded.byte_size,
-                sha256=excluded.sha256, md5=excluded.md5, width=excluded.width,
-                height=excluded.height, duration=excluded.duration, status='active',
-                updated_at=datetime('now')
-             ON CONFLICT(root_id, relative_path) DO UPDATE SET
-                post_id=COALESCE(excluded.post_id, media_files.post_id),
-                variant=excluded.variant, mime_type=excluded.mime_type,
-                byte_size=excluded.byte_size,
-                sha256=COALESCE(excluded.sha256, media_files.sha256),
-                md5=COALESCE(excluded.md5, media_files.md5),
-                width=COALESCE(excluded.width, media_files.width),
-                height=COALESCE(excluded.height, media_files.height),
-                duration=COALESCE(excluded.duration, media_files.duration),
-                status='active', updated_at=datetime('now')",
-            params![
-                media.id,
-                media.root_id,
-                media.post_id,
-                media.relative_path,
-                media.variant,
-                media.mime_type,
-                media.byte_size,
-                media.sha256,
-                media.md5,
-                media.width,
-                media.height,
-                media.duration,
-            ],
-        )?;
-        if let Some(record) = query_media_file(&conn, &media.id)? {
-            return Ok(record);
-        }
-        query_media_file_by_root_path(&conn, &media.root_id, &media.relative_path)?
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        upsert_media_file_in_transaction(&transaction, media)?;
+        let record = query_media_file(&transaction, &media.id)?
+            .or(query_media_file_by_root_path(
+                &transaction,
+                &media.root_id,
+                &media.relative_path,
+            )?)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        transaction.commit()?;
+        Ok(record)
     }
 
     pub fn upsert_post_with_tags(
@@ -1584,17 +1896,339 @@ impl Database {
         transaction.commit()
     }
 
+    pub fn active_media_index_fingerprints(
+        &self,
+        root_id: &str,
+    ) -> rusqlite::Result<HashMap<String, MediaIndexFingerprint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT relative_path, id, byte_size, file_mtime, width, height
+             FROM media_files WHERE root_id=?1 AND status='active'",
+        )?;
+        let fingerprints = statement
+            .query_map([root_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MediaIndexFingerprint {
+                        id: row.get(1)?,
+                        byte_size: row.get(2)?,
+                        file_mtime: row.get(3)?,
+                        width: row.get(4)?,
+                        height: row.get(5)?,
+                    },
+                ))
+            })?
+            .collect();
+        fingerprints
+    }
+
+    pub fn upsert_indexed_media_batch_with_mtimes(
+        &self,
+        local_posts: &[(PostRecordInput, Vec<PostTagInput>)],
+        media_files: &[MediaFileInput],
+        file_mtimes: &[(String, i64)],
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        for (post, tags) in local_posts {
+            insert_local_post_with_tags_if_missing_in_transaction(&transaction, post, tags)?;
+        }
+        for media in media_files {
+            upsert_media_file_in_transaction(&transaction, media)?;
+        }
+        for (id, file_mtime) in file_mtimes {
+            transaction.execute(
+                "UPDATE media_files SET file_mtime=?2 WHERE id=?1",
+                params![id, file_mtime],
+            )?;
+        }
+        transaction.commit()
+    }
+
+    pub fn begin_library_reindex_staging(
+        &self,
+        task_id: &str,
+        root_id: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM library_reindex_staging
+             WHERE task_id=?1 AND root_id<>?2",
+            params![task_id, root_id],
+        )?;
+        conn.execute(
+            "DELETE FROM library_reindex_post_staging
+             WHERE task_id=?1 AND root_id<>?2",
+            params![task_id, root_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn library_reindex_staging_fingerprints(
+        &self,
+        task_id: &str,
+        root_id: &str,
+    ) -> rusqlite::Result<HashMap<String, MediaIndexFingerprint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT relative_path, id, byte_size, file_mtime, width, height
+             FROM library_reindex_staging
+             WHERE task_id=?1 AND root_id=?2",
+        )?;
+        let fingerprints = statement
+            .query_map(params![task_id, root_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MediaIndexFingerprint {
+                        id: row.get(1)?,
+                        byte_size: row.get(2)?,
+                        file_mtime: row.get(3)?,
+                        width: row.get(4)?,
+                        height: row.get(5)?,
+                    },
+                ))
+            })?
+            .collect();
+        fingerprints
+    }
+
+    pub fn prune_library_reindex_staging(
+        &self,
+        task_id: &str,
+        root_id: &str,
+        scanned_paths: &HashSet<String>,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let stale_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id, relative_path FROM library_reindex_staging
+                 WHERE task_id=?1 AND root_id=?2",
+            )?;
+            let records = statement
+                .query_map(params![task_id, root_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            records
+                .into_iter()
+                .filter_map(|(id, path)| (!scanned_paths.contains(&path)).then_some(id))
+                .collect::<Vec<_>>()
+        };
+        for id in &stale_ids {
+            transaction.execute(
+                "DELETE FROM library_reindex_staging
+                 WHERE task_id=?1 AND root_id=?2 AND id=?3",
+                params![task_id, root_id, id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM library_reindex_post_staging
+             WHERE task_id=?1 AND root_id=?2
+               AND post_id NOT IN (
+                   SELECT post_id FROM library_reindex_staging
+                   WHERE task_id=?1 AND root_id=?2 AND post_id IS NOT NULL
+               )",
+            params![task_id, root_id],
+        )?;
+        transaction.commit()?;
+        Ok(stale_ids.len())
+    }
+
+    pub fn stage_library_reindex_batch(
+        &self,
+        task_id: &str,
+        root_id: &str,
+        local_posts: &[(PostRecordInput, Vec<PostTagInput>)],
+        media_files: &[MediaFileInput],
+        file_mtimes: &[(String, i64)],
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let next_sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(catalog_seq), 0) + 1
+             FROM library_reindex_staging WHERE task_id=?1 AND root_id=?2",
+            params![task_id, root_id],
+            |row| row.get(0),
+        )?;
+        for (post, tags) in local_posts {
+            transaction.execute(
+                "INSERT INTO library_reindex_post_staging(
+                    task_id, root_id, post_id, post_json, tags_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(task_id, post_id) DO UPDATE SET
+                    post_json=excluded.post_json, tags_json=excluded.tags_json",
+                params![
+                    task_id,
+                    root_id,
+                    post.id,
+                    serde_json::to_string(post).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?,
+                    serde_json::to_string(tags).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?,
+                ],
+            )?;
+        }
+        for (index, media) in media_files.iter().enumerate() {
+            let file_mtime = file_mtimes
+                .iter()
+                .find_map(|(id, value)| (id == &media.id).then_some(*value))
+                .unwrap_or(0);
+            transaction.execute(
+                "INSERT INTO library_reindex_staging(
+                    task_id, root_id, id, post_id, relative_path, variant, mime_type,
+                    byte_size, sha256, md5, width, height, duration, catalog_seq,
+                    directory_key, short_edge, file_mtime
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                           ?13, ?14, ?15,
+                           CASE WHEN ?11 IS NULL OR ?12 IS NULL THEN NULL
+                                WHEN ?11 < ?12 THEN ?11 ELSE ?12 END, ?16)
+                 ON CONFLICT(task_id, id) DO UPDATE SET
+                    post_id=excluded.post_id, relative_path=excluded.relative_path,
+                    variant=excluded.variant, mime_type=excluded.mime_type,
+                    byte_size=excluded.byte_size, sha256=excluded.sha256,
+                    md5=excluded.md5, width=excluded.width, height=excluded.height,
+                    duration=excluded.duration, directory_key=excluded.directory_key,
+                    short_edge=excluded.short_edge, file_mtime=excluded.file_mtime",
+                params![
+                    task_id,
+                    root_id,
+                    media.id,
+                    media.post_id,
+                    media.relative_path,
+                    media.variant,
+                    media.mime_type,
+                    media.byte_size,
+                    media.sha256,
+                    media.md5,
+                    media.width,
+                    media.height,
+                    media.duration,
+                    next_sequence.saturating_add(index as i64),
+                    Path::new(&media.relative_path)
+                        .parent()
+                        .and_then(Path::to_str)
+                        .unwrap_or("")
+                        .replace('\\', "/"),
+                    file_mtime,
+                ],
+            )?;
+        }
+        transaction.commit()
+    }
+
+    pub fn discard_library_reindex_staging(&self, task_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM library_reindex_staging WHERE task_id=?1",
+            [task_id],
+        )?;
+        conn.execute(
+            "DELETE FROM library_reindex_post_staging WHERE task_id=?1",
+            [task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_library_reindex(
+        &self,
+        task_id: &str,
+        root_id: &str,
+        expected_count: usize,
+    ) -> rusqlite::Result<(i64, usize)> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let staged_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM library_reindex_staging
+             WHERE task_id=?1 AND root_id=?2",
+            params![task_id, root_id],
+            |row| row.get(0),
+        )?;
+        if staged_count != expected_count as i64 {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "reindex staged count {staged_count} does not match {expected_count}"
+            )));
+        }
+        let staged_posts = {
+            let mut statement = transaction.prepare(
+                "SELECT post_json, tags_json FROM library_reindex_post_staging
+                 WHERE task_id=?1 AND root_id=?2 ORDER BY post_id",
+            )?;
+            let rows = statement
+                .query_map(params![task_id, root_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (post_json, tags_json) in staged_posts {
+            let post: PostRecordInput = serde_json::from_str(&post_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let tags: Vec<PostTagInput> = serde_json::from_str(&tags_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            insert_local_post_with_tags_if_missing_in_transaction(&transaction, &post, &tags)?;
+        }
+        let removed = transaction.execute(
+            "DELETE FROM media_files WHERE root_id=?1 AND status='active'",
+            [root_id],
+        )?;
+        let next_revision: i64 = transaction.query_row(
+            "SELECT catalog_revision + 1 FROM roots WHERE id=?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO media_files(
+                id, root_id, post_id, relative_path, variant, mime_type, byte_size,
+                sha256, md5, width, height, duration, catalog_seq, directory_key,
+                short_edge, file_mtime, catalog_revision, status, created_at, updated_at)
+             SELECT id, root_id, post_id, relative_path, variant, mime_type, byte_size,
+                    sha256, md5, width, height, duration, catalog_seq, directory_key,
+                    short_edge, file_mtime, ?3, 'active', datetime('now'), datetime('now')
+             FROM library_reindex_staging
+             WHERE task_id=?1 AND root_id=?2 ORDER BY catalog_seq",
+            params![task_id, root_id, next_revision],
+        )?;
+        transaction.execute(
+            "UPDATE roots SET catalog_revision=?2, indexing_status='indexed',
+                              updated_at=datetime('now') WHERE id=?1",
+            params![root_id, next_revision],
+        )?;
+        transaction.execute(
+            "DELETE FROM library_reindex_staging WHERE task_id=?1",
+            [task_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM library_reindex_post_staging WHERE task_id=?1",
+            [task_id],
+        )?;
+        transaction.commit()?;
+        Ok((next_revision, removed))
+    }
+
     pub fn get_post_library_metadata(
         &self,
         post_id: i64,
     ) -> rusqlite::Result<Option<PostLibraryMetadata>> {
         let conn = self.conn.lock().unwrap();
-        let rating = conn
-            .query_row("SELECT rating FROM posts WHERE id=?1", [post_id], |row| {
-                row.get::<_, String>(0)
+        let post_metadata = conn
+            .query_row("SELECT rating, posted_at FROM posts WHERE id=?1", [post_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
             })
             .optional()?;
-        let Some(rating) = rating else {
+        let Some((rating, post_created_at)) = post_metadata else {
             return Ok(None);
         };
         let mut statement = conn.prepare(
@@ -1615,8 +2249,53 @@ impl Database {
         Ok(Some(PostLibraryMetadata {
             post_id,
             rating,
+            post_created_at,
             tags,
         }))
+    }
+
+    pub fn get_post_library_metadata_batch(
+        &self,
+        post_ids: &[i64],
+    ) -> rusqlite::Result<HashMap<i64, PostLibraryMetadata>> {
+        if post_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut unique = post_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let placeholders = (1..=unique.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT p.id, p.rating, p.posted_at, t.name, t.category
+             FROM posts p
+             LEFT JOIN post_tags pt ON pt.post_id=p.id
+             LEFT JOIN tags t ON t.id=pt.tag_id
+             WHERE p.id IN ({placeholders})
+             ORDER BY p.id, t.category, t.name COLLATE BINARY"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut result = HashMap::<i64, PostLibraryMetadata>::new();
+        let mut rows = statement.query(rusqlite::params_from_iter(unique.iter()))?;
+        while let Some(row) = rows.next()? {
+            let post_id = row.get::<_, i64>(0)?;
+            let metadata = result.entry(post_id).or_insert(PostLibraryMetadata {
+                post_id,
+                rating: row.get(1)?,
+                post_created_at: row.get(2)?,
+                tags: Vec::new(),
+            });
+            if let Some(name) = row.get::<_, Option<String>>(3)? {
+                metadata.tags.push(PostLibraryTag {
+                    name,
+                    category: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                });
+            }
+        }
+        Ok(result)
     }
 
     pub fn get_media_file(&self, id: &str) -> rusqlite::Result<Option<MediaFileRecord>> {
@@ -1878,20 +2557,20 @@ impl Database {
         let interrupted_json = json_to_sql(&interrupted)?;
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn.transaction()?;
-        let downloads = transaction.execute(
+        let resumable = transaction.execute(
             "UPDATE tasks SET status='paused', revision=revision+1, error_json=NULL,
                     updated_at=datetime('now'), resumable=1
-             WHERE status='running' AND kind='download'",
+             WHERE status='running' AND kind IN ('download', 'training', 'reindex_library')",
             [],
         )?;
         let other = transaction.execute(
             "UPDATE tasks SET status='failed', revision=revision+1, error_json=?1,
                     updated_at=datetime('now'), finished_at=datetime('now'), resumable=0
-             WHERE status='running' AND kind!='download'",
+             WHERE status='running' AND kind NOT IN ('download', 'training', 'reindex_library')",
             [interrupted_json],
         )?;
         transaction.commit()?;
-        Ok(downloads + other)
+        Ok(resumable + other)
     }
 
     pub fn replace_task_items(
@@ -2326,10 +3005,11 @@ fn insert_local_post_with_tags_if_missing_in_transaction(
         "INSERT INTO posts(
             id, md5, rating, score, fav_count, width, height, file_ext, file_size,
             source, duration, status, tag_string, tag_string_general,
-            tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta
+            tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta,
+            posted_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18
+            ?16, ?17, ?18, CAST(strftime('%s', ?19) AS INTEGER)
          )
          ON CONFLICT DO NOTHING",
         params![
@@ -2351,6 +3031,7 @@ fn insert_local_post_with_tags_if_missing_in_transaction(
             post.tag_string_copyright,
             post.tag_string_artist,
             post.tag_string_meta,
+            post.post_created_at,
         ],
     )?;
     if inserted == 0 {
@@ -2390,10 +3071,11 @@ fn upsert_post_with_tags_in_transaction(
         "INSERT INTO posts(
             id, md5, rating, score, fav_count, width, height, file_ext, file_size,
             source, duration, status, tag_string, tag_string_general,
-            tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta
+            tag_string_character, tag_string_copyright, tag_string_artist, tag_string_meta,
+            posted_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-            ?16, ?17, ?18
+            ?16, ?17, ?18, CAST(strftime('%s', ?19) AS INTEGER)
          )
          ON CONFLICT(id) DO UPDATE SET
             md5=excluded.md5, rating=excluded.rating, score=excluded.score,
@@ -2406,6 +3088,7 @@ fn upsert_post_with_tags_in_transaction(
             tag_string_copyright=excluded.tag_string_copyright,
             tag_string_artist=excluded.tag_string_artist,
             tag_string_meta=excluded.tag_string_meta,
+            posted_at=COALESCE(excluded.posted_at, posts.posted_at),
             fetched_at=datetime('now')",
         params![
             post.id,
@@ -2426,6 +3109,7 @@ fn upsert_post_with_tags_in_transaction(
             post.tag_string_copyright,
             post.tag_string_artist,
             post.tag_string_meta,
+            post.post_created_at,
         ],
     )?;
     transaction.execute("DELETE FROM post_tags WHERE post_id=?1", [post.id])?;
@@ -2460,14 +3144,22 @@ fn upsert_media_file_in_transaction(
 ) -> rusqlite::Result<()> {
     transaction.execute(
         "INSERT INTO media_files(id, root_id, post_id, relative_path, variant, mime_type,
-                                 byte_size, sha256, md5, width, height, duration)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                 byte_size, sha256, md5, width, height, duration,
+                                 catalog_seq, directory_key, short_edge, catalog_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 COALESCE((SELECT MAX(catalog_seq) + 1 FROM media_files WHERE root_id=?2), 1),
+                 ?13,
+                 CASE WHEN ?10 IS NULL OR ?11 IS NULL THEN NULL
+                      WHEN ?10 < ?11 THEN ?10 ELSE ?11 END,
+                 COALESCE((SELECT catalog_revision FROM roots WHERE id=?2), 1))
          ON CONFLICT(id) DO UPDATE SET
             root_id=excluded.root_id, post_id=excluded.post_id,
             relative_path=excluded.relative_path, variant=excluded.variant,
             mime_type=excluded.mime_type, byte_size=excluded.byte_size,
             sha256=excluded.sha256, md5=excluded.md5, width=excluded.width,
-            height=excluded.height, duration=excluded.duration, status='active',
+            height=excluded.height, duration=excluded.duration,
+            directory_key=excluded.directory_key, short_edge=excluded.short_edge,
+            status='active',
             updated_at=datetime('now')
          ON CONFLICT(root_id, relative_path) DO UPDATE SET
             post_id=COALESCE(excluded.post_id, media_files.post_id),
@@ -2477,6 +3169,8 @@ fn upsert_media_file_in_transaction(
             md5=COALESCE(excluded.md5, media_files.md5),
             width=COALESCE(excluded.width, media_files.width),
             height=COALESCE(excluded.height, media_files.height),
+            directory_key=excluded.directory_key,
+            short_edge=COALESCE(excluded.short_edge, media_files.short_edge),
             duration=COALESCE(excluded.duration, media_files.duration),
             status='active', updated_at=datetime('now')",
         params![
@@ -2492,6 +3186,11 @@ fn upsert_media_file_in_transaction(
             media.width,
             media.height,
             media.duration,
+            Path::new(&media.relative_path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("")
+                .replace('\\', "/"),
         ],
     )?;
     Ok(())
@@ -2558,14 +3257,15 @@ fn map_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
         windows_path: row.get(2)?,
         linux_path: row.get(3)?,
         indexing_status: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        catalog_revision: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
 fn query_root(conn: &Connection, id: &str) -> rusqlite::Result<Option<RootRecord>> {
     let mut statement = conn.prepare(
-        "SELECT id, name, windows_path, linux_path, indexing_status, created_at, updated_at
+        "SELECT id, name, windows_path, linux_path, indexing_status, catalog_revision, created_at, updated_at
          FROM roots WHERE id=?1",
     )?;
     let mut rows = statement.query_map([id], map_root)?;
@@ -2740,6 +3440,167 @@ mod migration_tests {
     use crate::models::DownloadConfig;
 
     #[test]
+    fn reindex_staging_keeps_old_catalog_until_atomic_count_checked_cutover() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-reindex-cutover-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media")).unwrap();
+        let media = |id: &str, relative_path: &str| MediaFileInput {
+            id: id.to_string(),
+            root_id: "root-1".to_string(),
+            post_id: None,
+            relative_path: relative_path.to_string(),
+            variant: "original".to_string(),
+            mime_type: "image/jpeg".to_string(),
+            byte_size: 42,
+            sha256: None,
+            md5: None,
+            width: Some(100),
+            height: Some(80),
+            duration: None,
+        };
+        db.upsert_media_file(&media("old", "old.jpg")).unwrap();
+        db.begin_library_reindex_staging("task-1", "root-1").unwrap();
+        db.stage_library_reindex_batch(
+            "task-1",
+            "root-1",
+            &[],
+            &[media("new-a", "new-a.jpg"), media("new-b", "new-b.jpg")],
+            &[("new-a".to_string(), 1), ("new-b".to_string(), 2)],
+        ).unwrap();
+        db.begin_library_reindex_staging("task-1", "root-1").unwrap();
+        db.begin_library_reindex_staging("task-2", "root-1").unwrap();
+
+        assert_eq!(
+            db.list_library_media("root-1", None, 60, "").unwrap().items[0].id,
+            "old"
+        );
+        assert!(db.commit_library_reindex("task-1", "root-1", 3).is_err());
+        assert_eq!(
+            db.list_library_media("root-1", None, 60, "").unwrap().items[0].id,
+            "old"
+        );
+
+        let (revision, removed) = db.commit_library_reindex("task-1", "root-1", 2).unwrap();
+        let page = db.list_library_media("root-1", None, 60, "").unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(removed, 1);
+        assert_eq!(page.catalog_revision, 2);
+        assert_eq!(
+            page.items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            ["new-a", "new-b"]
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn five_hundred_thousand_item_cursor_page_stays_bounded_at_depth() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-library-500k-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-500k", "Scale fixture", None, Some("/media")).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE sequence(value) AS (
+                    SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 500000
+                 )
+                 INSERT INTO media_files(
+                    id, root_id, relative_path, variant, mime_type, byte_size,
+                    width, height, catalog_seq, directory_key, short_edge,
+                    file_mtime, catalog_revision, status)
+                 SELECT printf('media-%06d', value), 'root-500k',
+                        printf('folder-%03d/media-%06d.jpg', value / 1000, value),
+                        'original', 'image/jpeg', 4096, 1024, 768, value,
+                        printf('folder-%03d', value / 1000), 768,
+                        1700000000 + value, 1, 'active'
+                 FROM sequence;",
+            ).unwrap();
+        }
+
+        let query_first = || db.list_library_media("root-500k", None, 60, "").unwrap();
+        let query_deep = || db.list_library_media("root-500k", Some("media-450000"), 60, "").unwrap();
+        let first = query_first();
+        let deep = query_deep();
+        let percentile_95 = |mut samples: Vec<std::time::Duration>| {
+            samples.sort_unstable();
+            samples[((samples.len() * 95).div_ceil(100)).saturating_sub(1)]
+        };
+        let mut first_samples = Vec::new();
+        let mut deep_samples = Vec::new();
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            let page = query_first();
+            first_samples.push(started.elapsed());
+            assert_eq!(page.items.len(), 60);
+            let started = std::time::Instant::now();
+            let page = query_deep();
+            deep_samples.push(started.elapsed());
+            assert_eq!(page.items.len(), 60);
+        }
+        let first_p95 = percentile_95(first_samples);
+        let deep_p95 = percentile_95(deep_samples);
+
+        assert_eq!(first.total, 500_000);
+        assert_eq!(first.items.len(), 60);
+        assert_eq!(deep.items.first().unwrap().id, "media-450001");
+        assert_eq!(deep.items.len(), 60);
+        assert!(first_p95 < std::time::Duration::from_millis(300), "first-page p95 was {first_p95:?}");
+        assert!(deep_p95 < std::time::Duration::from_millis(300), "deep-page p95 was {deep_p95:?}");
+        let larger = first_p95.max(deep_p95);
+        let smaller = first_p95.min(deep_p95);
+        assert!(
+            larger <= smaller.mul_f64(1.2) + std::time::Duration::from_millis(5),
+            "cursor depth changed p95 too much: first={first_p95:?}, deep={deep_p95:?}"
+        );
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE selected(value) AS (
+                    SELECT 10 UNION ALL SELECT value + 10 FROM selected WHERE value < 500000
+                 )
+                 INSERT INTO posts(id, rating, score, width, height)
+                 SELECT value, 'g', 50, 1024, 768 FROM selected;
+                 INSERT INTO tags(id, name, category) VALUES (1, 'cat', 0), (2, 'blue_hair', 0);
+                 INSERT INTO post_tags(post_id, tag_id) SELECT id, 1 FROM posts;
+                 INSERT INTO post_tags(post_id, tag_id) SELECT id, 2 FROM posts;
+                 UPDATE media_files SET post_id=catalog_seq WHERE catalog_seq % 10 = 0;",
+            ).unwrap();
+        }
+        let filters = LibraryMediaFilters {
+            score_min: Some(40),
+            score_max: Some(60),
+            min_resolution: Some(700),
+            max_resolution: Some(800),
+            post_created_from: None,
+            post_created_to: None,
+            relative_directory: None,
+        };
+        let mut filtered_samples = Vec::new();
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            let page = db.list_library_media_bidirectional(
+                "root-500k", None, false, 60, "cat blue_hair", &filters,
+            ).unwrap();
+            filtered_samples.push(started.elapsed());
+            assert_eq!(page.total, 50_000);
+            assert_eq!(page.items.len(), 60);
+        }
+        let filtered_p95 = percentile_95(filtered_samples);
+        assert!(filtered_p95 < std::time::Duration::from_millis(500), "filtered page p95 was {filtered_p95:?}");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn migration_adds_normalized_schema_without_losing_legacy_history() {
         let path = std::env::temp_dir().join(format!("danbooru-schema-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -2818,7 +3679,7 @@ mod migration_tests {
             .unwrap();
 
         assert_eq!(created.id, "migrated-task");
-        assert_eq!(user_version, 3);
+        assert_eq!(user_version, 4);
         assert!(version_recorded);
     }
 
@@ -2964,6 +3825,7 @@ mod migration_tests {
                     file_size: Some(5),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "available".to_string(),
                     tag_string: "cat".to_string(),
                     tag_string_general: "cat".to_string(),
@@ -2985,6 +3847,43 @@ mod migration_tests {
                 .name,
             "cat"
         );
+    }
+
+    #[test]
+    fn versioned_migration_adds_posted_at_to_existing_posts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial-post-time-v3.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, rating TEXT NOT NULL DEFAULT 'g');
+                 CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (1), (2), (3);
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let _database = Database::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let has_posted_at: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('posts') WHERE name='posted_at'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(has_posted_at);
+        assert_eq!(user_version, 4);
     }
 
     #[test]
@@ -3267,6 +4166,7 @@ mod migration_tests {
             file_size: Some(99),
             source: None,
             duration: None,
+            post_created_at: None,
             status: "available".to_string(),
             tag_string: "cat".to_string(),
             tag_string_general: "cat".to_string(),
@@ -3947,6 +4847,50 @@ mod migration_tests {
     }
 
     #[test]
+    fn source_directory_selection_excludes_internal_augmentation_rows_before_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-source-directory-selection-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        for (id, relative_path) in [
+            (
+                "augmentation",
+                "people/.augmentation/task/ready/train/portrait/images/a.png",
+            ),
+            ("source", "people/z-source.png"),
+        ] {
+            db.upsert_media_file(&MediaFileInput {
+                id: id.into(),
+                root_id: "root-1".into(),
+                post_id: None,
+                relative_path: relative_path.into(),
+                variant: "original".into(),
+                mime_type: "image/png".into(),
+                byte_size: 42,
+                sha256: None,
+                md5: None,
+                width: None,
+                height: None,
+                duration: None,
+            })
+            .unwrap();
+        }
+
+        let selected = db
+            .list_active_source_media_in_directory("root-1", "people", 1)
+            .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "source");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn library_empty_query_uses_bounded_cursor_pagination_with_total() {
         let path =
             std::env::temp_dir().join(format!("danbooru-library-page-{}.db", std::process::id()));
@@ -3996,6 +4940,25 @@ mod migration_tests {
             ["media-3", "media-4"]
         );
         assert_eq!(second.next_cursor.as_deref(), Some("media-4"));
+        let previous = db
+            .list_library_media_bidirectional(
+                "root-1",
+                second.previous_cursor.as_deref(),
+                true,
+                2,
+                "",
+                &LibraryMediaFilters::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            previous
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["media-1", "media-2"]
+        );
+        assert_eq!(first.catalog_revision, 1);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
@@ -4121,6 +5084,8 @@ mod migration_tests {
                     score_max: Some(9),
                     min_resolution: Some(512),
                     max_resolution: None,
+                    post_created_from: None,
+                    post_created_to: None,
                     relative_directory: None,
                 },
             )
@@ -4311,6 +5276,56 @@ mod migration_tests {
     }
 
     #[test]
+    fn library_post_created_time_filter_includes_both_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-library-post-time-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        db.create_root("root-1", "Library", None, Some("/media"))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO posts(id, posted_at) VALUES
+                    (1, 1704067200), (2, 1704153600), (3, 1704240000);
+                 INSERT INTO media_files(
+                    id, root_id, post_id, relative_path, variant, mime_type, byte_size
+                 ) VALUES
+                    ('media-1', 'root-1', 1, '1.jpg', 'original', 'image/jpeg', 1),
+                    ('media-2', 'root-1', 2, '2.jpg', 'original', 'image/jpeg', 1),
+                    ('media-3', 'root-1', 3, '3.jpg', 'original', 'image/jpeg', 1);",
+            )
+            .unwrap();
+        }
+
+        let page = db
+            .list_library_media_filtered(
+                "root-1",
+                None,
+                60,
+                "",
+                &LibraryMediaFilters {
+                    post_created_from: Some(1_704_153_600),
+                    post_created_to: Some(1_704_240_000),
+                    ..LibraryMediaFilters::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|media| media.id.as_str())
+                .collect::<Vec<_>>(),
+            ["media-2", "media-3"]
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn repeated_post_upsert_replaces_exact_tag_associations() {
         let path =
             std::env::temp_dir().join(format!("danbooru-post-upsert-{}.db", std::process::id()));
@@ -4330,6 +5345,7 @@ mod migration_tests {
             file_size: Some(42),
             source: Some("https://example.test/source".into()),
             duration: None,
+            post_created_at: None,
             status: "available".into(),
             tag_string: "cat blue_hair".into(),
             tag_string_general: "cat blue_hair".into(),
@@ -4402,6 +5418,46 @@ mod migration_tests {
     }
 
     #[test]
+    fn post_created_at_is_normalized_and_missing_updates_preserve_it() {
+        let path = std::env::temp_dir().join(format!(
+            "danbooru-post-created-at-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).unwrap();
+        let mut post = PostRecordInput {
+            id: 710,
+            md5: None,
+            rating: "g".to_string(),
+            score: 0,
+            fav_count: 0,
+            width: 100,
+            height: 100,
+            file_ext: Some("jpg".to_string()),
+            file_size: Some(1),
+            source: None,
+            duration: None,
+            post_created_at: Some("2024-01-02T11:04:05+08:00".to_string()),
+            status: "available".to_string(),
+            tag_string: String::new(),
+            tag_string_general: String::new(),
+            tag_string_character: String::new(),
+            tag_string_copyright: String::new(),
+            tag_string_artist: String::new(),
+            tag_string_meta: String::new(),
+        };
+
+        db.upsert_post_with_tags(&post, &[]).unwrap();
+        post.post_created_at = None;
+        db.upsert_post_with_tags(&post, &[]).unwrap();
+
+        let metadata = db.get_post_library_metadata(post.id).unwrap().unwrap();
+        assert_eq!(metadata.post_created_at, Some(1_704_164_645));
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn local_post_insert_preserves_existing_remote_metadata_and_tags() {
         let path = std::env::temp_dir().join(format!(
             "danbooru-local-post-preserve-{}.db",
@@ -4421,6 +5477,7 @@ mod migration_tests {
                 file_size: Some(2048),
                 source: Some("https://example.test/original".into()),
                 duration: None,
+                post_created_at: None,
                 status: "available".into(),
                 tag_string: "remote_tag".into(),
                 tag_string_general: "remote_tag".into(),
@@ -4446,6 +5503,7 @@ mod migration_tests {
                 file_size: Some(8),
                 source: None,
                 duration: None,
+                post_created_at: None,
                 status: "local".into(),
                 tag_string: "local_tag".into(),
                 tag_string_general: "local_tag".into(),
@@ -4521,6 +5579,7 @@ mod migration_tests {
                     file_size: Some(42),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "local".into(),
                     tag_string: "cat".into(),
                     tag_string_general: "cat".into(),
@@ -4544,6 +5603,7 @@ mod migration_tests {
                     file_size: Some(84),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "local".into(),
                     tag_string: "dog".into(),
                     tag_string_general: "dog".into(),
@@ -4623,6 +5683,7 @@ mod migration_tests {
                 file_size: Some(42),
                 source: None,
                 duration: None,
+                post_created_at: None,
                 status: "available".into(),
                 tag_string: "zeta alice cat".into(),
                 tag_string_general: "zeta cat".into(),
@@ -4857,5 +5918,21 @@ mod migration_tests {
         let db = Database::open(&directory.path().join("health.db")).unwrap();
 
         db.health_check().expect("SELECT probe should succeed");
+    }
+
+    #[test]
+    fn database_pool_keeps_reads_available_when_another_connection_is_checked_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::open(&directory.path().join("pool.db")).unwrap());
+        let held = db.conn.lock().unwrap();
+        let reader = db.clone();
+
+        let probe = std::thread::spawn(move || reader.health_check());
+
+        probe.join().unwrap().expect("a second pooled connection should serve the read");
+        drop(held);
+        let diagnostics = db.pool_diagnostics();
+        assert!(diagnostics.total >= 2);
+        assert_eq!(diagnostics.in_use, 0);
     }
 }

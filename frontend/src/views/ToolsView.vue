@@ -79,7 +79,11 @@ const datasetSmartCropRuntimeProfileId = ref('conda:lora')
 const datasetSmartCropGpuId = ref('0')
 const datasetSmartCropPortrait = ref(true)
 const datasetSmartCropUpperBody = ref(true)
+const datasetSmartCropCowboyShot = ref(true)
 const datasetSmartCropFullBody = ref(true)
+const datasetSmartCropLowerBody = ref(true)
+const datasetSmartCropFeet = ref(true)
+const datasetSmartCropRequireBothFeet = ref(false)
 const datasetRetagWithVllm = ref(false)
 const datasetPreserveArtistCharacterTags = ref(true)
 const visionCropHealth = ref<VisionCropRuntimeHealth | null>(null)
@@ -327,8 +331,12 @@ async function createSelectedTask(): Promise<void> {
           quality_profile: 'anime-quality',
           portrait: datasetSmartCropPortrait.value,
           upper_body: datasetSmartCropUpperBody.value,
+          cowboy_shot: datasetSmartCropCowboyShot.value,
           full_body_tight: datasetSmartCropFullBody.value,
-          max_derived_per_family: 3,
+          lower_body: datasetSmartCropLowerBody.value,
+          feet: datasetSmartCropFeet.value,
+          require_both_feet: datasetSmartCropRequireBothFeet.value,
+          max_derived_per_family: 6,
         },
         retagging: {
           send_to_vllm: datasetRetagWithVllm.value,
@@ -523,7 +531,15 @@ onMounted(async () => {
                 <span v-if="visionCropHealth" class="field-help">{{ visionCropHealth.ready ? `已就绪：${visionCropHealth.gpu_name ?? 'GPU'}；${visionCropHealth.providers.join(', ')}` : visionCropHealth.message }}</span>
                 <span v-else class="field-help">anime-quality；任务会再次检查 CUDA provider、可用显存与模型状态，不会回退到 CPU。</span>
               </div>
-              <div class="dataset-checkbox-grid"><label class="checkbox-row" for="dataset-smart-crop-portrait"><input id="dataset-smart-crop-portrait" v-model="datasetSmartCropPortrait" type="checkbox"> 生成肖像裁剪</label><label class="checkbox-row" for="dataset-smart-crop-upper-body"><input id="dataset-smart-crop-upper-body" v-model="datasetSmartCropUpperBody" type="checkbox"> 生成上半身裁剪</label><label class="checkbox-row" for="dataset-smart-crop-full-body"><input id="dataset-smart-crop-full-body" v-model="datasetSmartCropFullBody" type="checkbox"> 生成紧凑全身裁剪</label></div>
+              <div class="dataset-checkbox-grid">
+                <label class="checkbox-row" for="dataset-smart-crop-portrait"><input id="dataset-smart-crop-portrait" v-model="datasetSmartCropPortrait" type="checkbox"> 生成肖像裁剪</label>
+                <label class="checkbox-row" for="dataset-smart-crop-upper-body"><input id="dataset-smart-crop-upper-body" v-model="datasetSmartCropUpperBody" type="checkbox"> 生成上半身裁剪</label>
+                <label class="checkbox-row" for="dataset-smart-crop-cowboy"><input id="dataset-smart-crop-cowboy" v-model="datasetSmartCropCowboyShot" type="checkbox"> 生成牛仔视角裁剪</label>
+                <label class="checkbox-row" for="dataset-smart-crop-full-body"><input id="dataset-smart-crop-full-body" v-model="datasetSmartCropFullBody" type="checkbox"> 生成紧凑全身裁剪</label>
+                <label class="checkbox-row" for="dataset-smart-crop-lower-body"><input id="dataset-smart-crop-lower-body" v-model="datasetSmartCropLowerBody" type="checkbox"> 生成下半身裁剪</label>
+                <label class="checkbox-row" for="dataset-smart-crop-feet"><input id="dataset-smart-crop-feet" v-model="datasetSmartCropFeet" type="checkbox"> 生成脚部视角裁剪</label>
+              </div>
+              <label v-if="datasetSmartCropFeet" class="checkbox-row dataset-foot-quality" for="dataset-smart-crop-both-feet"><input id="dataset-smart-crop-both-feet" v-model="datasetSmartCropRequireBothFeet" type="checkbox"> 仅生成完整双脚（关闭时允许完整单脚）</label>
             </section>
 
             <section class="dataset-augmentation-section">

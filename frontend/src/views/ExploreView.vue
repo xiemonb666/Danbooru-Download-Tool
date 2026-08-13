@@ -395,8 +395,7 @@ async function downloadSelected(): Promise<void> {
     })
     selected.value = new Set()
     await tasks.loadSnapshot()
-    toast.success('下载任务已加入队列')
-    void router.push('/tasks')
+    toast.success('下载任务已加入队列', '可通过右下角任务概览查看进度。')
   } catch (reason: unknown) {
     toast.error('无法创建下载任务', reason instanceof Error ? reason.message : '未知错误')
   } finally {
@@ -443,8 +442,7 @@ async function downloadQuery(): Promise<void> {
     })
     batchHistory.value = saveBatchDownloadHistory(settings)
     await tasks.loadSnapshot()
-    toast.success('标签批量下载已加入队列')
-    void router.push('/tasks')
+    toast.success('标签批量下载已加入队列', '可继续调整条件，或通过任务概览查看进度。')
   } catch (reason: unknown) {
     toast.error('无法创建下载任务', reason instanceof Error ? reason.message : '未知错误')
   } finally {

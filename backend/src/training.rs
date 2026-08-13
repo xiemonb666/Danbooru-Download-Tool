@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 /// A model-specific trainer description.  The HTTP/UI layer deliberately uses
 /// this data instead of special-casing an SDXL checkpoint or command line.
@@ -4027,9 +4028,20 @@ pub fn parse_metric_line(line: &str) -> Result<Vec<TrainingMetric>, String> {
         .collect())
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GpuLeaseManager {
     state: Arc<Mutex<GpuLeaseState>>,
+    changes: watch::Sender<u64>,
+}
+
+impl Default for GpuLeaseManager {
+    fn default() -> Self {
+        let (changes, _) = watch::channel(0);
+        Self {
+            state: Arc::new(Mutex::new(GpuLeaseState::default())),
+            changes,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4125,8 +4137,27 @@ impl GpuLeaseManager {
 
     pub fn release(&self, task_id: &str) {
         let mut state = self.state.lock().expect("GPU lease lock poisoned");
+        let held_before = state.held.len();
+        let waiting_before = state.waiting.len();
         state.held.retain(|_, owner| owner != task_id);
         state.waiting.remove(task_id);
+        let changed = held_before != state.held.len() || waiting_before != state.waiting.len();
+        drop(state);
+        if changed {
+            self.changes.send_modify(|generation| {
+                *generation = generation.saturating_add(1);
+            });
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub fn notify_waiters(&self) {
+        self.changes.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
     }
 
     pub fn blockers(&self, _profile: &str, gpu_ids: &[String]) -> Vec<String> {
@@ -4258,6 +4289,24 @@ mod tests {
         assert_eq!(snapshot[1].task_id, "second");
         assert_eq!(snapshot[1].queue_position, 2);
         assert_eq!(snapshot[1].blocker_task_ids, vec!["first"]);
+    }
+
+    #[tokio::test]
+    async fn releasing_a_gpu_wakes_waiters_without_a_polling_interval() {
+        let leases = GpuLeaseManager::default();
+        let gpu_zero = vec!["0".to_string()];
+        assert!(leases.try_acquire("holder", "windows", &gpu_zero));
+        leases.register_waiting("waiter", "windows", &gpu_zero);
+        assert!(!leases.try_acquire("waiter", "windows", &gpu_zero));
+        let mut changes = leases.subscribe();
+
+        leases.release("holder");
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), changes.changed())
+            .await
+            .expect("GPU release should wake the queue")
+            .expect("GPU lease notification channel should stay open");
+        assert!(leases.try_acquire("waiter", "windows", &gpu_zero));
     }
 
     #[test]

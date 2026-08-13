@@ -44,6 +44,17 @@ describe('generated OpenAPI contracts', () => {
     const usesGeneratedPost: Equal<DanbooruPost, components['schemas']['DanbooruPost']> = true
     const usesGeneratedLocalMedia: Equal<LocalMedia, components['schemas']['LocalMedia']> = true
     const usesGeneratedHealth: Equal<HealthStatus, components['schemas']['HealthStatus']> = true
+    const smartCrop = {
+      enabled: true,
+      portrait: true,
+      upper_body: true,
+      cowboy_shot: true,
+      full_body_tight: true,
+      lower_body: true,
+      feet: true,
+      require_both_feet: false,
+      max_derived_per_family: 6,
+    } satisfies components['schemas']['SmartCropTaskOptions']
     expect(config.download_concurrency).toBe(8)
     expect(usesGeneratedContract).toBe(true)
     expect(usesGeneratedTaskDetails).toBe(true)
@@ -51,6 +62,7 @@ describe('generated OpenAPI contracts', () => {
     expect(usesGeneratedPost).toBe(true)
     expect(usesGeneratedLocalMedia).toBe(true)
     expect(usesGeneratedHealth).toBe(true)
+    expect(Object.keys(smartCrop).filter(key => key !== 'enabled' && key !== 'max_derived_per_family' && key !== 'require_both_feet')).toHaveLength(6)
   })
 })
 

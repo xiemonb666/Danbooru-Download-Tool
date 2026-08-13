@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import App from './App.vue'
 
 vi.mock('./stores/config', () => ({
-  useConfigStore: () => ({ load: vi.fn() }),
+  useConfigStore: () => ({
+    config: { background_image: '', background_opacity: 18 },
+    loaded: true,
+    load: vi.fn(),
+  }),
 }))
 
 vi.mock('./stores/tasks', () => ({

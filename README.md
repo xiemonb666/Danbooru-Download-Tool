@@ -115,40 +115,45 @@ HEIC 转换另需将 `heif-convert` 放入 `PATH`。缺失时该任务会失败�
 
 ### 输出与训练门控
 
-每个任务大致生成如下结构：
+任务不会创建 `dataset-expanded`，也不会再复制一份 `original`。原图和原 Caption 始终留在所选源目录；同目录下只增加隐藏的图片工作区与独立元数据工作区：
 
 ```text
-dataset-expanded/<task-id>/
-├── raw/
-│   ├── images/                 # 保留原格式的原图副本
-│   └── labels/                 # 原图 Caption
-├── derived/
-│   ├── horizontal_flip/images/
-│   ├── portrait/images/
-│   ├── upper_body/images/
-│   └── full_body_tight/images/
-├── ready/
-│   ├── train/ validation/ test/
-│   └── .../<variant>/images/   # 仅可安全训练的派生子集
-├── metadata/
-│   ├── dataset.jsonl
-│   ├── families.jsonl
-│   ├── retagging.jsonl
-│   └── training-subsets.json
-├── splits/
-├── rejected/rejections.jsonl
-└── READY.json
+<原数据目录>/
+├── image.png / image.txt              # 原图与原标签：原地保留，不复制
+├── .augmentation/<task-id>/
+│   ├── derived/                         # 无损主副本，通用工具不可改写
+│   │   ├── horizontal_flip/images/
+│   │   ├── portrait/images/
+│   │   ├── upper_body/images/
+│   │   ├── cowboy_shot/images/
+│   │   ├── full_body_tight/images/
+│   │   ├── lower_body/images/
+│   │   └── feet/images/
+│   └── ready/<split>/<variant>/images/  # 仅已写入新 Caption 的训练副本
+└── .augmentation-metadata/<task-id>/
+    ├── INCOMPLETE.json 或 READY.json
+    ├── metadata/
+    │   ├── config.json
+    │   ├── dataset.jsonl
+    │   ├── families.jsonl
+    │   ├── retagging.jsonl
+    │   ├── smart-crop-evaluations.jsonl
+    │   └── training-subsets.json
+    ├── splits/
+    └── rejected/rejections.jsonl
 ```
 
-任务创建时先写入 `INCOMPLETE.json`；只有正常完成才生成 `READY.json`。训练页面会拒绝不完整输出。
+任务创建时先写入 `.augmentation-metadata/<task-id>/INCOMPLETE.json`；只有正常完成才用 `READY.json` 取代它。训练页面只发现完整且 Caption 齐全的 `ready` 子集。
 
-- 原图保留原文件和原 Caption，可直接进入 `ready`。
-- 翻转、肖像、上半身与紧凑全身等派生图统一以**无损 PNG**保存，避免二次 JPEG 压缩丢失细节。
-- 派生图不会复制原 Caption，因为构图变化后原标签可能已不匹配。它们会被标记为 `requires_retagging=true`，记录到 `metadata/retagging.jsonl`，且不会进入 `ready`。
+- 原图与原 Caption 不进入增广工作区。训练导入会直接引用源目录，并把同目录下发现的 `ready` 目录绑定为独立子集。
+- 翻转和六类智能裁剪派生图统一以**无损 PNG**保存，保持原生像素，不非等比缩放，也不为 bucket 预先缩放。
+- `derived` 是最高质量主副本，禁止缩放、标签流水线或普通打标等通用任务直接改写。需要后处理时显式选择相应的 `ready` 子文件夹；标签流水线、缩放和普通 vLLM 打标均支持明确选中的 `ready` 目录。
+- 派生图不会复制原 Caption，因为构图变化后原标签可能已不匹配。它们会被标记为 `requires_retagging=true`，记录到 `.augmentation-metadata/<task-id>/metadata/retagging.jsonl`，且不会直接进入 `ready`。
 - 可在创建任务时选择“发送派生图到 vLLM 二次打标”。仅 vLLM 真正写入非空新 Caption 的派生图才会进入相应 `ready/<split>/<variant>/images` 子集；失败项保持待打标，不会回退使用原标签。
 - 可选择将原图的 artist / character 标签放在 vLLM 新标签最前，保持逗号分隔并去重。
-- `metadata/dataset.jsonl` 记录原生尺寸、推荐 bucket、切分、来源、family 与重打标状态。bucket 仅作为训练建议，任务不缩放图片来匹配 bucket，更不会非等比拉伸。
+- `.augmentation-metadata/<task-id>/metadata/dataset.jsonl` 记录原生尺寸、推荐 bucket、切分、来源、family 与重打标状态。bucket 仅作为训练建议。
 - 通过稳定的 `family_id` 分配 train / validation / test。同源原图、翻转和裁剪始终位于同一 split，不会发生 family 泄漏。
+- 图库默认不会把隐藏工作区混入源目录列表；进入具体 `.augmentation/.../ready/...` 文件夹后可单独预览和处理。训练导入会自动发现每个已就绪变体，并允许分别设置 repeat、Caption 扩展名以及启用状态。
 
 ### GPU 动漫检测、分割与裁剪
 
@@ -163,17 +168,26 @@ dataset-expanded/<task-id>/
 - 单主体可信时使用 ISNet 动漫前景分割作为保护边界；
 - HumanArt 人物检测与 RTMPose，检查躯干、脚踝和人物边缘截断。
 
-Rust 端会关联同一主体的检测结果，最多尝试肖像、上半身、紧凑全身三种构图。候选必须满足原生分辨率、构图比例与明显裁剪幅度，并完整保留高置信脸、头部、手部及相应的完整身体关键点。多人严重重叠、第二人明显进入候选框、主体太小、关键部位可能被切断、姿态不完整或候选接近原图时，系统宁可拒绝，原因会写入 `rejected/rejections.jsonl`。
+Rust 端会关联同一主体的检测结果，并为六类构图独立生成、评分和记录拒绝原因：
+
+- `portrait`：头部与上胸为主的真正肖像；
+- `upper_body`：保留头部、躯干和腰部的上半身；
+- `cowboy_shot`：从头部至大腿/膝部附近的牛仔视角；
+- `full_body_tight`：依据完整姿态紧凑保留全身；
+- `lower_body`：依据髋、膝、踝等下半身关键点构图；
+- `feet`：以踝、脚跟与脚趾证据保留完整脚部。默认允许画面中只有一只可靠完整脚；开启“必须完整双脚”后才要求双脚都完整。
+
+六个构图都有显式开关，每个 family 的智能裁剪上限默认为 6。候选必须满足原生分辨率、构图比例与明显裁剪幅度，并保护该构图所需的高置信脸、头部、手部或身体关键点。多人严重重叠、第二人明显进入候选框、主体太小、关键部位可能被切断、姿态证据不足或候选接近原图时，系统宁可拒绝。逐图逐构图的结果与原因写入 `smart-crop-evaluations.jsonl`，聚合统计在任务详情中可见。
 
 智能裁剪与 LoRA 训练使用同一 GPU 独占队列。检测预检发现显存不足或有外部进程占用时会提示释放显存；应用不会终止外部 vLLM 或其他进程。
 
 ### 推荐的正式 LoRA 工作流
 
 1. 注册并索引原始数据集；先在图库检查分辨率、损坏图片和重复图。
-2. 在“工具 → 数据集增广”选择源目录，保留默认严格门槛，按需要启用翻转和三种裁剪。
+2. 在“工具 → 数据集增广”选择源目录，保留默认严格门槛，按需要启用翻转和六类智能裁剪。
 3. 需要派生图时，启用 vLLM 二次打标；想保留身份信息时勾选 artist / character 前置。
-4. 在任务结果中查看 `retagging_pending` 和 `training-subsets.json`。未重新打标的派生图应继续保留在待处理状态，不能作为训练输入。
-5. 在“训练 → 从图库引用”中选择 `ready/train/images` 与需要的 `ready/train/<variant>/images`。每个目录作为独立子集，分别设置 repeat 与 Caption 扩展名；应用会生成多 `[[datasets.subsets]]` 的训练配置，不复制这些文件。
+4. 在任务详情中查看每种构图的请求数、生成数、拒绝数、主要拒绝原因和平均保留面积；未重新打标的派生图不能作为训练输入。
+5. 在“训练 → 从图库引用”选择原数据目录。应用会直接引用原图，并自动发现 `.augmentation/<task-id>/ready/train/<variant>/images`。原数据集和每个裁剪子集都可单独设置 repeat 与 Caption 扩展名；应用会生成多 `[[datasets.subsets]]` 训练配置，不复制这些文件。
 6. 选择底模、运行时与 GPU，先运行诊断；训练进入 GPU 独占队列后，在训练监控页查看日志、指标、样图与产物。
 
 ## vLLM 图片打标
@@ -181,6 +195,13 @@ Rust 端会关联同一主体的检测结果，最多尝试肖像、上半身、
 vLLM 是可选功能。可以在“设置 → 本地服务”按需加载，也可设置 `START_VLLM=1` 交给启动器尝试后台加载。默认端点为 `http://127.0.0.1:8000/v1`。
 
 常规图库打标可由设置决定语言、系统提示词、最大标签数、并发、Danbooru 校验以及覆盖/追加写入模式。数据集增广的二次打标始终以覆盖方式写入全新派生 Caption，不引用原 Caption，避免把裁剪前的描述带入新样本。
+
+常规 vLLM 打标和增广二次打标共用同一套生命周期管理：
+
+- 任务开始前配置模型未就绪时，应用自动启动本地 vLLM 并等待该模型出现；
+- 并发打标任务共享同一运行时，只有最后一个任务释放且模型是由应用自动启动时，才会自动卸载以腾出显存；
+- 任务前已加载的模型保持驻留，不会在任务结束时被自动卸载；
+- “手动加载”会将模型设为保持驻留。“卸载 vLLM 模型”按钮只停止由本应用启动的进程，且打标租约仍在使用时会拒绝卸载，不会强制终止外部 vLLM。
 
 ## API 概览
 

@@ -1,10 +1,12 @@
 import { fireEvent, render, waitFor, within } from '@testing-library/vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import LibraryView from './LibraryView.vue'
+import { LIBRARY_VIEW_STATE_KEY } from '../utils/libraryViewState'
 
 const mocks = vi.hoisted(() => ({
   createTask: vi.fn(),
   getLibrary: vi.fn(),
+  getLibraryFacets: vi.fn(),
   getLibraryItem: vi.fn(),
   getMediaDirectories: vi.fn(),
   getMediaRoots: vi.fn(),
@@ -16,11 +18,14 @@ const mocks = vi.hoisted(() => ({
   error: vi.fn(),
   warning: vi.fn(),
   blurSensitiveMedia: true,
+  routeQuery: {} as Record<string, string>,
+  leaveGuard: undefined as undefined | (() => void),
 }))
 
 vi.mock('../api', () => ({
   createTask: mocks.createTask,
   getLibrary: mocks.getLibrary,
+  getLibraryFacets: mocks.getLibraryFacets,
   getLibraryItem: mocks.getLibraryItem,
   getMediaDirectories: mocks.getMediaDirectories,
   getMediaRoots: mocks.getMediaRoots,
@@ -44,8 +49,9 @@ vi.mock('../stores/toast', () => ({
 }))
 
 vi.mock('vue-router', () => ({
-  useRoute: () => ({ query: {} }),
+  useRoute: () => ({ get query() { return mocks.routeQuery } }),
   useRouter: () => ({ replace: mocks.replace, push: mocks.push }),
+  onBeforeRouteLeave: (guard: () => void) => { mocks.leaveGuard = guard },
 }))
 
 const root = {
@@ -84,12 +90,22 @@ const items = [
 
 describe('LibraryView batch actions', () => {
   beforeEach(() => {
+    sessionStorage.clear()
+    mocks.routeQuery = {}
+    mocks.leaveGuard = undefined
     mocks.blurSensitiveMedia = true
     mocks.getLibrary.mockReset()
+    mocks.getLibraryFacets.mockReset()
     mocks.getMediaDirectories.mockReset()
     mocks.getMediaRoots.mockResolvedValue([root])
     mocks.getMediaDirectories.mockResolvedValue({ directories: [], truncated: false })
     mocks.getLibrary.mockResolvedValue({ items, total: items.length })
+    mocks.getLibraryFacets.mockResolvedValue({
+      catalog_revision: 1,
+      total: items.length,
+      score_ranges: [],
+      resolution_ranges: [],
+    })
     mocks.getLibraryItem.mockReset()
     mocks.getLibraryItem.mockImplementation(async (id: string) => items.find((item) => item.id === id))
     mocks.error.mockReset()
@@ -97,6 +113,111 @@ describe('LibraryView batch actions', () => {
     vi.stubGlobal('scrollTo', mocks.scrollTo)
     mocks.createTask.mockResolvedValue(undefined)
     mocks.loadSnapshot.mockResolvedValue(undefined)
+  })
+
+  it('restores a saved browsing batch, ordinary selection, and scroll position', async () => {
+    mocks.getMediaDirectories.mockResolvedValue({ directories: ['人物/爱丽丝'], truncated: false })
+    mocks.getLibraryFacets.mockResolvedValue({
+      catalog_revision: 1,
+      total: 1,
+      score_ranges: [{ score_min: 10, score_max: 19, count: 1 }],
+      resolution_ranges: [{ resolution_min: 1024, resolution_max: 2047, count: 1 }],
+    })
+    mocks.getLibrary.mockResolvedValue({
+      items: [items[1]], total: 2, previous_cursor: 'media-2', catalog_revision: 1,
+    })
+    sessionStorage.setItem(LIBRARY_VIEW_STATE_KEY, JSON.stringify({
+      version: 1,
+      rootId: root.id,
+      directory: '人物/爱丽丝',
+      query: 'saved_tag',
+      scoreRange: '10:19',
+      resolutionRange: '1024:2047',
+      cursor: 'media-1',
+      before: false,
+      cursorDepth: 4,
+      scrollY: 640,
+      selectedIds: ['media-2'],
+      selectedMedia: [items[1]],
+      allMatchingSelected: false,
+      allMatchingTotal: 0,
+      selectedQuery: '',
+      excludedMediaIds: [],
+    }))
+
+    const view = render(LibraryView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '人物/爱丽丝',
+      query: 'saved_tag',
+      cursor: 'media-1',
+      before: false,
+      scoreMin: 10,
+      scoreMax: 19,
+      resolutionMin: 1024,
+      resolutionMax: 2047,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+    expect(view.getByPlaceholderText('精确标签，例如：1girl landscape（所有标签都必须匹配）')).toHaveValue('saved_tag')
+    await view.findByRole('option', { name: '10–19（1 项）' })
+    expect(view.getByRole('combobox', { name: '评分区间' })).toHaveValue('10:19')
+    expect(view.getByRole('combobox', { name: '分辨率区间' })).toHaveValue('1024:2047')
+    expect(view.getByRole('checkbox', { name: '选择 two.png' })).toBeChecked()
+    expect(view.getByText('已选择 1 项')).toBeVisible()
+    expect(view.getByText('第 4 批 · 共 2 项')).toBeVisible()
+    await waitFor(() => expect(mocks.scrollTo).toHaveBeenCalledWith({ top: 640, behavior: 'auto' }))
+  })
+
+  it('restores an all-matching selection with its excluded media IDs', async () => {
+    sessionStorage.setItem(LIBRARY_VIEW_STATE_KEY, JSON.stringify({
+      version: 1,
+      rootId: root.id,
+      directory: '',
+      query: 'saved_tag',
+      scoreRange: '0:9',
+      resolutionRange: '512:1023',
+      cursor: '',
+      before: false,
+      cursorDepth: 1,
+      scrollY: 0,
+      selectedIds: [],
+      selectedMedia: [],
+      allMatchingSelected: true,
+      allMatchingTotal: 120,
+      selectedQuery: 'saved_tag',
+      selectedScoreMin: 0,
+      selectedScoreMax: 9,
+      selectedResolutionMin: 512,
+      selectedResolutionMax: 1023,
+      excludedMediaIds: ['media-2'],
+    }))
+    mocks.getLibrary.mockResolvedValue({ items, total: 120, catalog_revision: 1 })
+
+    const view = render(LibraryView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    expect(await view.findByText('已选择 119 项')).toBeVisible()
+    expect(view.getByRole('checkbox', { name: '选择 one.jpg' })).toBeChecked()
+    expect(view.getByRole('checkbox', { name: '选择 two.png' })).not.toBeChecked()
+    await fireEvent.click(view.getByRole('button', { name: '安全缩放所选' }))
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'resize',
+      root_id: root.id,
+      options: {
+        library_query: 'saved_tag',
+        library_relative_directory: '',
+        library_score_min: 0,
+        library_score_max: 9,
+        library_resolution_min: 512,
+        library_resolution_max: 1023,
+        excluded_media_ids: ['media-2'],
+        max_size: 1216,
+      },
+    })
   })
 
   it('creates a resize task from individually selected media IDs', async () => {
@@ -133,7 +254,12 @@ describe('LibraryView batch actions', () => {
     expect(mocks.createTask).toHaveBeenCalledWith({
       type: 'resize',
       root_id: root.id,
-      options: { library_query: '', excluded_media_ids: [], max_size: 1216 },
+      options: {
+        library_query: '',
+        library_relative_directory: '',
+        excluded_media_ids: [],
+        max_size: 1216,
+      },
     })
   })
 
@@ -153,7 +279,11 @@ describe('LibraryView batch actions', () => {
     expect(mocks.createTask).toHaveBeenCalledWith({
       type: 'tag_pipeline',
       root_id: root.id,
-      options: { library_query: '', excluded_media_ids: ['media-2'] },
+      options: {
+        library_query: '',
+        library_relative_directory: '',
+        excluded_media_ids: ['media-2'],
+      },
     })
   })
 
@@ -190,11 +320,11 @@ describe('LibraryView batch actions', () => {
     })
   })
 
-  it('follows numbered pages and returns to the previous page', async () => {
+  it('follows bidirectional cursors and returns to the previous batch', async () => {
     mocks.getLibrary
-      .mockResolvedValueOnce({ items: [items[0]], total: 2, page: 1, total_pages: 2, score_ranges: [] })
-      .mockResolvedValueOnce({ items: [items[1]], total: 2, page: 2, total_pages: 2, score_ranges: [] })
-      .mockResolvedValueOnce({ items: [items[0]], total: 2, page: 1, total_pages: 2, score_ranges: [] })
+      .mockResolvedValueOnce({ items: [items[0]], total: 2, next_cursor: 'media-1', catalog_revision: 1 })
+      .mockResolvedValueOnce({ items: [items[1]], total: 2, previous_cursor: 'media-2', catalog_revision: 1 })
+      .mockResolvedValueOnce({ items: [items[0]], total: 2, next_cursor: 'media-1', catalog_revision: 1 })
     const view = render(LibraryView, {
       global: {
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
@@ -202,25 +332,24 @@ describe('LibraryView batch actions', () => {
     })
     expect(await view.findByRole('img', { name: 'one.jpg' })).toBeVisible()
 
-    await fireEvent.click(view.getByRole('button', { name: '下一页' }))
+    await fireEvent.click(view.getByRole('button', { name: '下一批' }))
 
     expect(mocks.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' })
     expect(mocks.getLibrary).toHaveBeenLastCalledWith({
-      rootId: root.id, directory: '', query: '', page: 2, limit: 60,
+      rootId: root.id, directory: '', query: '', cursor: 'media-1', before: false, limit: 60,
     }, expect.any(AbortSignal))
     expect(await view.findByRole('img', { name: 'two.png' })).toBeVisible()
-    await fireEvent.click(view.getByRole('button', { name: '上一页' }))
+    await fireEvent.click(view.getByRole('button', { name: '上一批' }))
     expect(mocks.getLibrary).toHaveBeenLastCalledWith({
-      rootId: root.id, directory: '', query: '', page: 1, limit: 60,
+      rootId: root.id, directory: '', query: '', cursor: 'media-2', before: true, limit: 60,
     }, expect.any(AbortSignal))
     expect(await view.findByRole('img', { name: 'one.jpg' })).toBeVisible()
   })
 
-  it('filters by a dynamic score interval and jumps directly to a page', async () => {
+  it('filters by a dynamic score interval without offset pagination', async () => {
     mocks.getLibrary.mockResolvedValue({
       items,
       total: 120,
-      page: 1,
       total_pages: 2,
       score_ranges: [{ score_min: 0, score_max: 9, count: 80 }],
     })
@@ -236,32 +365,18 @@ describe('LibraryView batch actions', () => {
       rootId: root.id,
       directory: '',
       query: '',
-      page: 1,
       scoreMin: 0,
       scoreMax: 9,
       limit: 60,
     }, expect.any(AbortSignal)))
 
-    await fireEvent.update(view.getByLabelText('跳转至页码'), '2')
-    await fireEvent.click(view.getByRole('button', { name: '跳转' }))
-
-    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
-      rootId: root.id,
-      directory: '',
-      query: '',
-      page: 2,
-      scoreMin: 0,
-      scoreMax: 9,
-      limit: 60,
-    }, expect.any(AbortSignal)))
-    expect(view.getByText(/共 2 页/)).toBeVisible()
+    expect(view.queryByLabelText('跳转至页码')).not.toBeInTheDocument()
   })
 
   it('filters by a dynamic resolution interval instead of a fixed minimum', async () => {
     mocks.getLibrary.mockResolvedValue({
       items,
       total: 80,
-      page: 1,
       total_pages: 2,
       score_ranges: [],
       resolution_ranges: [{ resolution_min: 512, resolution_max: 1023, count: 80 }],
@@ -279,18 +394,93 @@ describe('LibraryView batch actions', () => {
       rootId: root.id,
       directory: '',
       query: '',
-      page: 1,
       resolutionMin: 512,
       resolutionMax: 1023,
       limit: 60,
     }, expect.any(AbortSignal)))
   })
 
+  it('filters posts by inclusive local publication dates', async () => {
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+    const from = new Date(2026, 0, 2)
+    const afterTo = new Date(2026, 0, 4)
+
+    await fireEvent.update(await view.findByLabelText('帖子发布日期起'), '2026-01-02')
+    await fireEvent.update(view.getByLabelText('帖子发布日期止'), '2026-01-03')
+
+    await waitFor(() => expect(mocks.getLibrary).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: '',
+      postCreatedFrom: from.getTime() / 1_000,
+      postCreatedTo: afterTo.getTime() / 1_000 - 1,
+      limit: 60,
+    }, expect.any(AbortSignal)))
+    expect(mocks.getLibraryFacets).toHaveBeenLastCalledWith({
+      rootId: root.id,
+      directory: '',
+      query: '',
+      postCreatedFrom: from.getTime() / 1_000,
+      postCreatedTo: afterTo.getTime() / 1_000 - 1,
+    })
+  })
+
+  it('rejects a reversed post publication range before requesting the library', async () => {
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+    await view.findByLabelText('帖子发布日期起')
+    const requestsBeforeChange = mocks.getLibrary.mock.calls.length
+
+    await fireEvent.update(view.getByLabelText('帖子发布日期止'), '2026-01-02')
+    await fireEvent.update(view.getByLabelText('帖子发布日期起'), '2026-01-03')
+
+    expect(view.getByRole('alert')).toHaveTextContent('起始日期不能晚于结束日期')
+    expect(mocks.warning).toHaveBeenCalledWith('发布时间范围无效', '起始日期不能晚于结束日期。')
+    expect(mocks.getLibrary).toHaveBeenCalledTimes(requestsBeforeChange + 1)
+  })
+
+  it('does not send a reversed publication range restored from the session', async () => {
+    sessionStorage.setItem(LIBRARY_VIEW_STATE_KEY, JSON.stringify({
+      version: 1,
+      rootId: root.id,
+      directory: '',
+      query: '',
+      scoreRange: '',
+      resolutionRange: '',
+      postCreatedFromDate: '2026-01-03',
+      postCreatedToDate: '2026-01-02',
+      cursor: '',
+      before: false,
+      cursorDepth: 1,
+      scrollY: 0,
+      selectedIds: [],
+      selectedMedia: [],
+      allMatchingSelected: false,
+      allMatchingTotal: 0,
+      selectedQuery: '',
+      excludedMediaIds: [],
+    }))
+
+    const view = render(LibraryView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+
+    expect(await view.findByRole('alert')).toHaveTextContent('起始日期不能晚于结束日期')
+    expect(mocks.getLibrary).not.toHaveBeenCalled()
+    expect(mocks.getLibraryFacets).not.toHaveBeenCalled()
+  })
+
   it('keeps the active score and resolution filters when selecting every matching item', async () => {
     mocks.getLibrary.mockResolvedValue({
       items,
       total: 120,
-      page: 1,
       total_pages: 2,
       score_ranges: [{ score_min: 0, score_max: 9, count: 80 }],
       resolution_ranges: [{ resolution_min: 512, resolution_max: 1023, count: 80 }],
@@ -312,10 +502,40 @@ describe('LibraryView batch actions', () => {
       root_id: root.id,
       options: {
         library_query: '',
+        library_relative_directory: '',
         library_score_min: 0,
         library_score_max: 9,
         library_resolution_min: 512,
         library_resolution_max: 1023,
+        excluded_media_ids: [],
+        max_size: 1216,
+      },
+    })
+  })
+
+  it('keeps the post publication range when selecting every matching item', async () => {
+    mocks.getLibrary.mockResolvedValue({ items, total: 120 })
+    const view = render(LibraryView, {
+      global: {
+        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+      },
+    })
+    const from = new Date(2026, 0, 2).getTime() / 1_000
+    const afterTo = new Date(2026, 0, 4).getTime() / 1_000
+
+    await fireEvent.update(await view.findByLabelText('帖子发布日期起'), '2026-01-02')
+    await fireEvent.update(view.getByLabelText('帖子发布日期止'), '2026-01-03')
+    await fireEvent.click(view.getByRole('checkbox', { name: '全选搜索结果' }))
+    await fireEvent.click(view.getByRole('button', { name: '安全缩放所选' }))
+
+    expect(mocks.createTask).toHaveBeenCalledWith({
+      type: 'resize',
+      root_id: root.id,
+      options: {
+        library_query: '',
+        library_relative_directory: '',
+        library_post_created_from: from,
+        library_post_created_to: afterTo - 1,
         excluded_media_ids: [],
         max_size: 1216,
       },
@@ -404,9 +624,9 @@ describe('LibraryView batch actions', () => {
     })
     expect(mocks.success).toHaveBeenCalledWith(
       '删除任务已加入队列',
-      '请在任务页确认后，所选媒体及同名标签文件会移入隔离区，可在隔离区恢复。',
+      '请通过任务概览审阅确认；确认后媒体及同名标签文件会移入隔离区，可在隔离区恢复。',
     )
-    expect(mocks.push).toHaveBeenCalledWith('/tasks')
+    expect(mocks.push).not.toHaveBeenCalledWith('/tasks')
   })
 
   it('disables HEIC conversion with an accessible reason for mixed formats', async () => {
@@ -583,7 +803,6 @@ describe('LibraryView batch actions', () => {
       rootId: root.id,
       directory: '',
       query: 'character_exact',
-      page: 1,
       limit: 60,
     }, expect.any(AbortSignal)))
     expect(view.queryByRole('dialog', { name: 'one.jpg' })).not.toBeInTheDocument()
@@ -608,7 +827,6 @@ describe('LibraryView batch actions', () => {
       rootId: root.id,
       directory: '',
       query: 'existing_tag character_exact',
-      page: 1,
       limit: 60,
     }, expect.any(AbortSignal)))
   })

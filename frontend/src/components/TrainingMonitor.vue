@@ -45,6 +45,7 @@ const smoothing = ref(0)
 const zoomLevel = ref(1)
 const logs = ref('')
 const logsLoading = ref(false)
+let logCursor = 0
 const artifacts = ref<TrainingArtifact[]>([])
 const artifactsLoading = ref(false)
 const lightboxArtifact = ref<TrainingArtifact | null>(null)
@@ -354,7 +355,12 @@ async function loadArtifacts(): Promise<void> {
 async function loadLogs(): Promise<void> {
   logsLoading.value = true
   try {
-    logs.value = (await getTrainingLogs(props.taskId)).text
+    const response = await getTrainingLogs(props.taskId, { after: logCursor, limit: 256 * 1024 })
+    logCursor = response.cursor
+    if (response.text) {
+      const merged = logs.value + response.text
+      logs.value = merged.length > 1_000_000 ? merged.slice(-1_000_000) : merged
+    }
   } catch {
     // Metrics remain useful even when a runner has not produced console output.
   } finally {
@@ -455,6 +461,8 @@ function refresh(): void {
 
 watch(() => [props.taskId, props.active, props.visible], () => {
   stopMonitorActivity()
+  logs.value = ''
+  logCursor = 0
   if (props.visible) void loadMonitor()
 }, { immediate: true })
 watch([focusPoints, axisMode, smoothing, lineColor], scheduleChartRender)

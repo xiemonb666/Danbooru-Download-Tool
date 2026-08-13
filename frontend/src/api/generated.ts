@@ -95,6 +95,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/diagnostics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["diagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/downloads/history": {
         parameters: {
             query?: never;
@@ -119,6 +135,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["health"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/library/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_facets"];
         put?: never;
         post?: never;
         delete?: never;
@@ -457,6 +489,22 @@ export interface paths {
         get: operations["training_path_browser"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/training/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["training_preflight"];
         delete?: never;
         options?: never;
         head?: never;
@@ -948,12 +996,28 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        ApiSuccess_LibraryFacets: {
+            data: {
+                /** Format: int64 */
+                catalog_revision: number;
+                resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
+                score_ranges: components["schemas"]["LibraryScoreRange"][];
+                /** Format: int64 */
+                total: number;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
         ApiSuccess_LibraryPage: {
             data: {
+                /** Format: int64 */
+                catalog_revision: number;
                 items: components["schemas"]["LocalMedia"][];
                 next_cursor?: string | null;
                 /** Format: int64 */
                 page: number;
+                previous_cursor?: string | null;
                 resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
                 score_ranges: components["schemas"]["LibraryScoreRange"][];
                 /** Format: int64 */
@@ -975,6 +1039,7 @@ export interface components {
                 height?: number | null;
                 id: string;
                 mime_type: string;
+                post_created_at?: string | null;
                 /** Format: int64 */
                 post_id?: number | null;
                 rating?: null | components["schemas"]["ContentRating"];
@@ -1102,6 +1167,20 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        ApiSuccess_SystemDiagnostics: {
+            data: {
+                active_workers: number;
+                database_pool: components["schemas"]["DatabasePoolDiagnostics"];
+                queued_tasks: number;
+                scheduler: {
+                    [key: string]: components["schemas"]["SchedulerResourceDiagnostics"];
+                };
+                thumbnail_cache: components["schemas"]["ThumbnailCacheDiagnostics"];
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
         ApiSuccess_TaskDetails: {
             data: {
                 item_counts: components["schemas"]["TaskItemCounts"];
@@ -1134,6 +1213,7 @@ export interface components {
                 progress: components["schemas"]["TaskProgress"];
                 /** Format: int64 */
                 revision: number;
+                scheduling: components["schemas"]["TaskScheduling"];
                 status: components["schemas"]["TaskStatus"];
                 title: string;
                 training?: null | components["schemas"]["TrainingTaskSummary"];
@@ -1201,7 +1281,10 @@ export interface components {
         };
         ApiSuccess_TrainingLogsResponse: {
             data: {
+                /** Format: int64 */
+                cursor: number;
                 text: string;
+                truncated: boolean;
             };
             meta?: {
                 [key: string]: unknown;
@@ -1233,6 +1316,20 @@ export interface components {
                 directories: components["schemas"]["TrainingPathEntry"][];
                 files: components["schemas"]["TrainingPathEntry"][];
                 parent_path?: string | null;
+            };
+            meta?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        ApiSuccess_TrainingPreflightResponse: {
+            data: {
+                checks: components["schemas"]["TrainingPreflightCheck"][];
+                /** Format: int64 */
+                effective_steps: number;
+                /** Format: int64 */
+                estimated_vram_mib: number;
+                ready: boolean;
+                suggestions: components["schemas"]["TrainingParameterSuggestion"][];
             };
             meta?: {
                 [key: string]: unknown;
@@ -1505,7 +1602,7 @@ export interface components {
         CreateMediaDirectoryRequest: {
             relative_path: string;
         };
-        CreateTaskRequest: components["schemas"]["DownloadTaskRequest"] | components["schemas"]["IndexLibraryTaskRequest"] | components["schemas"]["IntegrityScanTaskRequest"] | components["schemas"]["ExactDedupTaskRequest"] | components["schemas"]["NearDedupTaskRequest"] | components["schemas"]["ResizeTaskRequest"] | components["schemas"]["HeicConvertTaskRequest"] | components["schemas"]["DeleteByTagTaskRequest"] | components["schemas"]["DeleteSelectedTaskRequest"] | components["schemas"]["TagPipelineTaskRequest"] | components["schemas"]["VllmTagTaskRequest"] | components["schemas"]["DatasetAugmentationTaskRequest"] | components["schemas"]["TrainingTaskRequest"];
+        CreateTaskRequest: components["schemas"]["DownloadTaskRequest"] | components["schemas"]["IndexLibraryTaskRequest"] | components["schemas"]["ReindexLibraryTaskRequest"] | components["schemas"]["IntegrityScanTaskRequest"] | components["schemas"]["ExactDedupTaskRequest"] | components["schemas"]["NearDedupTaskRequest"] | components["schemas"]["ResizeTaskRequest"] | components["schemas"]["HeicConvertTaskRequest"] | components["schemas"]["DeleteByTagTaskRequest"] | components["schemas"]["DeleteSelectedTaskRequest"] | components["schemas"]["TagPipelineTaskRequest"] | components["schemas"]["VllmTagTaskRequest"] | components["schemas"]["DatasetAugmentationTaskRequest"] | components["schemas"]["TrainingTaskRequest"];
         DanbooruCount: {
             /** Format: int64 */
             count: number;
@@ -1551,12 +1648,23 @@ export interface components {
         };
         /** @enum {string} */
         DatabaseHealthState: "ok";
+        DatabasePoolDiagnostics: {
+            capacity: number;
+            idle: number;
+            in_use: number;
+            total: number;
+        };
         DatasetAugmentationTaskOptions: {
             excluded_media_ids?: string[] | null;
             horizontal_flip?: boolean | null;
             /** Format: int32 */
             jpeg_quality?: number | null;
+            /** Format: int64 */
+            library_post_created_from?: number | null;
+            /** Format: int64 */
+            library_post_created_to?: number | null;
             library_query?: string | null;
+            library_relative_directory?: string | null;
             media_ids?: string[] | null;
             /** Format: int32 */
             min_long_side?: number | null;
@@ -1730,11 +1838,22 @@ export interface components {
         };
         /** @enum {string} */
         IntegrityScanTaskType: "integrity_scan";
+        LibraryFacets: {
+            /** Format: int64 */
+            catalog_revision: number;
+            resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
+            score_ranges: components["schemas"]["LibraryScoreRange"][];
+            /** Format: int64 */
+            total: number;
+        };
         LibraryPage: {
+            /** Format: int64 */
+            catalog_revision: number;
             items: components["schemas"]["LocalMedia"][];
             next_cursor?: string | null;
             /** Format: int64 */
             page: number;
+            previous_cursor?: string | null;
             resolution_ranges: components["schemas"]["LibraryResolutionRange"][];
             score_ranges: components["schemas"]["LibraryScoreRange"][];
             /** Format: int64 */
@@ -1767,6 +1886,7 @@ export interface components {
             height?: number | null;
             id: string;
             mime_type: string;
+            post_created_at?: string | null;
             /** Format: int64 */
             post_id?: number | null;
             rating?: null | components["schemas"]["ContentRating"];
@@ -1922,7 +2042,12 @@ export interface components {
         };
         MediaIdsTaskOptions: {
             excluded_media_ids?: string[] | null;
+            /** Format: int64 */
+            library_post_created_from?: number | null;
+            /** Format: int64 */
+            library_post_created_to?: number | null;
             library_query?: string | null;
+            library_relative_directory?: string | null;
             media_ids?: string[] | null;
             relative_directory?: string | null;
         };
@@ -1980,9 +2105,24 @@ export interface components {
             /** Format: int64 */
             size_bytes: number;
         };
+        ReindexLibraryTaskRequest: {
+            root_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "reindex_library";
+        };
+        /** @enum {string} */
+        ReindexLibraryTaskType: "reindex_library";
         ResizeTaskOptions: {
             excluded_media_ids?: string[] | null;
+            /** Format: int64 */
+            library_post_created_from?: number | null;
+            /** Format: int64 */
+            library_post_created_to?: number | null;
             library_query?: string | null;
+            library_relative_directory?: string | null;
             /** Format: int32 */
             max_size?: number | null;
             media_ids?: string[] | null;
@@ -2009,6 +2149,10 @@ export interface components {
             name: string;
             windows_path?: string | null;
         };
+        SchedulerResourceDiagnostics: {
+            available: number;
+            capacity: number;
+        };
         SecretRequest: {
             secret: string;
         };
@@ -2019,22 +2163,40 @@ export interface components {
         /** @enum {string} */
         SecretStorage: "system" | "session" | "none";
         SmartCropTaskOptions: {
+            cowboy_shot?: boolean | null;
             enabled?: boolean | null;
+            feet?: boolean | null;
             full_body_tight?: boolean | null;
             gpu_id?: string | null;
+            lower_body?: boolean | null;
             /** Format: int32 */
             max_derived_per_family?: number | null;
             portrait?: boolean | null;
             quality_profile?: string | null;
+            require_both_feet?: boolean | null;
             runtime_profile_id?: string | null;
             upper_body?: boolean | null;
+        };
+        SystemDiagnostics: {
+            active_workers: number;
+            database_pool: components["schemas"]["DatabasePoolDiagnostics"];
+            queued_tasks: number;
+            scheduler: {
+                [key: string]: components["schemas"]["SchedulerResourceDiagnostics"];
+            };
+            thumbnail_cache: components["schemas"]["ThumbnailCacheDiagnostics"];
         };
         /** @enum {string} */
         TagCategory: "general" | "artist" | "copyright" | "character" | "meta" | "query";
         TagPipelineTaskOptions: {
             artist_prefix?: null | components["schemas"]["ArtistPrefix"];
             excluded_media_ids?: string[] | null;
+            /** Format: int64 */
+            library_post_created_from?: number | null;
+            /** Format: int64 */
+            library_post_created_to?: number | null;
             library_query?: string | null;
+            library_relative_directory?: string | null;
             media_ids?: string[] | null;
             relative_directory?: string | null;
         };
@@ -2110,7 +2272,7 @@ export interface components {
         /** @enum {string} */
         TaskItemStatus: "queued" | "completed" | "skipped" | "failed";
         /** @enum {string} */
-        TaskKind: "download" | "index_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training" | "runtime_install";
+        TaskKind: "download" | "index_library" | "reindex_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training" | "runtime_install";
         TaskPreview: {
             candidates?: components["schemas"]["TaskPreviewCandidate"][] | null;
             pairs?: components["schemas"]["NearDuplicatePair"][] | null;
@@ -2137,6 +2299,17 @@ export interface components {
             /** Format: int64 */
             total_bytes?: number | null;
         };
+        /** @enum {string} */
+        TaskResourceClass: "network" | "io" | "cpu" | "gpu" | "maintenance";
+        TaskScheduling: {
+            blocking_task_ids: string[];
+            /** Format: int64 */
+            estimated_wait_seconds?: number | null;
+            /** Format: int64 */
+            queue_position?: number | null;
+            resource_class: components["schemas"]["TaskResourceClass"];
+            wait_reason?: string | null;
+        };
         TaskSnapshot: {
             /** Format: int64 */
             last_event_id: number;
@@ -2153,10 +2326,17 @@ export interface components {
             progress: components["schemas"]["TaskProgress"];
             /** Format: int64 */
             revision: number;
+            scheduling: components["schemas"]["TaskScheduling"];
             status: components["schemas"]["TaskStatus"];
             title: string;
             training?: null | components["schemas"]["TrainingTaskSummary"];
             updated_at: string;
+        };
+        ThumbnailCacheDiagnostics: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            entries: number;
         };
         TrainingAdapterField: {
             advanced: boolean;
@@ -2290,7 +2470,10 @@ export interface components {
             process_name: string;
         };
         TrainingLogsResponse: {
+            /** Format: int64 */
+            cursor: number;
             text: string;
+            truncated: boolean;
         };
         TrainingMetric: {
             series: string;
@@ -2320,6 +2503,11 @@ export interface components {
             cursor: number;
             metrics: components["schemas"]["TrainingMetric"][];
         };
+        TrainingParameterSuggestion: {
+            field: string;
+            reason: string;
+            value: unknown;
+        };
         TrainingPathBrowserResponse: {
             current_path: string;
             directories: components["schemas"]["TrainingPathEntry"][];
@@ -2329,6 +2517,22 @@ export interface components {
         TrainingPathEntry: {
             name: string;
             path: string;
+        };
+        TrainingPreflightCheck: {
+            id: string;
+            message: string;
+            ok: boolean;
+            recovery?: string | null;
+            severity: string;
+        };
+        TrainingPreflightResponse: {
+            checks: components["schemas"]["TrainingPreflightCheck"][];
+            /** Format: int64 */
+            effective_steps: number;
+            /** Format: int64 */
+            estimated_vram_mib: number;
+            ready: boolean;
+            suggestions: components["schemas"]["TrainingParameterSuggestion"][];
         };
         TrainingPresetExportResponse: {
             name: string;
@@ -2726,6 +2930,25 @@ export interface operations {
             };
         };
     };
+    diagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_SystemDiagnostics"];
+                };
+            };
+        };
+    };
     download_history: {
         parameters: {
             query?: {
@@ -2783,6 +3006,51 @@ export interface operations {
             };
         };
     };
+    library_facets: {
+        parameters: {
+            query: {
+                root_id: string;
+                q?: string;
+                score_min?: number;
+                score_max?: number;
+                resolution_min?: number;
+                resolution_max?: number;
+                post_created_from?: number;
+                post_created_to?: number;
+                directory?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_LibraryFacets"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
     list_library_items: {
         parameters: {
             query: {
@@ -2795,6 +3063,8 @@ export interface operations {
                 min_resolution?: number;
                 resolution_min?: number;
                 resolution_max?: number;
+                post_created_from?: number;
+                post_created_to?: number;
                 directory?: string;
                 limit?: number;
             };
@@ -3576,6 +3846,37 @@ export interface operations {
             };
         };
     };
+    training_preflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingRunRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiSuccess_TrainingPreflightResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiFailure"];
+                };
+            };
+        };
+    };
     list_training_presets: {
         parameters: {
             query?: never;
@@ -4033,6 +4334,8 @@ export interface operations {
         parameters: {
             query?: {
                 tail?: number;
+                after?: number;
+                limit?: number;
             };
             header?: never;
             path: {

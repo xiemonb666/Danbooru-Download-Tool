@@ -27,9 +27,21 @@ if ! kill -0 "$pid" 2>/dev/null; then
     exit 0
 fi
 
+recorded_start_ticks="$(sed -nE 's/.*"start_ticks"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$VLLM_STATE_FILE" | head -n 1)"
+if [[ "$recorded_start_ticks" =~ ^[1-9][0-9]*$ ]] && [ -r "/proc/$pid/stat" ]; then
+    process_stat="$(<"/proc/$pid/stat")"
+    process_stat_tail="${process_stat##*) }"
+    read -r -a process_stat_fields <<< "$process_stat_tail"
+    current_start_ticks="${process_stat_fields[19]:-0}"
+    if [ "$current_start_ticks" != "$recorded_start_ticks" ]; then
+        echo '[ERROR] vLLM 状态文件 PID 已被其他进程复用，已拒绝停止' >&2
+        exit 2
+    fi
+fi
+
 command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
 case "$command_line" in
-  *'vllm serve'*|*'vllm.entrypoints.'*|*'/vllm/'*'serve'*) ;;
+  *'vllm serve'*|*'vllm.entrypoints.'*|*'/vllm/'*'serve'*|*'start_vllm.sh'*) ;;
   *)
     echo '[ERROR] 状态文件记录的 PID 不是 vLLM 进程，已拒绝停止' >&2
     exit 2

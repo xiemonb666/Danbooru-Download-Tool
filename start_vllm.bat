@@ -17,7 +17,7 @@ echo [INFO] Press Ctrl+C to stop
 echo [INFO] Linux launcher writes timestamped logs under the project logs directory
 echo.
 
-wsl -u root env "VLLM_PORT=%VLLM_PORT%" "VLLM_HOST=%VLLM_HOST%" bash "%WSL_SCRIPT%"
+wsl -u root env "VLLM_PORT=%VLLM_PORT%" "VLLM_HOST=%VLLM_HOST%" "MODEL_PATH=%MODEL_PATH%" bash "%WSL_SCRIPT%"
 set "EXIT_CODE=%errorlevel%"
 
 if %EXIT_CODE% neq 0 (

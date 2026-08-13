@@ -114,6 +114,11 @@ onUnmounted(() => {
       </RouterView>
     </main>
 
+    <RouterLink v-if="tasks.activeCount" to="/tasks" class="global-task-overview" aria-label="查看进行中的任务">
+      <ListTodo :size="17" />
+      <span><strong>{{ tasks.activeCount }} 个任务进行中</strong><small>查看进度与队列原因</small></span>
+    </RouterLink>
+
     <nav class="mobile-nav" aria-label="移动端导航">
       <RouterLink v-for="item in navItems" :key="item.to" :to="item.to" class="mobile-nav-link">
         <component :is="item.icon" :size="20" :stroke-width="1.8" />

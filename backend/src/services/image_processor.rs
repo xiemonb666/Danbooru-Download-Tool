@@ -53,6 +53,14 @@ pub(crate) fn is_quarantine_dir_name(name: &OsStr) -> bool {
     }
 }
 
+fn is_automatic_task_internal_dir_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|value| {
+        value.eq_ignore_ascii_case(QUARANTINE_DIR)
+            || value.eq_ignore_ascii_case(".augmentation")
+            || value.eq_ignore_ascii_case(".augmentation-metadata")
+    })
+}
+
 fn validate_relative_path(path: &Path) -> Result<PathBuf, String> {
     use std::path::Component;
 
@@ -1734,7 +1742,7 @@ fn collect_media_files(root: &VerifiedMediaRoot) -> Result<Vec<PathBuf>, ToolErr
     let walker = WalkDir::new(root.path())
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !is_quarantine_dir_name(entry.file_name()));
+        .filter_entry(|entry| !is_automatic_task_internal_dir_name(entry.file_name()));
     for entry in walker {
         let entry = entry.map_err(|error| {
             error
@@ -2512,6 +2520,31 @@ mod tests {
             PathBuf::from("broken.jpg")
         );
         assert!(directory.path().join("broken.jpg").exists());
+    }
+
+    #[test]
+    fn default_media_collection_skips_augmentation_and_metadata_internals() {
+        let directory = tempfile::tempdir().expect("temp root");
+        for relative in [
+            "source.png",
+            ".augmentation/task/derived/portrait/images/master.png",
+            ".augmentation/task/ready/train/portrait/images/train.png",
+        ] {
+            let path = directory.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            image::RgbImage::new(8, 8).save(path).unwrap();
+        }
+        fs::create_dir_all(directory.path().join(".augmentation-metadata/task")).unwrap();
+        fs::write(
+            directory.path().join(".augmentation-metadata/task/READY.json"),
+            "{}",
+        )
+        .unwrap();
+        let root = VerifiedMediaRoot::open(directory.path()).expect("valid root");
+
+        let files = collect_media_files(&root).unwrap();
+
+        assert_eq!(files, vec![PathBuf::from("source.png")]);
     }
 
     #[test]

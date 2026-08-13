@@ -283,8 +283,12 @@ describe('ToolsView media selection boundary', () => {
           quality_profile: 'anime-quality',
           portrait: true,
           upper_body: true,
+          cowboy_shot: true,
           full_body_tight: true,
-          max_derived_per_family: 3,
+          lower_body: true,
+          feet: true,
+          require_both_feet: false,
+          max_derived_per_family: 6,
         },
         retagging: {
           send_to_vllm: false,
@@ -307,7 +311,11 @@ describe('ToolsView media selection boundary', () => {
     expect(within(dialog).getByText('智能裁剪')).toBeVisible()
     expect(within(dialog).getByLabelText('生成肖像裁剪')).toBeChecked()
     expect(within(dialog).getByLabelText('生成上半身裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('生成牛仔视角裁剪')).toBeChecked()
     expect(within(dialog).getByLabelText('生成紧凑全身裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('生成下半身裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('生成脚部视角裁剪')).toBeChecked()
+    expect(within(dialog).getByLabelText('仅生成完整双脚（关闭时允许完整单脚）')).not.toBeChecked()
   })
 
   it('groups dataset augmentation controls into a compact layout', async () => {

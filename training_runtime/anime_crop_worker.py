@@ -20,6 +20,26 @@ from typing import Any, Callable
 
 
 HEAD_MODEL = "head_detect_v2.0_x_yv11"
+WARMUP_MARKER_SCHEMA = "danbooru-anime-crop-warmup"
+WARMUP_MARKER_SCHEMA_VERSION = 2
+WARMUP_MODELS = (
+    HEAD_MODEL,
+    "anime_face",
+    "anime_person",
+    "anime_halfbody",
+    "anime_hand",
+    "isnet_anime",
+    "humanart_rtmpose_halpe26",
+)
+WARMUP_MISSING_LABEL = "完整 Halpe26 动漫检测模型预热"
+POSE_BBOX_RELIABLE_INDICES = (
+    0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+)
+POSE_LOWER_ASSOCIATION_INDICES = (
+    11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25,
+)
+POSE_RELIABLE_SCORE = 0.35
+POSE_LOWER_ASSOCIATION_SCORE = 0.05
 _DOWNLOAD_PATCHED = False
 _POSE_MODELS: dict[str, Any] = {}
 _CUDA_DLL_DIRECTORIES: list[Any] = []
@@ -57,7 +77,86 @@ def warmup_marker() -> Path:
 def mark_models_warmed(device: str) -> None:
     marker = warmup_marker()
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"device": device, "models": HEAD_MODEL}), encoding="utf-8")
+    payload = {
+        "schema": WARMUP_MARKER_SCHEMA,
+        "schema_version": WARMUP_MARKER_SCHEMA_VERSION,
+        "device": device,
+        "models": list(WARMUP_MODELS),
+    }
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="warmup-complete-",
+        suffix=".tmp",
+        dir=marker.parent,
+        delete=False,
+    )
+    try:
+        with temporary:
+            json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary.name, marker)
+    except Exception:
+        try:
+            os.unlink(temporary.name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def validate_warmup_marker(device: str) -> dict[str, Any]:
+    marker = warmup_marker()
+    status: dict[str, Any] = {
+        "path": str(marker),
+        "schema": WARMUP_MARKER_SCHEMA,
+        "schema_version": WARMUP_MARKER_SCHEMA_VERSION,
+        "valid": False,
+    }
+    if not marker.is_file():
+        status["error"] = "模型尚未完成完整 Halpe26 预热"
+        return status
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception as error:
+        status["error"] = f"预热标记无法解析: {error}"
+        return status
+    if not isinstance(payload, dict):
+        status["error"] = "预热标记格式无效"
+        return status
+    if payload.get("schema") != WARMUP_MARKER_SCHEMA:
+        status["error"] = "预热标记 schema 已过期"
+        return status
+    if payload.get("schema_version") != WARMUP_MARKER_SCHEMA_VERSION:
+        status["error"] = "预热标记版本已过期"
+        return status
+    marker_device = payload.get("device")
+    if marker_device != device or not str(marker_device).startswith("cuda:"):
+        status["error"] = "预热标记不是当前 CUDA 运行时生成的"
+        return status
+    models = payload.get("models")
+    if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+        status["error"] = "预热标记缺少模型清单"
+        return status
+    missing_models = [model for model in WARMUP_MODELS if model not in models]
+    if missing_models:
+        status["error"] = f"预热标记缺少模型: {', '.join(missing_models)}"
+        status["missing_models"] = missing_models
+        return status
+    status["valid"] = True
+    status["models"] = models
+    return status
+
+
+def update_model_marker_health(status: dict[str, Any], device: str) -> None:
+    marker_status = validate_warmup_marker(device)
+    status["model_marker"] = marker_status
+    status["models_ready"] = bool(marker_status["valid"])
+    missing = [item for item in status.get("missing", []) if item != WARMUP_MISSING_LABEL]
+    if not status["models_ready"]:
+        missing.append(WARMUP_MISSING_LABEL)
+    status["missing"] = missing
+    status["ready"] = bool(status.get("dependencies_ready")) and status["models_ready"]
 
 
 def emit(value: dict[str, Any]) -> int:
@@ -144,9 +243,8 @@ def dependency_health(device: str) -> dict[str, Any]:
         if not probe["ready"]:
             missing.append("动漫检测 ONNX CUDA session")
     status["dependencies_ready"] = not missing
-    status["models_ready"] = warmup_marker().is_file()
-    status["ready"] = status["dependencies_ready"] and status["models_ready"]
     status["missing"] = missing
+    update_model_marker_health(status, device)
     return status
 
 
@@ -271,6 +369,11 @@ def _detector(detectors: Any, names: tuple[str, ...]) -> Callable[..., Any] | No
     return None
 
 
+def point_in_image(x: float, y: float, width: int, height: int) -> bool:
+    """Reject fabricated pose coordinates instead of clamping them to media edges."""
+    return 0.0 <= x < float(width) and 0.0 <= y < float(height)
+
+
 def detect_poses(image: Any, device: str) -> list[dict[str, Any]]:
     """Return per-person HumanArt/RTMPose evidence for full-body crops.
 
@@ -284,9 +387,9 @@ def detect_poses(image: Any, device: str) -> list[dict[str, Any]]:
     try:
         import rtmlib
 
-        body_type = getattr(rtmlib, "Body", None)
+        body_type = getattr(rtmlib, "BodyWithFeet", None)
         if body_type is None:
-            return []
+            raise RuntimeError("rtmlib 缺少 BodyWithFeet (Halpe26) 姿态模型")
         backend = "onnxruntime"
         pose = _POSE_MODELS.get(device)
         if pose is None:
@@ -302,28 +405,102 @@ def detect_poses(image: Any, device: str) -> list[dict[str, Any]]:
             return []
         if len(scores) == 0:
             return []
+        image_width, image_height = image.size
         poses: list[dict[str, Any]] = []
         for person_keypoints, person_scores in zip(keypoints, scores):
-            if len(person_scores) < 17:
-                continue
-            reliable = [
-                point for point, score in zip(person_keypoints, person_scores)
-                if float(score) >= 0.35
+            if len(person_scores) < 26 or len(person_keypoints) < 26:
+                raise RuntimeError("BodyWithFeet 未返回完整 Halpe26 关键点")
+            import math
+
+            valid_points: dict[int, tuple[float, float, float]] = {}
+            for index in range(26):
+                x = float(person_keypoints[index][0])
+                y = float(person_keypoints[index][1])
+                score = float(person_scores[index])
+                if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(score)):
+                    continue
+                if not point_in_image(x, y, image_width, image_height):
+                    continue
+                valid_points[index] = (x, y, score)
+
+            reliable_points = [
+                valid_points[index]
+                for index in POSE_BBOX_RELIABLE_INDICES
+                if index in valid_points and valid_points[index][2] >= POSE_RELIABLE_SCORE
             ]
-            if len(reliable) < 5:
+            if len(reliable_points) < 5:
                 continue
-            x_values = [float(point[0]) for point in reliable]
-            y_values = [float(point[1]) for point in reliable]
-            torso_indices = [5, 6, 11, 12]
-            torso_scores = [float(person_scores[index]) for index in torso_indices if index < len(person_scores)]
+
+            reliable_x0 = min(point[0] for point in reliable_points)
+            reliable_x1 = max(point[0] for point in reliable_points)
+            reliable_y0 = min(point[1] for point in reliable_points)
+            reliable_y1 = max(point[1] for point in reliable_points)
+            horizontal_margin = max(
+                (reliable_x1 - reliable_x0) * 1.25,
+                image_width * 0.10,
+            )
+            upper_margin = max(
+                (reliable_y1 - reliable_y0) * 0.25,
+                image_height * 0.03,
+            )
+            # Knees, ankles and foot tips are frequently scored below the
+            # general-body threshold on stylized art.  Keep low-score points
+            # only when they remain anatomically associated with the reliable
+            # skeleton; this extends the pose bbox for person association
+            # without accepting arbitrary coordinates elsewhere in the image.
+            lower_association_points = [
+                valid_points[index]
+                for index in POSE_LOWER_ASSOCIATION_INDICES
+                if index in valid_points
+                and valid_points[index][2] >= POSE_LOWER_ASSOCIATION_SCORE
+                and reliable_x0 - horizontal_margin
+                <= valid_points[index][0]
+                <= reliable_x1 + horizontal_margin
+                and valid_points[index][1] >= reliable_y0 - upper_margin
+            ]
+            bbox_points = reliable_points + lower_association_points
+            x_values = [point[0] for point in bbox_points]
+            y_values = [point[1] for point in bbox_points]
+            torso_indices = (5, 6, 11, 12)
+            torso_scores = [
+                valid_points[index][2]
+                for index in torso_indices
+                if index in valid_points
+            ]
+
+            def keypoint(index: int) -> dict[str, float] | None:
+                point = valid_points.get(index)
+                if point is None:
+                    return None
+                return {"x": point[0], "y": point[1], "score": point[2]}
+
+            def valid_score(index: int) -> float:
+                point = valid_points.get(index)
+                return point[2] if point is not None else 0.0
+
             poses.append({
                 "bbox": {
                     "x0": min(x_values), "y0": min(y_values),
-                    "x1": max(x_values), "y1": max(y_values), "score": 1.0,
+                    "x1": max(x_values), "y1": max(y_values),
+                    "score": sum(point[2] for point in reliable_points) / len(reliable_points),
                 },
                 "torso_score": sum(torso_scores) / len(torso_scores) if torso_scores else 0.0,
-                "left_ankle_score": float(person_scores[15]),
-                "right_ankle_score": float(person_scores[16]),
+                "left_ankle_score": valid_score(15),
+                "right_ankle_score": valid_score(16),
+                "keypoints": {
+                    "left_hip": keypoint(11),
+                    "right_hip": keypoint(12),
+                    "left_knee": keypoint(13),
+                    "right_knee": keypoint(14),
+                    "left_ankle": keypoint(15),
+                    "right_ankle": keypoint(16),
+                    "left_big_toe": keypoint(20),
+                    "right_big_toe": keypoint(21),
+                    "left_small_toe": keypoint(22),
+                    "right_small_toe": keypoint(23),
+                    "left_heel": keypoint(24),
+                    "right_heel": keypoint(25),
+                },
             })
         return poses
     except Exception as error:
@@ -434,12 +611,11 @@ def warmup(device: str) -> dict[str, Any]:
     if result.get("pose_error"):
         return {"ready": False, "health": health, "error": f"HumanArt/RTMPose 未就绪: {result['pose_error']}"}
     mark_models_warmed(device)
-    health["models_ready"] = True
-    health["ready"] = True
+    update_model_marker_health(health, device)
     return {
-        "ready": True,
+        "ready": health["ready"],
         "health": health,
-        "models": [HEAD_MODEL, "anime_face", "anime_person", "anime_halfbody", "anime_hand", "isnet_anime", "humanart_rtmpose"],
+        "models": list(WARMUP_MODELS),
     }
 
 
@@ -469,6 +645,7 @@ def main() -> int:
             return emit({"ready": False, "error": "items 必须为数组", "items": []})
         completed = 0
         detected_any = False
+        pose_failures: list[str] = []
         for item in items:
             # Third-party detector packages occasionally log to stdout. Keep
             # their output out of the JSONL stream, then flush this item's
@@ -476,12 +653,26 @@ def main() -> int:
             with contextlib.redirect_stdout(sys.stderr):
                 result = analyze_item(item, device)
             detected_any = detected_any or not bool(result.get("error"))
+            if result.get("pose_error"):
+                pose_failures.append(
+                    f"{result.get('media_id') or '<unknown>'}: {result['pose_error']}"
+                )
             emit({"type": "detection", "item": result})
             completed += 1
+        if pose_failures:
+            health["ready"] = False
+            health["pose_ready"] = False
+            return emit({
+                "type": "complete",
+                "ready": False,
+                "health": health,
+                "error": "HumanArt/RTMPose 姿态检测失败: " + "; ".join(pose_failures[:3]),
+                "pose_failure_count": len(pose_failures),
+                "count": completed,
+            })
         if detected_any:
             mark_models_warmed(device)
-            health["models_ready"] = True
-            health["ready"] = True
+            update_model_marker_health(health, device)
         # The task protocol is JSONL rather than a single unbounded response:
         # the Rust parent can validate every returned media ID independently
         # and never needs to grant the worker write access to the workspace.

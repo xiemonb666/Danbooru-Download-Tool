@@ -5,10 +5,11 @@ use crate::config::{
 };
 use crate::database::{
     Database, DownloadTaskHistoryCursor, LibraryMediaFilters, LibraryResolutionRange,
-    LibraryScoreRange, MediaFileInput, MediaFileRecord, PostRecordInput, PostTagInput,
+    LibraryScoreRange, MediaFileInput, MediaFileRecord, MediaIndexFingerprint, PostRecordInput, PostTagInput,
     QuarantineInput, QuarantineRecord, RootRecord, TaskItemInput,
 };
 use crate::media_root::{normalize_windows_path, MediaRoot};
+use crate::openapi::TaskResourceClass;
 use crate::secrets::{SecretKind, SecretManager, SystemCredentialVault};
 use crate::services::danbooru::{
     validate_filename_template, AutocompleteItem, ControlledDownloadOutcome, DanbooruClient,
@@ -63,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -157,6 +158,35 @@ struct HealthResponse {
     uptime_seconds: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct DatabasePoolResponse {
+    total: usize,
+    in_use: usize,
+    idle: usize,
+    capacity: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerResourceResponse {
+    capacity: usize,
+    available: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ThumbnailCacheResponse {
+    entries: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemDiagnosticsResponse {
+    database_pool: DatabasePoolResponse,
+    scheduler: BTreeMap<String, SchedulerResourceResponse>,
+    thumbnail_cache: ThumbnailCacheResponse,
+    active_workers: usize,
+    queued_tasks: usize,
+}
+
 type PersistentTaskManager = TaskManager<SqliteTaskStore>;
 
 #[derive(Clone, Default)]
@@ -189,7 +219,6 @@ impl RootWriteCoordinator {
     }
 }
 
-const VLLM_LOAD_REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
 const TRAINING_TELEMETRY_LAUNCHER: &[u8] =
     include_bytes!("../../../training_runtime/telemetry_launcher.py");
 const TRAINING_ADAPTER_INSPECTOR: &[u8] =
@@ -203,8 +232,286 @@ const LORA_SVD_ANALYSIS_CACHE_LIMIT: usize = 3;
 const LORA_SVD_SUMMARY_SPECTRUM_LIMIT: usize = 4_096;
 
 #[derive(Clone, Default)]
-struct VllmLoadCoordinator {
-    requested_at: Arc<StdMutex<Option<Instant>>>,
+struct VllmRuntimeCoordinator {
+    state: Arc<Mutex<VllmRuntimeState>>,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct VllmRuntimeState {
+    key: Option<String>,
+    generation: u64,
+    starting: bool,
+    ready: bool,
+    stopping: bool,
+    auto_started: bool,
+    keep_loaded: bool,
+    active_leases: usize,
+    pending_acquires: usize,
+    last_start_failure: Option<TaskFailure>,
+}
+
+#[derive(Debug)]
+struct VllmRuntimeLease {
+    generation: u64,
+    auto_started: bool,
+    released: bool,
+}
+
+impl VllmRuntimeState {
+    fn begin_generation(&mut self, key: String, keep_loaded: bool) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.key = Some(key);
+        self.starting = true;
+        self.ready = false;
+        self.stopping = false;
+        self.auto_started = false;
+        self.keep_loaded = keep_loaded;
+        self.active_leases = 0;
+        self.pending_acquires = 0;
+        self.last_start_failure = None;
+        self.generation
+    }
+
+    fn reserve_pending(&mut self, generation: u64) -> bool {
+        if self.generation != generation || !self.starting {
+            return false;
+        }
+        self.pending_acquires = self.pending_acquires.saturating_add(1);
+        true
+    }
+
+    fn activate_pending(&mut self, generation: u64, keep_loaded: bool) -> bool {
+        if self.generation != generation
+            || self.starting
+            || !self.ready
+            || self.pending_acquires == 0
+        {
+            return false;
+        }
+        self.pending_acquires -= 1;
+        self.active_leases = self.active_leases.saturating_add(1);
+        self.keep_loaded |= keep_loaded;
+        true
+    }
+
+    fn cancel_pending(&mut self, generation: u64) -> bool {
+        if self.generation != generation || self.pending_acquires == 0 {
+            return false;
+        }
+        self.pending_acquires -= 1;
+        let should_unload = self.ready
+            && self.active_leases == 0
+            && self.pending_acquires == 0
+            && self.auto_started
+            && !self.keep_loaded;
+        if should_unload {
+            self.stopping = true;
+        }
+        should_unload
+    }
+
+    fn release_generation(&mut self, generation: u64) -> bool {
+        if self.generation != generation || self.active_leases == 0 {
+            return false;
+        }
+        self.active_leases -= 1;
+        let should_unload = self.active_leases == 0
+            && self.pending_acquires == 0
+            && self.auto_started
+            && !self.keep_loaded;
+        if should_unload {
+            self.stopping = true;
+        }
+        should_unload
+    }
+
+    fn begin_manual_stop(&mut self) -> Option<u64> {
+        if self.active_leases > 0
+            || self.pending_acquires > 0
+            || self.starting
+            || self.stopping
+        {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.stopping = true;
+        self.last_start_failure = None;
+        Some(self.generation)
+    }
+
+    fn finish_unload(&mut self, generation: u64, succeeded: bool) {
+        if self.generation != generation || !self.stopping {
+            return;
+        }
+        self.stopping = false;
+        if succeeded {
+            self.key = None;
+            self.ready = false;
+            self.auto_started = false;
+            self.keep_loaded = false;
+            self.active_leases = 0;
+            self.pending_acquires = 0;
+            self.last_start_failure = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod vllm_runtime_state_tests {
+    use super::VllmRuntimeState;
+
+    #[test]
+    fn preexisting_runtime_is_never_auto_unloaded() {
+        let mut runtime = VllmRuntimeState {
+            generation: 3,
+            active_leases: 1,
+            auto_started: false,
+            ..VllmRuntimeState::default()
+        };
+
+        assert!(!runtime.release_generation(3));
+        assert_eq!(runtime.active_leases, 0);
+        assert!(!runtime.stopping);
+    }
+
+    #[test]
+    fn auto_started_runtime_unloads_only_after_the_last_lease() {
+        let mut runtime = VllmRuntimeState {
+            generation: 7,
+            active_leases: 2,
+            auto_started: true,
+            ..VllmRuntimeState::default()
+        };
+
+        assert!(!runtime.release_generation(7));
+        assert_eq!(runtime.active_leases, 1);
+        assert!(runtime.release_generation(7));
+        assert!(runtime.stopping);
+    }
+
+    #[test]
+    fn manual_keep_loaded_promotion_prevents_auto_unload() {
+        let mut runtime = VllmRuntimeState {
+            generation: 11,
+            active_leases: 1,
+            auto_started: true,
+            keep_loaded: true,
+            ..VllmRuntimeState::default()
+        };
+
+        assert!(!runtime.release_generation(11));
+        assert!(!runtime.stopping);
+    }
+
+    #[test]
+    fn a_new_generation_does_not_inherit_stale_keep_loaded_state() {
+        let mut runtime = VllmRuntimeState {
+            generation: 4,
+            ready: true,
+            keep_loaded: true,
+            ..VllmRuntimeState::default()
+        };
+
+        let generation = runtime.begin_generation("endpoint\nmodel".to_string(), false);
+
+        assert_eq!(generation, 5);
+        assert!(runtime.starting);
+        assert!(!runtime.ready);
+        assert!(!runtime.keep_loaded);
+    }
+
+    #[test]
+    fn pending_acquire_prevents_the_leader_from_unloading_early() {
+        let mut runtime = VllmRuntimeState {
+            generation: 8,
+            ready: true,
+            auto_started: true,
+            active_leases: 1,
+            pending_acquires: 1,
+            ..VllmRuntimeState::default()
+        };
+
+        assert!(!runtime.release_generation(8));
+        assert_eq!(runtime.active_leases, 0);
+        assert!(!runtime.stopping);
+        assert!(runtime.activate_pending(8, false));
+        assert_eq!(runtime.active_leases, 1);
+    }
+
+    #[test]
+    fn cancelling_the_last_pending_acquire_requests_owned_runtime_cleanup() {
+        let mut runtime = VllmRuntimeState {
+            generation: 9,
+            ready: true,
+            auto_started: true,
+            pending_acquires: 1,
+            ..VllmRuntimeState::default()
+        };
+
+        assert!(runtime.cancel_pending(9));
+        assert_eq!(runtime.pending_acquires, 0);
+        assert!(runtime.stopping);
+    }
+
+    #[test]
+    fn failed_manual_unload_retains_runtime_ownership_for_retry() {
+        let mut runtime = VllmRuntimeState {
+            key: Some("endpoint\nmodel".to_string()),
+            generation: 12,
+            ready: true,
+            auto_started: true,
+            keep_loaded: true,
+            ..VllmRuntimeState::default()
+        };
+
+        let stop_generation = runtime.begin_manual_stop().unwrap();
+        assert_eq!(stop_generation, 13);
+        assert!(runtime.stopping);
+        runtime.finish_unload(stop_generation, false);
+
+        assert!(!runtime.stopping);
+        assert!(runtime.ready);
+        assert!(runtime.auto_started);
+        assert!(runtime.keep_loaded);
+        assert_eq!(runtime.key.as_deref(), Some("endpoint\nmodel"));
+    }
+
+    #[test]
+    fn successful_manual_unload_clears_ownership_but_preserves_generation_token() {
+        let mut runtime = VllmRuntimeState {
+            key: Some("endpoint\nmodel".to_string()),
+            generation: 20,
+            ready: true,
+            auto_started: true,
+            keep_loaded: true,
+            ..VllmRuntimeState::default()
+        };
+
+        let stop_generation = runtime.begin_manual_stop().unwrap();
+        runtime.finish_unload(stop_generation, true);
+
+        assert_eq!(runtime.generation, stop_generation);
+        assert!(!runtime.stopping);
+        assert!(!runtime.ready);
+        assert!(!runtime.auto_started);
+        assert!(!runtime.keep_loaded);
+        assert!(runtime.key.is_none());
+    }
+
+    #[test]
+    fn manual_unload_refuses_pending_startup_consumers() {
+        let mut runtime = VllmRuntimeState {
+            generation: 30,
+            starting: true,
+            pending_acquires: 2,
+            ..VllmRuntimeState::default()
+        };
+
+        assert_eq!(runtime.begin_manual_stop(), None);
+        assert_eq!(runtime.generation, 30);
+        assert!(!runtime.stopping);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -311,27 +618,6 @@ impl TrainingRuntimeInstallCoordinator {
     }
 }
 
-impl VllmLoadCoordinator {
-    fn begin(&self) -> bool {
-        let mut requested_at = self
-            .requested_at
-            .lock()
-            .expect("vLLM load coordinator lock poisoned");
-        if requested_at.is_some_and(|started| started.elapsed() < VLLM_LOAD_REQUEST_TTL) {
-            return false;
-        }
-        *requested_at = Some(Instant::now());
-        true
-    }
-
-    fn clear(&self) {
-        self.requested_at
-            .lock()
-            .expect("vLLM load coordinator lock poisoned")
-            .take();
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct VllmLoadResponse {
     state: &'static str,
@@ -354,19 +640,151 @@ pub struct AppState {
     danbooru: Arc<RwLock<DanbooruClient>>,
     danbooru_posts: Arc<StdMutex<HashMap<u64, CachedDanbooruPost>>>,
     active_workers: Arc<Mutex<HashSet<String>>>,
+    root_scheduling: RootWriteCoordinator,
     root_writes: RootWriteCoordinator,
     root_registry: Arc<Mutex<()>>,
     thumbnail_cache_dir: PathBuf,
+    thumbnail_inflight: ThumbnailCoordinator,
+    thumbnail_slots: Arc<Semaphore>,
+    library_facets_cache: Arc<StdMutex<HashMap<String, (Instant, LibraryFacetsResponse)>>>,
     backgrounds_dir: PathBuf,
     vllm_launcher_root: Option<PathBuf>,
-    vllm_loads: VllmLoadCoordinator,
+    vllm_runtime: VllmRuntimeCoordinator,
     worker_slots: Arc<Semaphore>,
+    resource_slots: ResourceTaskSlots,
     training_root: PathBuf,
     training_leases: GpuLeaseManager,
     training_presets: TrainingPresetStore,
     training_runtime_installs: TrainingRuntimeInstallCoordinator,
     lora_svd_analyses: LoraSvdAnalysisCache,
     started_at: Instant,
+}
+
+struct PendingVllmAcquire {
+    state: AppState,
+    generation: u64,
+    armed: bool,
+}
+
+impl PendingVllmAcquire {
+    fn new(state: &AppState, generation: u64) -> Self {
+        Self {
+            state: state.clone(),
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingVllmAcquire {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let generation = self.generation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cancel_pending_vllm_acquire(&state, generation).await;
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResourceTaskSlots {
+    network: Arc<Semaphore>,
+    io: Arc<Semaphore>,
+    cpu: Arc<Semaphore>,
+    gpu: Arc<Semaphore>,
+    maintenance: Arc<Semaphore>,
+}
+
+#[derive(Clone, Default)]
+struct ThumbnailCoordinator {
+    locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+    quota_checks: Arc<StdMutex<Option<Instant>>>,
+}
+
+impl ThumbnailCoordinator {
+    async fn acquire(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().expect("thumbnail coordinator lock poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    fn should_enforce_quota(&self) -> bool {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+        let mut checks = self
+            .quota_checks
+            .lock()
+            .expect("thumbnail quota coordinator lock poisoned");
+        let now = Instant::now();
+        if checks.is_some_and(|last| now.saturating_duration_since(last) < CHECK_INTERVAL) {
+            return false;
+        }
+        *checks = Some(now);
+        true
+    }
+}
+
+impl Default for ResourceTaskSlots {
+    fn default() -> Self {
+        Self {
+            network: Arc::new(Semaphore::new(2)),
+            io: Arc::new(Semaphore::new(2)),
+            cpu: Arc::new(Semaphore::new(1)),
+            gpu: Arc::new(Semaphore::new(8)),
+            maintenance: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+impl ResourceTaskSlots {
+    async fn acquire(&self, class: TaskResourceClass) -> Result<OwnedSemaphorePermit, ()> {
+        let semaphore = match class {
+            TaskResourceClass::Network => &self.network,
+            TaskResourceClass::Io => &self.io,
+            TaskResourceClass::Cpu => &self.cpu,
+            TaskResourceClass::Gpu => &self.gpu,
+            TaskResourceClass::Maintenance => &self.maintenance,
+        };
+        semaphore.clone().acquire_owned().await.map_err(|_| ())
+    }
+
+    fn diagnostics(&self) -> BTreeMap<String, SchedulerResourceResponse> {
+        [
+            ("network", 2, &self.network),
+            ("io", 2, &self.io),
+            ("cpu", 1, &self.cpu),
+            ("gpu", 8, &self.gpu),
+            ("maintenance", 1, &self.maintenance),
+        ]
+        .into_iter()
+        .map(|(name, capacity, semaphore)| {
+            (
+                name.to_string(),
+                SchedulerResourceResponse {
+                    capacity,
+                    available: semaphore.available_permits(),
+                },
+            )
+        })
+        .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -588,13 +1006,18 @@ impl AppState {
             danbooru: Arc::new(RwLock::new(danbooru)),
             danbooru_posts: Arc::new(StdMutex::new(HashMap::new())),
             active_workers: Arc::new(Mutex::new(HashSet::new())),
+            root_scheduling: RootWriteCoordinator::default(),
             root_writes: RootWriteCoordinator::default(),
             root_registry: Arc::new(Mutex::new(())),
             thumbnail_cache_dir,
+            thumbnail_inflight: ThumbnailCoordinator::default(),
+            thumbnail_slots: Arc::new(Semaphore::new(2)),
+            library_facets_cache: Arc::new(StdMutex::new(HashMap::new())),
             backgrounds_dir,
             vllm_launcher_root,
-            vllm_loads: VllmLoadCoordinator::default(),
+            vllm_runtime: VllmRuntimeCoordinator::default(),
             worker_slots: Arc::new(Semaphore::new(4)),
+            resource_slots: ResourceTaskSlots::default(),
             training_root,
             training_leases: GpuLeaseManager::default(),
             training_presets,
@@ -1679,7 +2102,7 @@ fn configured_local_vllm_port(endpoint: &str) -> Result<u16, &'static str> {
         .ok_or("vLLM Base URL 必须包含端口，例如 http://127.0.0.1:8000/v1")
 }
 
-fn launch_vllm_process(project_root: &Path, port: u16) -> Result<(), String> {
+fn launch_vllm_process(project_root: &Path, port: u16, model: &str) -> Result<(), String> {
     let (launcher, program) = if cfg!(windows) {
         (project_root.join("start_vllm.bat"), None)
     } else {
@@ -1701,6 +2124,7 @@ fn launch_vllm_process(project_root: &Path, port: u16) -> Result<(), String> {
         .current_dir(project_root)
         .env("VLLM_HOST", "127.0.0.1")
         .env("VLLM_PORT", port.to_string())
+        .env("MODEL_PATH", model)
         .env("LOG_DIR", &logs)
         .env("VLLM_STATE_FILE", logs.join("vllm.state.json"))
         .stdin(Stdio::null())
@@ -1873,6 +2297,7 @@ pub fn router_with_state(state: AppState) -> Router {
     }
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/diagnostics", get(system_diagnostics))
         .route("/api/vllm/health", get(vllm_health))
         .route("/api/vllm/load", axum::routing::post(vllm_load))
         .route("/api/vllm/unload", axum::routing::post(vllm_unload))
@@ -1896,6 +2321,7 @@ pub fn router_with_state(state: AppState) -> Router {
             get(list_root_directories).post(create_root_directory),
         )
         .route("/api/library/items", get(list_library_items))
+        .route("/api/library/facets", get(library_facets))
         .route("/api/library/items/{id}", get(library_item))
         .route("/api/library/media/{id}/{variant}", get(library_media))
         .route(
@@ -1966,6 +2392,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route(
             "/api/training/preview",
             axum::routing::post(training_preview),
+        )
+        .route(
+            "/api/training/preflight",
+            axum::routing::post(training_preflight),
         )
         .route(
             "/api/training/lora-svd/analyses",
@@ -2366,7 +2796,13 @@ async fn training_gallery_augmentation_discovery(
                 };
                 if !matches!(
                     id,
-                    "horizontal_flip" | "portrait" | "upper_body" | "full_body_tight"
+                    "horizontal_flip"
+                        | "portrait"
+                        | "upper_body"
+                        | "cowboy_shot"
+                        | "full_body_tight"
+                        | "lower_body"
+                        | "feet"
                 ) {
                     continue;
                 }
@@ -3285,7 +3721,7 @@ async fn install_training_runtime(
         .map_err(map_task_manager_error)?;
     spawn_task_worker(state.clone(), task.id.clone()).await;
     Ok(Json(ApiSuccess {
-        data: task_summary_response(&state.database, task),
+        data: task_summary_response(&state, task),
         meta: None,
     }))
 }
@@ -3672,7 +4108,59 @@ fn parse_anime_crop_detection_jsonl(output: &[u8]) -> Result<Vec<AnimeCropAnalys
 
 #[cfg(test)]
 mod anime_crop_worker_contract_tests {
-    use super::parse_anime_crop_detection_jsonl;
+    use super::{parse_anime_crop_detection_jsonl, ANIME_CROP_WORKER};
+
+    #[test]
+    fn worker_warmup_marker_requires_a_versioned_full_halpe26_model_stack() {
+        let worker = std::str::from_utf8(ANIME_CROP_WORKER).unwrap();
+
+        assert!(worker.contains("WARMUP_MARKER_SCHEMA_VERSION"));
+        assert!(worker.contains("WARMUP_MODELS"));
+        assert!(worker.contains("humanart_rtmpose_halpe26"));
+        assert!(worker.contains("validate_warmup_marker"));
+        assert!(worker.contains("payload.get(\"schema\") != WARMUP_MARKER_SCHEMA"));
+        assert!(worker.contains(
+            "payload.get(\"schema_version\") != WARMUP_MARKER_SCHEMA_VERSION"
+        ));
+        assert!(worker.contains("missing_models = [model for model in WARMUP_MODELS"));
+    }
+
+    #[test]
+    fn worker_uses_halpe26_body_with_feet_and_emits_foot_keypoints() {
+        let worker = std::str::from_utf8(ANIME_CROP_WORKER).unwrap();
+
+        assert!(worker.contains("BodyWithFeet"));
+        assert!(worker.contains("left_big_toe"));
+        assert!(worker.contains("right_heel"));
+        assert!(worker.contains("len(person_scores) < 26"));
+    }
+
+    #[test]
+    fn worker_fails_the_detect_batch_when_the_pose_subsystem_errors() {
+        let worker = std::str::from_utf8(ANIME_CROP_WORKER).unwrap();
+        let output = r#"{"type":"detection","item":{"media_id":"image-1","width":1200,"height":1600,"persons":[{"x0":0,"y0":0,"x1":1200,"y1":1600,"score":0.9}],"poses":[],"pose_error":"RTMPose CUDA session failed"}}
+{"type":"complete","ready":false,"error":"HumanArt/RTMPose 姿态检测失败: RTMPose CUDA session failed","count":1}
+"#
+        .as_bytes();
+
+        assert!(worker.contains("pose_failures.append"));
+        assert!(worker.contains("health[\"pose_ready\"] = False"));
+        assert!(parse_anime_crop_detection_jsonl(output)
+            .unwrap_err()
+            .contains("HumanArt/RTMPose"));
+    }
+
+    #[test]
+    fn worker_pose_bbox_keeps_plausible_low_score_lower_points_but_rejects_out_of_bounds() {
+        let worker = std::str::from_utf8(ANIME_CROP_WORKER).unwrap();
+
+        assert!(worker.contains("POSE_BBOX_RELIABLE_INDICES"));
+        assert!(worker.contains("POSE_LOWER_ASSOCIATION_INDICES"));
+        assert!(worker.contains("POSE_LOWER_ASSOCIATION_SCORE"));
+        assert!(worker.contains("point_in_image"));
+        assert!(worker.contains("lower_association_points"));
+        assert!(worker.contains("0.0 <= x < float(width)"));
+    }
 
     #[test]
     fn detection_jsonl_accepts_empty_detection_sets_without_losing_the_media_id() {
@@ -3990,6 +4478,368 @@ struct TrainingPreviewRequest {
 #[derive(Debug, Serialize)]
 struct TrainingPreviewResponse {
     toml: String,
+}
+
+fn vllm_runtime_key(settings: &StoredSettings) -> String {
+    format!("{}\n{}", settings.vllm_base_url, settings.vllm_model)
+}
+
+fn vllm_runtime_service(
+    state: &AppState,
+    settings: &StoredSettings,
+) -> Result<VllmService, TaskFailure> {
+    let api_key = state
+        .secrets
+        .get_for_internal_use(SecretKind::Vllm)
+        .map_err(|_| TaskFailure {
+            code: "secret_unavailable".to_string(),
+            message: "无法从系统凭据库读取 vLLM 密钥".to_string(),
+            retryable: true,
+        })?;
+    VllmService::new(
+        VllmServiceConfig {
+            endpoint: settings.vllm_base_url.clone(),
+            allowed_hosts: settings.vllm_allowed_hosts.clone(),
+            model: settings.vllm_model.clone(),
+            system_prompt: settings.vllm_system_prompt.clone(),
+            tag_mode: settings.vllm_tag_mode,
+            concurrency: settings.vllm_concurrency,
+            timeout_seconds: 5,
+            ..VllmServiceConfig::default()
+        },
+        api_key,
+    )
+    .map_err(vllm_task_failure)
+}
+
+async fn configured_vllm_model_is_ready(service: &VllmService, model: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(6), service.list_models())
+        .await
+        .is_ok_and(|result| {
+            result.is_ok_and(|models| models.iter().any(|candidate| candidate == model))
+        })
+}
+
+fn vllm_runtime_config_changed_failure() -> TaskFailure {
+    TaskFailure {
+        code: "vllm_runtime_config_changed".to_string(),
+        message: "vLLM 正在使用另一组 endpoint/model；请等待当前任务结束，或先手动卸载旧模型"
+            .to_string(),
+        retryable: true,
+    }
+}
+
+async fn execute_vllm_unload(
+    state: &AppState,
+    failure_code: &'static str,
+) -> Result<&'static str, TaskFailure> {
+    let project_root = state.vllm_launcher_root.clone().ok_or_else(|| TaskFailure {
+        code: "vllm_launcher_missing".to_string(),
+        message: "找不到随应用提供的 vLLM 卸载脚本".to_string(),
+        retryable: false,
+    })?;
+    tokio::task::spawn_blocking(move || unload_vllm_process(&project_root))
+        .await
+        .map_err(|error| TaskFailure {
+            code: failure_code.to_string(),
+            message: format!("vLLM 卸载任务失败: {error}"),
+            retryable: true,
+        })?
+        .map_err(|message| TaskFailure {
+            code: failure_code.to_string(),
+            message,
+            retryable: true,
+        })
+}
+
+async fn unload_vllm_generation(
+    state: &AppState,
+    generation: u64,
+    failure_code: &'static str,
+) -> Result<&'static str, TaskFailure> {
+    let unload = execute_vllm_unload(state, failure_code).await;
+    let mut runtime = state.vllm_runtime.state.lock().await;
+    runtime.finish_unload(generation, unload.is_ok());
+    drop(runtime);
+    state.vllm_runtime.changed.notify_waiters();
+    unload
+}
+
+async fn cancel_pending_vllm_acquire(state: &AppState, generation: u64) {
+    let should_unload = {
+        let mut runtime = state.vllm_runtime.state.lock().await;
+        runtime.cancel_pending(generation)
+    };
+    state.vllm_runtime.changed.notify_waiters();
+    if should_unload {
+        if let Err(failure) =
+            unload_vllm_generation(state, generation, "vllm_auto_unload_failed").await
+        {
+            tracing::warn!(
+                code = %failure.code,
+                message = %failure.message,
+                "取消 vLLM 启动等待后无法卸载应用拥有的运行时"
+            );
+        }
+    }
+}
+
+async fn acquire_vllm_runtime(
+    state: &AppState,
+    keep_loaded: bool,
+) -> Result<VllmRuntimeLease, TaskFailure> {
+    const START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    let settings = state.settings.read().await.clone();
+    let key = vllm_runtime_key(&settings);
+    let service = vllm_runtime_service(state, &settings)?;
+    let mut pending_reservation: Option<PendingVllmAcquire> = None;
+    loop {
+        let changed = state.vllm_runtime.changed.notified();
+        let generation = {
+            let mut runtime = state.vllm_runtime.state.lock().await;
+
+            if let Some(reservation) = pending_reservation.as_mut() {
+                if runtime.generation == reservation.generation && !runtime.starting {
+                    if let Some(failure) = runtime.last_start_failure.clone() {
+                        reservation.disarm();
+                        return Err(failure);
+                    }
+                    if runtime.key.as_deref() == Some(key.as_str())
+                        && runtime.activate_pending(reservation.generation, keep_loaded)
+                    {
+                        let lease = VllmRuntimeLease {
+                            generation: runtime.generation,
+                            auto_started: runtime.auto_started,
+                            released: false,
+                        };
+                        reservation.disarm();
+                        return Ok(lease);
+                    }
+                }
+                if runtime.generation != reservation.generation {
+                    reservation.disarm();
+                    pending_reservation = None;
+                }
+            }
+
+            if runtime.stopping {
+                drop(runtime);
+                changed.await;
+                continue;
+            }
+            if runtime.starting {
+                if runtime.key.as_deref() != Some(key.as_str()) {
+                    return Err(vllm_runtime_config_changed_failure());
+                }
+                if pending_reservation.is_none() {
+                    let generation = runtime.generation;
+                    if runtime.reserve_pending(generation) {
+                        pending_reservation = Some(PendingVllmAcquire::new(state, generation));
+                    }
+                }
+                drop(runtime);
+                changed.await;
+                continue;
+            }
+            if runtime.ready {
+                if runtime.key.as_deref() == Some(key.as_str()) {
+                    runtime.active_leases = runtime.active_leases.saturating_add(1);
+                    runtime.keep_loaded |= keep_loaded;
+                    return Ok(VllmRuntimeLease {
+                        generation: runtime.generation,
+                        auto_started: runtime.auto_started,
+                        released: false,
+                    });
+                }
+                if runtime.active_leases > 0 || runtime.auto_started {
+                    return Err(vllm_runtime_config_changed_failure());
+                }
+                runtime.ready = false;
+                runtime.key = None;
+                runtime.keep_loaded = false;
+            } else if runtime.auto_started {
+                return Err(TaskFailure {
+                    code: "vllm_cleanup_required".to_string(),
+                    message:
+                        "上次 vLLM 启动后健康检查失败，且自动清理未完成；请先点击卸载后重试"
+                            .to_string(),
+                    retryable: true,
+                });
+            }
+
+            if runtime.active_leases > 0 {
+                if runtime.key.as_deref() != Some(key.as_str()) {
+                    return Err(vllm_runtime_config_changed_failure());
+                }
+                runtime.active_leases = runtime.active_leases.saturating_add(1);
+                runtime.keep_loaded |= keep_loaded;
+                return Ok(VllmRuntimeLease {
+                    generation: runtime.generation,
+                    auto_started: runtime.auto_started,
+                    released: false,
+                });
+            }
+            runtime.begin_generation(key.clone(), keep_loaded)
+        };
+
+        let preexisting = configured_vllm_model_is_ready(&service, &settings.vllm_model).await;
+        let mut launch_succeeded = false;
+        let mut startup_result: Result<(), TaskFailure> = if preexisting {
+            Ok(())
+        } else {
+            async {
+                let port = configured_local_vllm_port(&settings.vllm_base_url).map_err(|message| {
+                    TaskFailure {
+                        code: "invalid_vllm_launch_endpoint".to_string(),
+                        message: message.to_string(),
+                        retryable: false,
+                    }
+                })?;
+                let project_root =
+                    state.vllm_launcher_root.clone().ok_or_else(|| TaskFailure {
+                        code: "vllm_launcher_missing".to_string(),
+                        message: "找不到随应用提供的 vLLM 启动脚本".to_string(),
+                        retryable: false,
+                    })?;
+                let model = settings.vllm_model.clone();
+                tokio::task::spawn_blocking(move || {
+                    launch_vllm_process(&project_root, port, &model)
+                })
+                .await
+                .map_err(join_task_failure)?
+                .map_err(|message| TaskFailure {
+                    code: "vllm_auto_start_failed".to_string(),
+                    message,
+                    retryable: true,
+                })?;
+                launch_succeeded = true;
+                let started = Instant::now();
+                loop {
+                    if configured_vllm_model_is_ready(&service, &settings.vllm_model).await {
+                        break Ok(());
+                    }
+                    if started.elapsed() >= START_TIMEOUT {
+                        break Err(TaskFailure {
+                            code: "vllm_auto_start_timeout".to_string(),
+                            message: format!(
+                                "vLLM 已启动，但模型 {} 在 15 分钟内未就绪",
+                                settings.vllm_model
+                            ),
+                            retryable: true,
+                        });
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            }
+            .await
+        };
+
+        let cleanup_succeeded = if startup_result.is_err() && launch_succeeded {
+            match execute_vllm_unload(state, "vllm_startup_cleanup_failed").await {
+                Ok(_) => true,
+                Err(cleanup) => {
+                    if let Err(failure) = startup_result.as_mut() {
+                        failure.message = format!(
+                            "{}；同时无法清理本次启动的 vLLM：{}",
+                            failure.message, cleanup.message
+                        );
+                    }
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        let mut runtime = state.vllm_runtime.state.lock().await;
+        if runtime.generation != generation {
+            drop(runtime);
+            state.vllm_runtime.changed.notify_waiters();
+            continue;
+        }
+        runtime.starting = false;
+        match startup_result {
+            Ok(()) => {
+                runtime.ready = true;
+                runtime.auto_started = !preexisting;
+                runtime.active_leases = 1;
+                runtime.last_start_failure = None;
+                let lease = VllmRuntimeLease {
+                    generation,
+                    auto_started: runtime.auto_started,
+                    released: false,
+                };
+                drop(runtime);
+                state.vllm_runtime.changed.notify_waiters();
+                return Ok(lease);
+            }
+            Err(failure) => {
+                runtime.ready = false;
+                runtime.active_leases = 0;
+                runtime.pending_acquires = 0;
+                runtime.keep_loaded = false;
+                runtime.last_start_failure = Some(failure.clone());
+                if launch_succeeded && !cleanup_succeeded {
+                    runtime.auto_started = true;
+                } else {
+                    runtime.key = None;
+                    runtime.auto_started = false;
+                }
+                drop(runtime);
+                state.vllm_runtime.changed.notify_waiters();
+                return Err(failure);
+            }
+        }
+    }
+}
+
+async fn release_vllm_runtime(
+    state: &AppState,
+    lease: &mut VllmRuntimeLease,
+) -> Result<(), TaskFailure> {
+    if lease.released {
+        return Ok(());
+    }
+    let should_unload = {
+        let mut runtime = state.vllm_runtime.state.lock().await;
+        lease.released = true;
+        runtime.release_generation(lease.generation)
+    };
+    if !should_unload {
+        state.vllm_runtime.changed.notify_waiters();
+        return Ok(());
+    }
+    unload_vllm_generation(state, lease.generation, "vllm_auto_unload_failed")
+        .await
+        .map(|_| ())
+}
+
+#[derive(Debug, Serialize)]
+struct TrainingPreflightCheckResponse {
+    id: String,
+    ok: bool,
+    severity: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrainingParameterSuggestionResponse {
+    field: &'static str,
+    value: Value,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TrainingPreflightResponse {
+    ready: bool,
+    checks: Vec<TrainingPreflightCheckResponse>,
+    suggestions: Vec<TrainingParameterSuggestionResponse>,
+    effective_steps: u64,
+    estimated_vram_mib: u64,
 }
 
 async fn training_preview(
@@ -4472,11 +5322,15 @@ fn scan_training_metrics(
 #[derive(Debug, Deserialize)]
 struct TrainingLogsQuery {
     tail: Option<usize>,
+    after: Option<u64>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 struct TrainingLogsResponse {
     text: String,
+    cursor: u64,
+    truncated: bool,
 }
 
 async fn training_logs(
@@ -4490,14 +5344,33 @@ async fn training_logs(
         .join("runs")
         .join(&id)
         .join("console.log");
-    let source = match std::fs::read(&path) {
-        Ok(bytes) => decode_training_log_bytes(&bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let after = query.after.unwrap_or(0);
+    let limit = query.limit.unwrap_or(256 * 1024).clamp(1, 1024 * 1024);
+    let (source, cursor, truncated) = match std::fs::File::open(&path) {
+        Ok(mut file) => {
+            let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            let start = after.min(file_len);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|error| ApiError::internal(format!("无法定位训练日志游标: {error}")))?;
+            let mut bytes = vec![0; limit.min((file_len - start) as usize)];
+            file.read_exact(&mut bytes)
+                .map_err(|error| ApiError::internal(format!("无法增量读取训练日志: {error}")))?;
+            let cursor = start.saturating_add(bytes.len() as u64);
+            (decode_training_log_bytes(&bytes), cursor, cursor < file_len)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), 0, false),
         Err(error) => return Err(ApiError::internal(format!("无法读取训练日志: {error}"))),
+    };
+    let text = if query.after.is_some() {
+        source
+    } else {
+        tail_training_log_lines(&source, query.tail.unwrap_or(300).clamp(1, 2_000))
     };
     Ok(Json(ApiSuccess {
         data: TrainingLogsResponse {
-            text: tail_training_log_lines(&source, query.tail.unwrap_or(300).clamp(1, 2_000)),
+            text,
+            cursor,
+            truncated,
         },
         meta: None,
     }))
@@ -5327,6 +6200,7 @@ async fn vllm_health(
     State(state): State<AppState>,
 ) -> Result<Json<ApiSuccess<VllmHealth>>, ApiError> {
     let settings = state.settings.read().await.clone();
+    let configured_model = settings.vllm_model.clone();
     let api_key = state
         .secrets
         .get_for_internal_use(SecretKind::Vllm)
@@ -5345,9 +6219,10 @@ async fn vllm_health(
         api_key,
     )
     .map_err(|error| ApiError::bad_request("invalid_vllm_config", error.message))?;
-    let health = service.health().await;
-    if health.available {
-        state.vllm_loads.clear();
+    let mut health = service.health().await;
+    if health.available && !health.models.iter().any(|model| model == &configured_model) {
+        health.available = false;
+        health.message = format!("vLLM 服务可访问，但配置模型 {configured_model} 尚未加载");
     }
     Ok(Json(ApiSuccess {
         data: health,
@@ -5359,60 +6234,31 @@ async fn vllm_load(
     State(state): State<AppState>,
 ) -> Result<Json<ApiSuccess<VllmLoadResponse>>, ApiError> {
     let settings = state.settings.read().await.clone();
-    let port = configured_local_vllm_port(&settings.vllm_base_url)
+    configured_local_vllm_port(&settings.vllm_base_url)
         .map_err(|message| ApiError::bad_request("invalid_vllm_launch_endpoint", message))?;
-    let api_key = state
-        .secrets
-        .get_for_internal_use(SecretKind::Vllm)
-        .map_err(|_| ApiError::internal("无法读取 vLLM 凭据"))?;
-    let service = VllmService::new(
-        VllmServiceConfig {
-            endpoint: settings.vllm_base_url,
-            allowed_hosts: settings.vllm_allowed_hosts,
-            model: settings.vllm_model,
-            system_prompt: settings.vllm_system_prompt,
-            tag_mode: settings.vllm_tag_mode,
-            concurrency: settings.vllm_concurrency,
-            timeout_seconds: 5,
-            ..VllmServiceConfig::default()
+    let mut lease = acquire_vllm_runtime(&state, true).await.map_err(|failure| ApiError {
+        status: if failure.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
         },
-        api_key,
-    )
-    .map_err(|error| ApiError::bad_request("invalid_vllm_config", error.message))?;
-    if tokio::time::timeout(Duration::from_secs(1), service.health())
+        code: failure.code,
+        message: failure.message,
+        retryable: failure.retryable,
+        fields: None,
+    })?;
+    let started = lease.auto_started;
+    release_vllm_runtime(&state, &mut lease)
         .await
-        .is_ok_and(|health| health.available)
-    {
-        state.vllm_loads.clear();
-        return Ok(Json(ApiSuccess {
-            data: VllmLoadResponse {
-                state: "ready",
-                message: "vLLM 模型已可用".to_string(),
-            },
-            meta: None,
-        }));
-    }
-    if !state.vllm_loads.begin() {
-        return Ok(Json(ApiSuccess {
-            data: VllmLoadResponse {
-                state: "loading",
-                message: "vLLM 模型正在加载，请稍候".to_string(),
-            },
-            meta: None,
-        }));
-    }
-    let Some(project_root) = state.vllm_launcher_root.as_deref() else {
-        state.vllm_loads.clear();
-        return Err(ApiError::internal("找不到随应用提供的 vLLM 启动脚本"));
-    };
-    if let Err(error) = launch_vllm_process(project_root, port) {
-        state.vllm_loads.clear();
-        return Err(ApiError::internal(error));
-    }
+        .map_err(|failure| ApiError::internal(failure.message))?;
     Ok(Json(ApiSuccess {
         data: VllmLoadResponse {
-            state: "started",
-            message: "已开始加载 vLLM 模型；首次加载可能需要数分钟，可在此页查看状态。".to_string(),
+            state: if started { "started" } else { "ready" },
+            message: if started {
+                "vLLM 模型已加载并保持驻留。".to_string()
+            } else {
+                "vLLM 模型已可用，并将保持驻留。".to_string()
+            },
         },
         meta: None,
     }))
@@ -5424,11 +6270,30 @@ async fn vllm_unload(
     let settings = state.settings.read().await.clone();
     configured_local_vllm_port(&settings.vllm_base_url)
         .map_err(|message| ApiError::bad_request("invalid_vllm_launch_endpoint", message))?;
-    let Some(project_root) = state.vllm_launcher_root.as_deref() else {
-        return Err(ApiError::internal("找不到随应用提供的 vLLM 卸载脚本"));
+    let stop_generation = {
+        let mut runtime = state.vllm_runtime.state.lock().await;
+        runtime.begin_manual_stop().ok_or_else(|| ApiError {
+            status: StatusCode::CONFLICT,
+            code: "vllm_in_use".to_string(),
+            message: "vLLM 正在被打标任务或启动等待者使用，任务结束后再卸载".to_string(),
+            retryable: true,
+            fields: None,
+        })?
     };
-    let unload_state = unload_vllm_process(project_root).map_err(ApiError::internal)?;
-    state.vllm_loads.clear();
+    state.vllm_runtime.changed.notify_waiters();
+    let unload_state = unload_vllm_generation(
+        &state,
+        stop_generation,
+        "vllm_manual_unload_failed",
+    )
+    .await
+    .map_err(|failure| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: failure.code,
+        message: failure.message,
+        retryable: failure.retryable,
+        fields: None,
+    })?;
     let message = if unload_state == "stopped" {
         "vLLM 模型已卸载，显存已释放。".to_string()
     } else {
@@ -6311,12 +7176,16 @@ struct LibraryItemsQuery {
     #[serde(default, rename = "q")]
     query: String,
     cursor: Option<String>,
+    #[serde(default)]
+    before: bool,
     page: Option<usize>,
     score_min: Option<i64>,
     score_max: Option<i64>,
     min_resolution: Option<i64>,
     resolution_min: Option<i64>,
     resolution_max: Option<i64>,
+    post_created_from: Option<i64>,
+    post_created_to: Option<i64>,
     directory: Option<String>,
     #[serde(default = "default_library_limit")]
     limit: usize,
@@ -6326,11 +7195,33 @@ fn default_library_limit() -> usize {
     60
 }
 
+fn validate_post_created_range(
+    post_created_from: Option<i64>,
+    post_created_to: Option<i64>,
+) -> Result<(), ApiError> {
+    const MAX_POST_CREATED_EPOCH: i64 = 253_402_300_799;
+    if post_created_from.is_some_and(|value| !(0..=MAX_POST_CREATED_EPOCH).contains(&value))
+        || post_created_to.is_some_and(|value| !(0..=MAX_POST_CREATED_EPOCH).contains(&value))
+        || post_created_from
+            .zip(post_created_to)
+            .is_some_and(|(from, to)| from > to)
+    {
+        return Err(ApiError::bad_request(
+            "invalid_post_created_range",
+            "帖子发布时间区间无效",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct LibraryPageResponse {
     items: Vec<LocalMediaResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    previous_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+    catalog_revision: i64,
     total: i64,
     page: usize,
     total_pages: usize,
@@ -6357,6 +7248,8 @@ struct LocalMediaResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     rating: Option<String>,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_created_at: Option<String>,
     created_at: String,
 }
 
@@ -6376,6 +7269,7 @@ async fn list_library_items(
             "查询最长为 4096 字节",
         ));
     }
+    validate_post_created_range(query.post_created_from, query.post_created_to)?;
     let directory = query
         .directory
         .as_deref()
@@ -6428,54 +7322,79 @@ async fn list_library_items(
         score_max: query.score_max,
         min_resolution: resolution_min,
         max_resolution: query.resolution_max,
+        post_created_from: query.post_created_from,
+        post_created_to: query.post_created_to,
         relative_directory: directory,
     };
-    let numbered_page = state
-        .database
-        .list_library_media_by_page(
-            &query.root_id,
-            query.page.unwrap_or(1),
-            query.limit,
-            &query.query,
-            &filters,
-        )
-        .map_err(|error| ApiError::internal(format!("无法读取图库: {error}")))?;
-    let mut media_items = numbered_page.items;
-    let next_cursor = if query.page.is_none()
-        && query.score_min.is_none()
-        && query.score_max.is_none()
-        && query.min_resolution.is_none()
-        && query.resolution_min.is_none()
-        && query.resolution_max.is_none()
-        && query.directory.is_none()
-    {
-        let legacy_page = state
-            .database
-            .list_library_media(
-                &query.root_id,
-                query.cursor.as_deref(),
-                query.limit,
-                &query.query,
+    let (media_items, previous_cursor, next_cursor, catalog_revision, total, page_number, total_pages, score_ranges, resolution_ranges) =
+        if let Some(page_number) = query.page {
+            let numbered = state
+                .database
+                .list_library_media_by_page(
+                    &query.root_id,
+                    page_number,
+                    query.limit,
+                    &query.query,
+                    &filters,
+                )
+                .map_err(|error| ApiError::internal(format!("无法读取图库兼容分页: {error}")))?;
+            let revision = state.database.get_root(&query.root_id)
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .map(|root| root.catalog_revision)
+                .unwrap_or(1);
+            (
+                numbered.items,
+                None,
+                None,
+                revision,
+                numbered.total,
+                numbered.page,
+                numbered.total_pages,
+                numbered.score_ranges,
+                numbered.resolution_ranges,
             )
-            .map_err(|error| ApiError::internal(format!("无法读取图库: {error}")))?;
-        media_items = legacy_page.items;
-        legacy_page.next_cursor
-    } else {
-        None
-    };
+        } else {
+            let cursor_page = state
+                .database
+                .list_library_media_bidirectional(
+                    &query.root_id,
+                    query.cursor.as_deref(),
+                    query.before,
+                    query.limit,
+                    &query.query,
+                    &filters,
+                )
+                .map_err(|error| ApiError::internal(format!("无法读取图库游标页: {error}")))?;
+            (
+                cursor_page.items,
+                cursor_page.previous_cursor,
+                cursor_page.next_cursor,
+                cursor_page.catalog_revision,
+                cursor_page.total,
+                1,
+                0,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+    let metadata = state.database.get_post_library_metadata_batch(
+        &media_items.iter().filter_map(|media| media.post_id).collect::<Vec<_>>(),
+    ).map_err(|error| ApiError::internal(format!("无法批量读取图库标签: {error}")))?;
     let items = media_items
         .into_iter()
-        .map(|media| local_media_response(&state.database, media))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|media| local_media_response_with_metadata(media, &metadata))
+        .collect::<Vec<_>>();
     Ok(Json(ApiSuccess {
         data: LibraryPageResponse {
             items,
+            previous_cursor,
             next_cursor,
-            total: numbered_page.total,
-            page: numbered_page.page,
-            total_pages: numbered_page.total_pages,
-            score_ranges: numbered_page.score_ranges,
-            resolution_ranges: numbered_page.resolution_ranges,
+            catalog_revision,
+            total,
+            page: page_number,
+            total_pages,
+            score_ranges,
+            resolution_ranges,
         },
         meta: None,
     }))
@@ -6497,8 +7416,13 @@ fn local_media_response(
         .map_err(|error| ApiError::internal(format!("无法读取帖子标签: {error}")))?
         .flatten();
     let rating = metadata.as_ref().map(|metadata| metadata.rating.clone());
+    let post_created_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.post_created_at)
+        .and_then(format_post_created_at);
     let tags = metadata
-        .map(|metadata| metadata.tags.into_iter().map(|tag| tag.name).collect())
+        .as_ref()
+        .map(|metadata| metadata.tags.iter().map(|tag| tag.name.clone()).collect())
         .unwrap_or_default();
     Ok(LocalMediaResponse {
         id: media.id,
@@ -6513,6 +7437,7 @@ fn local_media_response(
         size_bytes: media.byte_size,
         rating,
         tags,
+        post_created_at,
         created_at: media.created_at,
     })
 }
@@ -6572,9 +7497,13 @@ async fn library_media(
             "{}\0{}\0{}\0{}",
             media.id, media.relative_path, media.byte_size, media.updated_at
         );
+        let _request_merge = state.thumbnail_inflight.acquire(&cache_key).await;
+        let enforce_quota = state.thumbnail_inflight.should_enforce_quota();
+        let _decode_slot = state.thumbnail_slots.clone().acquire_owned().await
+            .map_err(|_| ApiError::internal("缩略图工作池已关闭"))?;
         let source = path.clone();
         let thumbnail = tokio::task::spawn_blocking(move || {
-            generate_cached_thumbnail(&source, &cache_dir, &cache_key)
+            generate_cached_thumbnail(&source, &cache_dir, &cache_key, enforce_quota)
         })
         .await
         .map_err(|error| ApiError::internal(format!("缩略图任务异常: {error}")))?
@@ -6613,9 +7542,11 @@ fn generate_cached_thumbnail(
     source: &Path,
     cache_dir: &Path,
     cache_key: &str,
+    enforce_quota: bool,
 ) -> Result<PathBuf, String> {
     const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
     const MAX_PIXELS: u64 = 100_000_000;
+    const CACHE_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
     let metadata =
         std::fs::symlink_metadata(source).map_err(|error| format!("无法读取源图片: {error}"))?;
     if !metadata.is_file() || metadata_is_link_or_reparse_point(&metadata) {
@@ -6636,9 +7567,23 @@ fn generate_cached_thumbnail(
     let destination = cache_dir.join(format!("{}.jpg", hex::encode(digest.finalize())));
     if let Ok(cached) = std::fs::symlink_metadata(&destination) {
         if cached.is_file() && !metadata_is_link_or_reparse_point(&cached) && cached.len() > 0 {
-            return Ok(destination);
+            if image::ImageReader::open(&destination)
+                .ok()
+                .and_then(|reader| reader.with_guessed_format().ok())
+                .and_then(|reader| reader.into_dimensions().ok())
+                .is_some()
+            {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&destination)
+                    .and_then(|file| file.set_modified(SystemTime::now()));
+                return Ok(destination);
+            }
+            std::fs::remove_file(&destination)
+                .map_err(|error| format!("损坏缩略图无法重建: {error}"))?;
+        } else {
+            return Err("缩略图缓存路径不安全".to_string());
         }
-        return Err("缩略图缓存路径不安全".to_string());
     }
 
     let image = image::ImageReader::open(source)
@@ -6669,7 +7614,78 @@ fn generate_cached_thumbnail(
     })();
     let _ = std::fs::remove_file(&temporary);
     write_result?;
+    if enforce_quota {
+        if let Err(error) = enforce_thumbnail_cache_quota(
+            cache_dir,
+            CACHE_QUOTA_BYTES,
+            Some(destination.as_path()),
+        ) {
+            tracing::warn!(%error, "无法完整执行缩略图缓存配额淘汰");
+        }
+    }
     Ok(destination)
+}
+
+fn enforce_thumbnail_cache_quota(
+    cache_dir: &Path,
+    max_bytes: u64,
+    protected: Option<&Path>,
+) -> Result<u64, String> {
+    let mut entries = Vec::new();
+    let mut total = 0_u64;
+    let read_dir = match std::fs::read_dir(cache_dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("无法读取缩略图缓存目录: {error}")),
+    };
+    for entry in read_dir {
+        let entry = entry.map_err(|error| format!("无法读取缩略图缓存项: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jpg") {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("无法读取缩略图缓存元数据: {error}"))?;
+        if !metadata.is_file() || metadata_is_link_or_reparse_point(&metadata) {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        entries.push((
+            metadata.modified().unwrap_or(UNIX_EPOCH),
+            path,
+            metadata.len(),
+        ));
+    }
+    if total <= max_bytes {
+        return Ok(0);
+    }
+    entries.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let mut removed = 0_u64;
+    for (_, path, bytes) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        if protected.is_some_and(|protected| protected == path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                total = total.saturating_sub(bytes);
+                removed = removed.saturating_add(1);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total = total.saturating_sub(bytes);
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "无法淘汰旧缩略图缓存项");
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn library_thumbnail_placeholder(method: &Method) -> Response {
@@ -6929,6 +7945,7 @@ struct TaskSummaryResponse {
     revision: u64,
     title: String,
     progress: TaskProgressResponse,
+    scheduling: TaskSchedulingResponse,
     failures: Vec<TaskFailureResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<Value>,
@@ -7279,7 +8296,7 @@ async fn list_tasks(
         data: TaskSnapshotResponse {
             tasks: tasks
                 .into_iter()
-                .map(|task| task_summary_response(&state.database, task))
+                .map(|task| task_summary_response(&state, task))
                 .collect(),
             last_event_id,
         },
@@ -7420,7 +8437,7 @@ async fn task_detail(
     let result = sanitize_task_result(&task);
     Ok(Json(ApiSuccess {
         data: TaskDetailResponse {
-            task: task_summary_response(&state.database, task),
+            task: task_summary_response(&state, task),
             result,
             item_counts,
             items,
@@ -7474,11 +8491,12 @@ fn task_item_response(item: crate::database::TaskItemRecord) -> Result<TaskItemR
 fn sanitize_task_item_result(result: Option<&Value>) -> Option<Value> {
     let object = result?.as_object()?;
     let mut safe = serde_json::Map::new();
-    for key in ["bytes", "recovered", "sidecar_written"] {
+    for key in ["bytes", "generated", "recovered", "sidecar_written"] {
         if let Some(value) = object.get(key).filter(|value| {
             matches!(
                 (key, *value),
                 ("bytes", Value::Number(_))
+                    | ("generated", Value::Number(_))
                     | ("recovered", Value::Bool(_))
                     | ("sidecar_written", Value::Bool(_))
             )
@@ -7491,6 +8509,14 @@ fn sanitize_task_item_result(result: Option<&Value>) -> Option<Value> {
             "reason".to_string(),
             Value::String(reason.chars().take(256).collect()),
         );
+    }
+    for key in ["media_id", "status"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            safe.insert(
+                key.to_string(),
+                Value::String(value.chars().take(256).collect()),
+            );
+        }
     }
     for key in ["variants", "media_ids", "tags"] {
         if let Some(values) = object.get(key).and_then(Value::as_array) {
@@ -7573,7 +8599,7 @@ fn sanitize_task_result(task: &TaskSnapshot) -> Option<Value> {
                 if let Some(enabled) = smart_crop.get("enabled").and_then(Value::as_bool) {
                     crop.insert("enabled".to_string(), Value::Bool(enabled));
                 }
-                for key in ["generated", "rejected"] {
+                for key in ["requested", "generated", "rejected"] {
                     if let Some(value) =
                         smart_crop.get(key).filter(|value| value.as_u64().is_some())
                     {
@@ -7585,18 +8611,64 @@ fn sanitize_task_result(task: &TaskSnapshot) -> Option<Value> {
                     .and_then(Value::as_object)
                 {
                     let mut safe_coverage = serde_json::Map::new();
-                    for (variant, value) in coverage.iter().take(4) {
-                        let Some(average) = value.get("average").filter(|value| value.is_number())
-                        else {
+                    for variant in [
+                        "portrait",
+                        "upper_body",
+                        "cowboy_shot",
+                        "full_body_tight",
+                        "lower_body",
+                        "feet",
+                    ] {
+                        let Some(value) = coverage.get(variant).and_then(Value::as_object) else {
                             continue;
                         };
-                        safe_coverage.insert(
-                            variant.chars().take(64).collect(),
-                            serde_json::json!({ "average": average }),
-                        );
+                        let mut safe_variant = serde_json::Map::new();
+                        for key in ["count", "average", "min", "max"] {
+                            if let Some(metric) = value.get(key).filter(|metric| metric.is_number()) {
+                                safe_variant.insert(key.to_string(), metric.clone());
+                            }
+                        }
+                        if !safe_variant.is_empty() {
+                            safe_coverage.insert(variant.to_string(), Value::Object(safe_variant));
+                        }
                     }
                     if !safe_coverage.is_empty() {
                         crop.insert("coverage_percent".to_string(), Value::Object(safe_coverage));
+                    }
+                }
+                if let Some(by_variant) = smart_crop.get("by_variant").and_then(Value::as_object) {
+                    let mut safe_variants = serde_json::Map::new();
+                    for variant in [
+                        "portrait",
+                        "upper_body",
+                        "cowboy_shot",
+                        "full_body_tight",
+                        "lower_body",
+                        "feet",
+                    ] {
+                        let Some(details) = by_variant.get(variant).and_then(Value::as_object) else {
+                            continue;
+                        };
+                        let mut safe_details = serde_json::Map::new();
+                        for key in ["requested", "generated", "rejected"] {
+                            if let Some(count) =
+                                details.get(key).filter(|value| value.as_u64().is_some())
+                            {
+                                safe_details.insert(key.to_string(), count.clone());
+                            }
+                        }
+                        if let Some(reasons) =
+                            sanitized_count_map(details.get("rejection_reasons"), 8)
+                        {
+                            safe_details.insert("rejection_reasons".to_string(), reasons);
+                        }
+                        if !safe_details.is_empty() {
+                            safe_variants
+                                .insert(variant.to_string(), Value::Object(safe_details));
+                        }
+                    }
+                    if !safe_variants.is_empty() {
+                        crop.insert("by_variant".to_string(), Value::Object(safe_variants));
                     }
                 }
                 if !crop.is_empty() {
@@ -7883,7 +8955,7 @@ async fn create_task(
             return Err(ApiError::internal("无法持久化下载任务项目"));
         }
     }
-    if request.kind == "vllm_tag" {
+    if matches!(request.kind.as_str(), "vllm_tag" | "dataset_augmentation") {
         let media_ids = validated_task_media_ids(request.options.as_ref())?;
         let items = media_ids
             .into_iter()
@@ -7897,7 +8969,7 @@ async fn create_task(
             })
             .collect::<Vec<_>>();
         if let Err(error) = state.database.ensure_task_items(&task.id, &items) {
-            tracing::error!(task_id = %task.id, %error, "无法持久化 vLLM 任务项目");
+            tracing::error!(task_id = %task.id, kind = %request.kind, %error, "无法持久化媒体任务项目");
             if let Err(status_error) = state.tasks.fail(
                 &task.id,
                 TaskFailure {
@@ -7908,14 +8980,14 @@ async fn create_task(
             ) {
                 tracing::error!(task_id = %task.id, %status_error, "无法持久化任务项目失败状态");
             }
-            return Err(ApiError::internal("无法持久化 vLLM 任务项目"));
+            return Err(ApiError::internal("无法持久化媒体任务项目"));
         }
     }
     spawn_task_worker(state.clone(), task.id.clone()).await;
     Ok((
         StatusCode::CREATED,
         Json(ApiSuccess {
-            data: task_summary_response(&state.database, task),
+            data: task_summary_response(&state, task),
             meta: None,
         }),
     ))
@@ -7938,6 +9010,7 @@ fn validate_task_request(state: &AppState, request: &CreateTaskRequest) -> Resul
     const KINDS: &[&str] = &[
         "download",
         "index_library",
+        "reindex_library",
         "integrity_scan",
         "exact_dedup",
         "near_dedup",
@@ -8144,6 +9217,32 @@ fn validate_task_request(state: &AppState, request: &CreateTaskRequest) -> Resul
                         "任务媒体不属于指定根目录",
                     ));
                 }
+                match task_media_domain(&media.relative_path) {
+                    TaskMediaDomain::AugmentationDerived => {
+                        return Err(ApiError::bad_request(
+                            "augmentation_master_protected",
+                            "derived 是最高质量无损主副本，不能用通用工具修改；请选择 ready 训练副本",
+                        ));
+                    }
+                    TaskMediaDomain::AugmentationReady
+                        if !matches!(
+                            request.kind.as_str(),
+                            "resize" | "tag_pipeline" | "vllm_tag"
+                        ) =>
+                    {
+                        return Err(ApiError::bad_request(
+                            "augmentation_ready_tool_unsupported",
+                            "该工具不能修改训练就绪增广子集；可使用缩放、标签处理或 vLLM",
+                        ));
+                    }
+                    TaskMediaDomain::Internal => {
+                        return Err(ApiError::bad_request(
+                            "internal_media_path",
+                            "内部元数据或隔离目录不能作为媒体任务输入",
+                        ));
+                    }
+                    TaskMediaDomain::Source | TaskMediaDomain::AugmentationReady => {}
+                }
                 if request.kind == "vllm_tag"
                     && !is_supported_vllm_media(&media.relative_path, &media.mime_type)
                 {
@@ -8318,9 +9417,8 @@ fn validate_batch_download_filter(filter: &BatchDownloadFilter) -> Result<(), Ap
         if tag.is_empty()
             || tag.len() > 255
             || tag.starts_with('-')
-            || tag
-                .chars()
-                .any(|character| character.is_whitespace() || character == ':')
+            || tag.chars().any(char::is_whitespace)
+            || has_batch_query_metatag(tag)
             || !seen.insert(tag)
         {
             return Err(ApiError::bad_request(
@@ -8330,6 +9428,116 @@ fn validate_batch_download_filter(filter: &BatchDownloadFilter) -> Result<(), Ap
         }
     }
     Ok(())
+}
+
+fn has_batch_query_metatag(tag: &str) -> bool {
+    let Some((name, _value)) = tag.split_once(':') else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "user"
+            | "approver"
+            | "commenter"
+            | "comm"
+            | "noter"
+            | "noteupdater"
+            | "artcomm"
+            | "commentaryupdater"
+            | "flagger"
+            | "appealer"
+            | "upvote"
+            | "downvote"
+            | "fav"
+            | "ordfav"
+            | "favgroup"
+            | "ordfavgroup"
+            | "reacted"
+            | "pool"
+            | "ordpool"
+            | "note"
+            | "comment"
+            | "commentary"
+            | "id"
+            | "rating"
+            | "source"
+            | "status"
+            | "filetype"
+            | "disapproved"
+            | "parent"
+            | "child"
+            | "search"
+            | "embedded"
+            | "md5"
+            | "pixelhash"
+            | "width"
+            | "height"
+            | "mpixels"
+            | "ratio"
+            | "score"
+            | "upvotes"
+            | "downvotes"
+            | "favcount"
+            | "filesize"
+            | "date"
+            | "age"
+            | "order"
+            | "limit"
+            | "tagcount"
+            | "pixiv_id"
+            | "pixiv"
+            | "unaliased"
+            | "exif"
+            | "duration"
+            | "random"
+            | "is"
+            | "has"
+            | "ai"
+            | "comment_count"
+            | "deleted_comment_count"
+            | "active_comment_count"
+            | "note_count"
+            | "deleted_note_count"
+            | "active_note_count"
+            | "flag_count"
+            | "child_count"
+            | "deleted_child_count"
+            | "active_child_count"
+            | "pool_count"
+            | "deleted_pool_count"
+            | "active_pool_count"
+            | "series_pool_count"
+            | "collection_pool_count"
+            | "appeal_count"
+            | "approval_count"
+            | "replacement_count"
+            | "disapproval_count"
+            | "comments"
+            | "deleted_comments"
+            | "active_comments"
+            | "notes"
+            | "deleted_notes"
+            | "active_notes"
+            | "flags"
+            | "children"
+            | "deleted_children"
+            | "active_children"
+            | "pools"
+            | "deleted_pools"
+            | "active_pools"
+            | "series_pools"
+            | "collection_pools"
+            | "appeals"
+            | "approvals"
+            | "replacements"
+            | "disapprovals"
+            | "gentags"
+            | "arttags"
+            | "copytags"
+            | "chartags"
+            | "metatags"
+    )
 }
 
 fn contains_forbidden_task_option(value: &Value) -> bool {
@@ -8394,6 +9602,41 @@ fn optional_library_selection_i64(
         .transpose()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskMediaDomain {
+    Source,
+    AugmentationReady,
+    AugmentationDerived,
+    Internal,
+}
+
+fn task_media_domain(path: &str) -> TaskMediaDomain {
+    let normalized = path.replace('\\', "/");
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        if component.eq_ignore_ascii_case(".augmentation-metadata")
+            || component.eq_ignore_ascii_case(".danbooru-quarantine")
+        {
+            return TaskMediaDomain::Internal;
+        }
+        if component.eq_ignore_ascii_case(".augmentation") {
+            return match components.get(index + 2).copied() {
+                Some(value) if value.eq_ignore_ascii_case("ready") => {
+                    TaskMediaDomain::AugmentationReady
+                }
+                Some(value) if value.eq_ignore_ascii_case("derived") => {
+                    TaskMediaDomain::AugmentationDerived
+                }
+                _ => TaskMediaDomain::Internal,
+            };
+        }
+    }
+    TaskMediaDomain::Source
+}
+
 fn expand_library_query_selection(
     state: &AppState,
     request: &mut CreateTaskRequest,
@@ -8433,6 +9676,47 @@ fn expand_library_query_selection(
             "library_query 最长为 4096 字节",
         ));
     }
+    let selection_directory = options
+        .get("library_relative_directory")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_library_relative_directory",
+                        "library_relative_directory 必须是字符串",
+                    )
+                })
+                .and_then(normalize_task_relative_directory)
+        })
+        .transpose()?;
+    let selection_domain = selection_directory
+        .as_deref()
+        .map(task_media_domain)
+        .unwrap_or(TaskMediaDomain::Source);
+    match selection_domain {
+        TaskMediaDomain::Source => {}
+        TaskMediaDomain::AugmentationReady
+            if matches!(request.kind.as_str(), "resize" | "tag_pipeline" | "vllm_tag") => {}
+        TaskMediaDomain::AugmentationReady => {
+            return Err(ApiError::bad_request(
+                "augmentation_ready_tool_unsupported",
+                "该工具不能修改训练就绪增广子集；可使用缩放、标签处理或 vLLM",
+            ));
+        }
+        TaskMediaDomain::AugmentationDerived => {
+            return Err(ApiError::bad_request(
+                "augmentation_master_protected",
+                "derived 是最高质量无损主副本，不能用通用工具修改；请选择 ready 训练副本",
+            ));
+        }
+        TaskMediaDomain::Internal => {
+            return Err(ApiError::bad_request(
+                "internal_media_directory",
+                "内部元数据或隔离目录不能作为媒体任务输入",
+            ));
+        }
+    }
     let resolution_min =
         optional_library_selection_i64(options, "library_resolution_min", "分辨率下限")?.or(
             optional_library_selection_i64(options, "library_min_resolution", "最低分辨率")?,
@@ -8446,8 +9730,19 @@ fn expand_library_query_selection(
             "library_resolution_max",
             "分辨率上限",
         )?,
-        relative_directory: None,
+        post_created_from: optional_library_selection_i64(
+            options,
+            "library_post_created_from",
+            "帖子发布时间下限",
+        )?,
+        post_created_to: optional_library_selection_i64(
+            options,
+            "library_post_created_to",
+            "帖子发布时间上限",
+        )?,
+        relative_directory: selection_directory.clone(),
     };
+    validate_post_created_range(filters.post_created_from, filters.post_created_to)?;
     if filters
         .score_min
         .zip(filters.score_max)
@@ -8531,7 +9826,10 @@ fn expand_library_query_selection(
                 }
                 _ => true,
             };
-            if supported && !excluded.contains(&media.id) {
+            if supported
+                && task_media_domain(&media.relative_path) == selection_domain
+                && !excluded.contains(&media.id)
+            {
                 media_ids.push(media.id);
             }
         }
@@ -8547,12 +9845,15 @@ fn expand_library_query_selection(
         ));
     }
     options.remove("library_query");
+    options.remove("library_relative_directory");
     options.remove("excluded_media_ids");
     options.remove("library_score_min");
     options.remove("library_score_max");
     options.remove("library_min_resolution");
     options.remove("library_resolution_min");
     options.remove("library_resolution_max");
+    options.remove("library_post_created_from");
+    options.remove("library_post_created_to");
     options.insert(
         "media_ids".to_string(),
         Value::Array(media_ids.into_iter().map(Value::String).collect()),
@@ -8564,7 +9865,7 @@ fn expand_relative_directory_selection(
     state: &AppState,
     request: &mut CreateTaskRequest,
 ) -> Result<(), ApiError> {
-    if matches!(request.kind.as_str(), "download" | "index_library") {
+    if matches!(request.kind.as_str(), "download" | "index_library" | "reindex_library") {
         return Ok(());
     }
     let Some(options) = request.options.as_mut().and_then(Value::as_object_mut) else {
@@ -8596,10 +9897,40 @@ fn expand_relative_directory_selection(
     {
         return Err(ApiError::not_found("root_not_found", "媒体根不存在"));
     }
-    let mut media = state
-        .database
-        .list_active_media_in_directory(&request.root_id, &directory, 10_001)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let domain = task_media_domain(&directory);
+    let mut media = match domain {
+        TaskMediaDomain::Source => state
+            .database
+            .list_active_source_media_in_directory(&request.root_id, &directory, 10_001),
+        TaskMediaDomain::AugmentationReady
+            if matches!(
+                request.kind.as_str(),
+                "resize" | "tag_pipeline" | "vllm_tag" | "integrity_scan"
+            ) => state.database.list_active_media_in_directory(
+            &request.root_id,
+            &directory,
+            10_001,
+        ),
+        TaskMediaDomain::AugmentationReady => {
+            return Err(ApiError::bad_request(
+                "augmentation_ready_tool_unsupported",
+                "该工具不能修改训练就绪增广子集；可使用缩放、标签处理、vLLM 或完整性检查",
+            ));
+        }
+        TaskMediaDomain::AugmentationDerived => {
+            return Err(ApiError::bad_request(
+                "augmentation_master_protected",
+                "derived 是最高质量无损主副本，不能用通用工具修改；请选择 ready 训练副本",
+            ));
+        }
+        TaskMediaDomain::Internal => {
+            return Err(ApiError::bad_request(
+                "internal_media_directory",
+                "内部元数据或隔离目录不能作为媒体任务输入",
+            ));
+        }
+    }
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     media.retain(|item| match request.kind.as_str() {
         "vllm_tag" => is_supported_vllm_media(&item.relative_path, &item.mime_type),
         "heic_convert" => is_supported_heic_media(&item.relative_path, &item.mime_type),
@@ -8736,7 +10067,15 @@ struct SmartCropOptions {
     #[serde(default)]
     upper_body: Option<bool>,
     #[serde(default)]
+    cowboy_shot: Option<bool>,
+    #[serde(default)]
     full_body_tight: Option<bool>,
+    #[serde(default)]
+    lower_body: Option<bool>,
+    #[serde(default)]
+    feet: Option<bool>,
+    #[serde(default)]
+    require_both_feet: Option<bool>,
     #[serde(default)]
     max_derived_per_family: Option<u8>,
 }
@@ -8813,8 +10152,20 @@ fn parse_dataset_augmentation_config(
         if let Some(value) = smart_crop.upper_body {
             config.smart_crop.upper_body = value;
         }
+        if let Some(value) = smart_crop.cowboy_shot {
+            config.smart_crop.cowboy_shot = value;
+        }
         if let Some(value) = smart_crop.full_body_tight {
             config.smart_crop.full_body_tight = value;
+        }
+        if let Some(value) = smart_crop.lower_body {
+            config.smart_crop.lower_body = value;
+        }
+        if let Some(value) = smart_crop.feet {
+            config.smart_crop.feet = value;
+        }
+        if let Some(value) = smart_crop.require_both_feet {
+            config.smart_crop.require_both_feet = value;
         }
         if let Some(value) = smart_crop.max_derived_per_family {
             config.smart_crop.max_derived_per_family = value;
@@ -8911,6 +10262,9 @@ async fn task_action(
         }
     }
     .map_err(map_task_manager_error)?;
+    if matches!(action.as_str(), "pause" | "cancel") {
+        state.training_leases.notify_waiters();
+    }
     if action == "retry" && matches!(task.kind.as_str(), "download" | "vllm_tag") {
         if let Err(error) = state.database.requeue_retryable_task_items(&id) {
             tracing::error!(task_id = %id, %error, "无法重新排入可重试任务项目");
@@ -8937,7 +10291,7 @@ async fn task_action(
         spawn_task_worker(state.clone(), task.id.clone()).await;
     }
     Ok(Json(ApiSuccess {
-        data: task_summary_response(&state.database, task),
+        data: task_summary_response(&state, task),
         meta: None,
     }))
 }
@@ -8951,7 +10305,7 @@ async fn task_delete(
         .delete_terminal(&id)
         .map_err(map_task_manager_error)?;
     Ok(Json(ApiSuccess {
-        data: task_summary_response(&state.database, task),
+        data: task_summary_response(&state, task),
         meta: None,
     }))
 }
@@ -8981,6 +10335,456 @@ enum WorkerOutcome {
     Stopped,
 }
 
+fn local_media_response_with_metadata(
+    media: MediaFileRecord,
+    metadata: &HashMap<i64, crate::database::PostLibraryMetadata>,
+) -> LocalMediaResponse {
+    let filename = Path::new(&media.relative_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&media.relative_path)
+        .to_string();
+    let post_metadata = media.post_id.and_then(|post_id| metadata.get(&post_id));
+    LocalMediaResponse {
+        id: media.id,
+        root_id: media.root_id,
+        post_id: media.post_id,
+        filename,
+        relative_path: media.relative_path,
+        mime_type: media.mime_type,
+        width: media.width,
+        height: media.height,
+        duration: media.duration,
+        size_bytes: media.byte_size,
+        rating: post_metadata.map(|metadata| metadata.rating.clone()),
+        tags: post_metadata
+            .map(|metadata| metadata.tags.iter().map(|tag| tag.name.clone()).collect())
+            .unwrap_or_default(),
+        post_created_at: post_metadata
+            .and_then(|metadata| metadata.post_created_at)
+            .and_then(format_post_created_at),
+        created_at: media.created_at,
+    }
+}
+
+fn training_parameter_u64(parameters: &Value, key: &str, fallback: u64) -> u64 {
+    parameters
+        .get(key)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(fallback)
+}
+
+fn training_model_path_ready(path: &Path) -> bool {
+    path.is_file() || (path.is_dir() && path.join("model_index.json").is_file())
+}
+
+fn inspect_path_training_dataset(path: &Path) -> (u64, u64) {
+    let mut images = 0_u64;
+    let mut captions = 0_u64;
+    if !path.is_dir() {
+        return (images, captions);
+    }
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_file() && is_training_image_file(entry.path()) {
+            images = images.saturating_add(1);
+            if entry.path().with_extension("txt").is_file() {
+                captions = captions.saturating_add(1);
+            }
+        }
+    }
+    (images, captions)
+}
+
+fn training_resume_state_ready(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let mut optimizer = false;
+    let mut random_state = false;
+    for entry in WalkDir::new(path)
+        .max_depth(2)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        optimizer |= matches!(name.as_ref(), "optimizer.bin" | "optimizer.pt");
+        random_state |= name.starts_with("random_states_")
+            && matches!(entry.path().extension().and_then(|value| value.to_str()), Some("pkl" | "pt"));
+    }
+    optimizer && random_state
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn training_output_available_mib(path: &Path) -> Option<u64> {
+    let parent = nearest_existing_directory(path)?;
+    fs2::available_space(parent).ok().map(|bytes| bytes / 1024 / 1024)
+}
+
+async fn training_preflight(
+    State(state): State<AppState>,
+    Json(request): Json<TrainingRequest>,
+) -> Result<Json<ApiSuccess<TrainingPreflightResponse>>, ApiError> {
+    request
+        .validate()
+        .map_err(|message| ApiError::bad_request("invalid_training_request", message))?;
+    let mut checks = Vec::new();
+    let runtime = resolve_training_runtime_profile(&state.training_root, &request.runtime_profile_id);
+    checks.push(TrainingPreflightCheckResponse {
+        id: "runtime".to_string(),
+        ok: runtime.is_ok(),
+        severity: "error",
+        message: runtime.as_ref().map_or_else(|error| error.clone(), |profile| format!("训练运行时 {} 可用", profile.label)),
+        recovery: runtime.is_err().then(|| "在训练页安装或选择可用运行时".to_string()),
+    });
+    if let Ok(profile) = runtime.as_ref() {
+        let runtime_root = installed_training_runtime_root(&state.training_root);
+        let runtime_root_for_check = runtime_root.clone();
+        let profile_for_check = profile.clone();
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            collect_training_runtime_diagnostics(&runtime_root_for_check, &profile_for_check)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("训练运行时预检异常: {error}")))?;
+        for diagnostic in diagnostics {
+            checks.push(TrainingPreflightCheckResponse {
+                id: format!("runtime-{}", diagnostic.id),
+                ok: diagnostic.ok,
+                severity: "error",
+                message: diagnostic.detail,
+                recovery: (!diagnostic.ok).then(|| "修复或重新安装所选训练运行时".to_string()),
+            });
+        }
+    }
+
+    let model_value = request.parameters.get("pretrained_model_name_or_path")
+        .and_then(Value::as_str).unwrap_or("").trim();
+    let model_ok = !model_value.is_empty() && training_model_path_ready(Path::new(model_value));
+    checks.push(TrainingPreflightCheckResponse {
+        id: "model".to_string(),
+        ok: model_ok,
+        severity: "error",
+        message: if model_ok { "底模文件或 Diffusers 模型目录可用" } else { "底模必须是权重文件或包含 model_index.json 的目录" }.to_string(),
+        recovery: (!model_ok).then(|| "重新选择有效底模或 Diffusers 模型目录".to_string()),
+    });
+    let dataset_images = if request.gallery_datasets().is_empty() {
+        let dataset_value = request.parameters.get("train_data_dir")
+            .and_then(Value::as_str).unwrap_or("").trim();
+        let (images, captions) = inspect_path_training_dataset(Path::new(dataset_value));
+        let dataset_ok = images > 0 && images == captions;
+        checks.push(TrainingPreflightCheckResponse {
+            id: "dataset".to_string(),
+            ok: dataset_ok,
+            severity: "error",
+            message: format!("训练目录包含 {images} 张图片、{captions} 个同名 Caption"),
+            recovery: (!dataset_ok).then(|| "为每张训练图片补齐同名 .txt Caption".to_string()),
+        });
+        images
+    } else {
+        let inspections = request.gallery_datasets().iter()
+            .filter_map(|dataset| inspect_training_gallery_dataset(&state, dataset).ok())
+            .collect::<Vec<_>>();
+        let datasets_ok = inspections.len() == request.gallery_datasets().len()
+            && inspections.iter().all(|inspection| inspection.image_count > 0 && inspection.image_count == inspection.caption_count);
+        let images = inspections.iter()
+            .map(|inspection| inspection.image_count.saturating_mul(inspection.repeats as u64))
+            .sum();
+        checks.push(TrainingPreflightCheckResponse {
+            id: "dataset".to_string(),
+            ok: datasets_ok,
+            severity: "error",
+            message: if datasets_ok { "图库数据集与 Caption 完整" } else { "图库数据集为空或 Caption 不完整" }.to_string(),
+            recovery: (!datasets_ok).then(|| "先完成图库索引与 Caption 生成".to_string()),
+        });
+        images
+    };
+    let output = request.parameters.get("output_dir").and_then(Value::as_str).unwrap_or("");
+    let output_parent = nearest_existing_directory(Path::new(output));
+    let output_ok = !output.trim().is_empty()
+        && output_parent.is_some_and(|parent| {
+            parent.metadata().is_ok_and(|metadata| !metadata.permissions().readonly())
+        });
+    checks.push(TrainingPreflightCheckResponse {
+        id: "output".to_string(),
+        ok: output_ok,
+        severity: "error",
+        message: if output_ok { "输出目录可创建" } else { "输出目录的父目录不可用" }.to_string(),
+        recovery: (!output_ok).then(|| "选择具备写权限的 SSD 输出目录".to_string()),
+    });
+    let output_available_mib = training_output_available_mib(Path::new(output));
+    let disk_ok = output_available_mib.is_some_and(|available| available >= 10_240);
+    checks.push(TrainingPreflightCheckResponse {
+        id: "disk-space".to_string(),
+        ok: disk_ok,
+        severity: "error",
+        message: output_available_mib.map_or_else(
+            || "无法读取输出磁盘的剩余空间".to_string(),
+            |available| format!("输出磁盘剩余 {available} MiB"),
+        ),
+        recovery: (!disk_ok).then(|| "释放至少 10 GiB 空间，或选择容量更充足的 SSD 输出目录".to_string()),
+    });
+    let resume = request.parameters.get("resume").and_then(Value::as_str).unwrap_or("").trim();
+    if !resume.is_empty() {
+        let resume_ok = training_resume_state_ready(Path::new(resume));
+        checks.push(TrainingPreflightCheckResponse {
+            id: "resume".to_string(),
+            ok: resume_ok,
+            severity: "error",
+            message: if resume_ok { "Accelerate/Kohya 断点状态完整" } else { "所选目录不是可恢复的训练状态" }.to_string(),
+            recovery: (!resume_ok).then(|| "选择含 optimizer 与 random_states 文件的状态目录，或清空断点并重新开始".to_string()),
+        });
+    }
+
+    let gpus = training_gpu_inventory();
+    let selected_memory = request.gpu_ids.first()
+        .and_then(|id| gpus.iter().find(|gpu| &gpu.id == id))
+        .or_else(|| gpus.first())
+        .map(|gpu| gpu.memory_total_mib)
+        .unwrap_or(0);
+    checks.push(TrainingPreflightCheckResponse {
+        id: "gpu".to_string(),
+        ok: selected_memory > 0,
+        severity: "error",
+        message: if selected_memory > 0 { format!("检测到 {} MiB GPU 显存", selected_memory) } else { "未检测到可用 NVIDIA GPU".to_string() },
+        recovery: (selected_memory == 0).then(|| "检查 NVIDIA 驱动、CUDA 与 WSL GPU 透传".to_string()),
+    });
+
+    let resolution = training_parameter_u64(&request.parameters, "resolution", if request.adapter_id.contains("sdxl") { 1024 } else { 512 });
+    let batch = training_parameter_u64(&request.parameters, "train_batch_size", 1);
+    let accumulation = training_parameter_u64(&request.parameters, "gradient_accumulation_steps", 1);
+    let configured_steps = training_parameter_u64(&request.parameters, "max_train_steps", 0);
+    let effective_steps = if configured_steps > 0 { configured_steps } else { dataset_images.div_ceil(batch.max(1)).saturating_mul(10) };
+    let estimated_vram_mib = (resolution.saturating_mul(resolution).saturating_mul(batch).saturating_mul(14) / 1024 / 1024)
+        .saturating_add(if request.adapter_id.contains("sdxl") { 7_000 } else { 4_000 });
+    let recommended_batch = if selected_memory >= 20_000 { 4 } else if selected_memory >= 12_000 { 2 } else { 1 };
+    let mut suggestions = Vec::new();
+    if batch > recommended_batch {
+        suggestions.push(TrainingParameterSuggestionResponse {
+            field: "train_batch_size",
+            value: Value::from(recommended_batch),
+            reason: format!("按 {} MiB 显存降低 OOM 风险", selected_memory),
+        });
+    }
+    if accumulation == 1 && recommended_batch == 1 {
+        suggestions.push(TrainingParameterSuggestionResponse {
+            field: "gradient_accumulation_steps",
+            value: Value::from(4),
+            reason: "在小显存批量下保持有效批量大小".to_string(),
+        });
+    }
+    if !request.parameters.get("mixed_precision").is_some() {
+        suggestions.push(TrainingParameterSuggestionResponse {
+            field: "mixed_precision",
+            value: Value::String(if selected_memory >= 8_000 { "bf16" } else { "fp16" }.to_string()),
+            reason: "消费级 NVIDIA GPU 通常可通过混合精度节省显存".to_string(),
+        });
+    }
+    for (field, value, reason) in [
+        ("cache_latents", Value::Bool(true), "缓存 latent 可减少重复 VAE 编码"),
+        ("sdpa", Value::Bool(true), "使用 PyTorch SDPA 降低注意力显存开销"),
+        ("max_data_loader_n_workers", Value::from(2), "消费级桌面默认保留 CPU 与磁盘带宽给界面"),
+        ("save_every_n_epochs", Value::from(1), "每轮保存便于中断恢复与产物筛选"),
+    ] {
+        if request.parameters.get(field).is_none() {
+            suggestions.push(TrainingParameterSuggestionResponse {
+                field,
+                value,
+                reason: reason.to_string(),
+            });
+        }
+    }
+    if request.sample.is_some() && request.parameters.get("sample_every_n_epochs").is_none() {
+        suggestions.push(TrainingParameterSuggestionResponse {
+            field: "sample_every_n_epochs",
+            value: Value::from(1),
+            reason: "固定每轮采样，便于使用相同 Prompt 对比".to_string(),
+        });
+    }
+    Ok(Json(ApiSuccess {
+        data: TrainingPreflightResponse {
+            ready: checks.iter().all(|check| check.ok),
+            checks,
+            suggestions,
+            effective_steps,
+            estimated_vram_mib,
+        },
+        meta: None,
+    }))
+}
+
+async fn library_facets(
+    State(state): State<AppState>,
+    Query(query): Query<LibraryItemsQuery>,
+) -> Result<Json<ApiSuccess<LibraryFacetsResponse>>, ApiError> {
+    validate_post_created_range(query.post_created_from, query.post_created_to)?;
+    let directory = query
+        .directory
+        .as_deref()
+        .map(normalize_task_relative_directory)
+        .transpose()?;
+    let filters = LibraryMediaFilters {
+        score_min: query.score_min,
+        score_max: query.score_max,
+        min_resolution: query.resolution_min.or(query.min_resolution),
+        max_resolution: query.resolution_max,
+        post_created_from: query.post_created_from,
+        post_created_to: query.post_created_to,
+        relative_directory: directory,
+    };
+    let root = state
+        .database
+        .get_root(&query.root_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::not_found("root_not_found", "媒体根不存在"))?;
+    let cache_key = format!(
+        "{}\0{}\0{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}",
+        query.root_id,
+        root.catalog_revision,
+        query.query,
+        filters.score_min,
+        filters.score_max,
+        filters.min_resolution,
+        filters.max_resolution,
+        filters.post_created_from,
+        filters.post_created_to,
+        filters.relative_directory,
+    );
+    if let Some(cached) = state
+        .library_facets_cache
+        .lock()
+        .expect("library facets cache lock poisoned")
+        .get(&cache_key)
+        .filter(|(created, _)| created.elapsed() < Duration::from_secs(300))
+        .map(|(_, value)| value.clone())
+    {
+        return Ok(Json(ApiSuccess { data: cached, meta: None }));
+    }
+    let facets = state
+        .database
+        .list_library_media_by_page(&query.root_id, 1, 1, &query.query, &filters)
+        .map_err(|error| ApiError::internal(format!("无法读取图库分面: {error}")))?;
+    let response = LibraryFacetsResponse {
+            catalog_revision: root.catalog_revision,
+            total: facets.total,
+            score_ranges: facets.score_ranges,
+            resolution_ranges: facets.resolution_ranges,
+        };
+    {
+        let mut cache = state.library_facets_cache.lock()
+            .expect("library facets cache lock poisoned");
+        cache.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(300));
+        cache.insert(cache_key, (Instant::now(), response.clone()));
+    }
+    Ok(Json(ApiSuccess {
+        data: response,
+        meta: None,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LibraryFacetsResponse {
+    catalog_revision: i64,
+    total: i64,
+    score_ranges: Vec<LibraryScoreRange>,
+    resolution_ranges: Vec<LibraryResolutionRange>,
+}
+
+fn thumbnail_cache_diagnostics(path: &Path) -> ThumbnailCacheResponse {
+    let mut result = ThumbnailCacheResponse::default();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                result.entries = result.entries.saturating_add(1);
+                result.bytes = result.bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    result
+}
+
+async fn system_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<SystemDiagnosticsResponse>>, ApiError> {
+    let database_pool = state.database.pool_diagnostics();
+    let thumbnail_cache_dir = state.thumbnail_cache_dir.clone();
+    let thumbnail_cache = tokio::task::spawn_blocking(move || {
+        thumbnail_cache_diagnostics(&thumbnail_cache_dir)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("无法读取缩略图缓存诊断: {error}")))?;
+    let active_workers = state.active_workers.lock().await.len();
+    let queued_tasks = state
+        .tasks
+        .snapshot()
+        .map_err(|error| ApiError::internal(format!("无法读取任务诊断: {error}")))?
+        .into_iter()
+        .filter(|task| task.status == TaskStatus::Queued)
+        .count();
+    Ok(Json(ApiSuccess {
+        data: SystemDiagnosticsResponse {
+            database_pool: DatabasePoolResponse {
+                total: database_pool.total,
+                in_use: database_pool.in_use,
+                idle: database_pool.idle,
+                capacity: database_pool.capacity,
+            },
+            scheduler: state.resource_slots.diagnostics(),
+            thumbnail_cache,
+            active_workers,
+            queued_tasks,
+        },
+        meta: None,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskSchedulingResponse {
+    resource_class: TaskResourceClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_position: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_reason: Option<String>,
+    blocking_task_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_wait_seconds: Option<u64>,
+}
+
+fn task_resource_class(kind: &str) -> TaskResourceClass {
+    match kind {
+        "download" => TaskResourceClass::Network,
+        "index_library" => TaskResourceClass::Io,
+        "training" | "vllm_tag" | "dataset_augmentation" => TaskResourceClass::Gpu,
+        "runtime_install" | "reindex_library" => TaskResourceClass::Maintenance,
+        _ => TaskResourceClass::Cpu,
+    }
+}
+
 async fn spawn_task_worker(state: AppState, task_id: String) {
     {
         let mut active = state.active_workers.lock().await;
@@ -8988,30 +10792,75 @@ async fn spawn_task_worker(state: AppState, task_id: String) {
             return;
         }
     }
-    let gpu_lease = state
+    let initial_task = state
         .tasks
         .get(&task_id)
         .ok()
-        .flatten()
-        .and_then(task_gpu_lease_request);
+        .flatten();
+    let gpu_lease = initial_task.clone().and_then(task_gpu_lease_request);
+    let resource_class = initial_task
+        .as_ref()
+        .map(|task| task_resource_class(&task.kind))
+        .unwrap_or(TaskResourceClass::Cpu);
+    let root_schedule_path = initial_task
+        .as_ref()
+        .and_then(|task| task_root_schedule_path(&state, task));
     if let Some((profile, gpu_ids)) = gpu_lease.as_ref() {
         state
             .training_leases
             .register_waiting(&task_id, profile, gpu_ids);
     }
     tokio::spawn(async move {
+        let mut gpu_changes = state.training_leases.subscribe();
         loop {
+            let root_schedule = if let Some(root_path) = root_schedule_path.as_deref() {
+                match acquire_queued_task_root_schedule(&state, &task_id, root_path).await {
+                    Ok(Some(guard)) => Some(guard),
+                    Ok(None) => {
+                        state.training_leases.release(&task_id);
+                        state.active_workers.lock().await.remove(&task_id);
+                        break;
+                    }
+                    Err(failure) => {
+                        if let Err(error) = state.tasks.start(&task_id) {
+                            tracing::error!(task_id = %task_id, %error, "无法启动根目录调度失败的任务");
+                        }
+                        if let Err(error) = state.tasks.fail(&task_id, failure) {
+                            tracing::error!(task_id = %task_id, %error, "无法持久化根目录调度失败");
+                        }
+                        state.training_leases.release(&task_id);
+                        state.active_workers.lock().await.remove(&task_id);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             if let Some((profile, gpu_ids)) = gpu_lease.as_ref() {
+                if !matches!(
+                    state.tasks.get(&task_id),
+                    Ok(Some(task)) if task.status == TaskStatus::Queued
+                ) {
+                    state.training_leases.release(&task_id);
+                    state.active_workers.lock().await.remove(&task_id);
+                    break;
+                }
                 if !state
                     .training_leases
                     .try_acquire(&task_id, profile, gpu_ids)
                 {
                     let blockers = state.training_leases.blockers(profile, gpu_ids);
                     tracing::debug!(task_id = %task_id, profile, ?gpu_ids, ?blockers, "GPU 任务正在等待已占用的 GPU");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if gpu_changes.changed().await.is_err() {
+                        break;
+                    }
                     continue;
                 }
             }
+            let resource_slot = match state.resource_slots.acquire(resource_class).await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
             let worker_slot = match state.worker_slots.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => break,
@@ -9025,6 +10874,7 @@ async fn spawn_task_worker(state: AppState, task_id: String) {
                 match task.kind.as_str() {
                     "download" => run_download_task(&state, &task).await,
                     "index_library" => run_index_task(&state, &task).await,
+                    "reindex_library" => run_reindex_task(&state, &task).await,
                     "exact_dedup" | "integrity_scan" | "near_dedup" | "delete_by_tag"
                     | "delete_selected" => run_tool_task(&state, &task).await,
                     "vllm_tag" => run_vllm_task(&state, &task).await,
@@ -9108,6 +10958,8 @@ async fn spawn_task_worker(state: AppState, task_id: String) {
             }
 
             drop(worker_slot);
+            drop(resource_slot);
+            drop(root_schedule);
             if gpu_lease.is_some() {
                 state.training_leases.release(&task_id);
             }
@@ -9144,13 +10996,27 @@ fn task_gpu_lease_request(task: TaskSnapshot) -> Option<(String, Vec<String>)> {
             (training.runtime_profile_id, gpu_ids)
         });
     }
+    if task.kind == "vllm_tag" {
+        return Some(("vllm".to_string(), vec!["0".to_string()]));
+    }
     if task.kind == "dataset_augmentation" {
         let config = parse_dataset_augmentation_config(request.options.as_ref()).ok()?;
+        let mut gpu_ids = Vec::new();
         if config.smart_crop.enabled {
-            return Some((
-                config.smart_crop.runtime_profile_id,
-                vec![config.smart_crop.gpu_id],
-            ));
+            gpu_ids.push(config.smart_crop.gpu_id.clone());
+        }
+        if config.retagging.send_to_vllm {
+            gpu_ids.push("0".to_string());
+        }
+        if !gpu_ids.is_empty() {
+            gpu_ids.sort();
+            gpu_ids.dedup();
+            let profile = if config.smart_crop.enabled {
+                config.smart_crop.runtime_profile_id
+            } else {
+                "vllm".to_string()
+            };
+            return Some((profile, gpu_ids));
         }
     }
     None
@@ -9995,6 +11861,33 @@ async fn run_vllm_task(
     state: &AppState,
     task: &TaskSnapshot,
 ) -> Result<WorkerOutcome, TaskFailure> {
+    let has_queued_items = state
+        .database
+        .list_task_items(&task.id)
+        .map_err(database_task_failure)?
+        .iter()
+        .any(|item| item.status == "queued");
+    if !has_queued_items {
+        return run_vllm_task_with_ready_runtime(state, task).await;
+    }
+    let mut lease = acquire_vllm_runtime(state, false).await?;
+    let outcome = run_vllm_task_with_ready_runtime(state, task).await;
+    let cleanup = release_vllm_runtime(state, &mut lease).await;
+    match (outcome, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(failure), Ok(())) => Err(failure),
+        (Err(failure), Err(cleanup)) => {
+            tracing::warn!(code = %cleanup.code, message = %cleanup.message, "vLLM 任务失败后自动卸载也失败");
+            Err(failure)
+        }
+    }
+}
+
+async fn run_vllm_task_with_ready_runtime(
+    state: &AppState,
+    task: &TaskSnapshot,
+) -> Result<WorkerOutcome, TaskFailure> {
     let request: CreateTaskRequest =
         serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
             code: "invalid_task_payload".to_string(),
@@ -10809,11 +12702,24 @@ async fn run_dataset_augmentation_task(
     let started = Instant::now();
     let mut generated_samples = Vec::new();
     let mut rejections = Vec::new();
+    let augmentation_item_keys = state
+        .database
+        .list_task_items(&task.id)
+        .map_err(database_task_failure)?
+        .into_iter()
+        .filter_map(|item| {
+            item.payload
+                .get("media_id")
+                .and_then(Value::as_str)
+                .map(|media_id| (media_id.to_string(), item.item_key))
+        })
+        .collect::<HashMap<_, _>>();
     for (index, source) in sources.into_iter().enumerate() {
         if worker_was_stopped(state, &task.id) {
             return Ok(WorkerOutcome::Stopped);
         }
-        let analysis = analyses.get(&source.media_id).cloned();
+        let source_media_id = source.media_id.clone();
+        let analysis = analyses.get(&source_media_id).cloned();
         let (next_workspace, item_result) = tokio::task::spawn_blocking(move || {
             let mut workspace = workspace;
             let item_result = workspace.process_with_analysis(&source, analysis.as_ref());
@@ -10862,9 +12768,57 @@ async fn run_dataset_augmentation_task(
                         })
                         .map_err(database_task_failure)?;
                 }
+                let item_result = serde_json::json!({
+                    "media_id": source_media_id.clone(),
+                    "generated": samples.len(),
+                    "variants": samples.iter().map(|sample| sample.variant.clone()).collect::<Vec<_>>(),
+                    "status": if samples.is_empty() { "quality_rules_rejected" } else { "generated" },
+                });
+                if let Some(item_key) = augmentation_item_keys.get(&source_media_id) {
+                    let status = if samples.is_empty() { "skipped" } else { "completed" };
+                    if !state
+                        .database
+                        .finish_task_item(&task.id, item_key, status, Some(&item_result), None)
+                        .map_err(database_task_failure)?
+                    {
+                        return Err(TaskFailure {
+                            code: "augmentation_task_item_commit_failed".to_string(),
+                            message: format!("无法提交数据增广项目: {source_media_id}"),
+                            retryable: true,
+                        });
+                    }
+                }
                 generated_samples.extend(samples);
             }
-            DatasetAugmentationItemResult::Rejected(rejection) => rejections.push(rejection),
+            DatasetAugmentationItemResult::Rejected(rejection) => {
+                let item_result = serde_json::json!({
+                    "media_id": source_media_id.clone(),
+                    "generated": 0,
+                    "variants": [],
+                    "status": "source_rejected",
+                    "reason": rejection.reason.clone(),
+                });
+                if let Some(item_key) = augmentation_item_keys.get(&source_media_id) {
+                    if !state
+                        .database
+                        .finish_task_item(
+                            &task.id,
+                            item_key,
+                            "skipped",
+                            Some(&item_result),
+                            None,
+                        )
+                        .map_err(database_task_failure)?
+                    {
+                        return Err(TaskFailure {
+                            code: "augmentation_task_item_commit_failed".to_string(),
+                            message: format!("无法提交数据增广拒绝项目: {source_media_id}"),
+                            retryable: true,
+                        });
+                    }
+                }
+                rejections.push(rejection);
+            }
         }
         if !report_download_progress(state, &task.id, index as u64 + 1, total, 0, started)? {
             return Ok(WorkerOutcome::Stopped);
@@ -10879,7 +12833,8 @@ async fn run_dataset_augmentation_task(
             .cloned()
             .collect::<Vec<_>>();
         if !retagging_samples.is_empty() {
-            let (successes, failures) = retag_dataset_augmentation_samples(
+            let mut lease = acquire_vllm_runtime(state, false).await?;
+            let retagging_result = retag_dataset_augmentation_samples(
                 state,
                 &root_path,
                 &source_lookup,
@@ -10887,7 +12842,17 @@ async fn run_dataset_augmentation_task(
                 &retagging_samples,
                 retagging_config.preserve_artist_character_tags,
             )
-            .await?;
+            .await;
+            let cleanup = release_vllm_runtime(state, &mut lease).await;
+            let (successes, failures) = match (retagging_result, cleanup) {
+                (Ok(result), Ok(())) => result,
+                (Ok(_), Err(cleanup)) => return Err(cleanup),
+                (Err(failure), Ok(())) => return Err(failure),
+                (Err(failure), Err(cleanup)) => {
+                    tracing::warn!(code = %cleanup.code, message = %cleanup.message, "增广重打标失败后自动卸载也失败");
+                    return Err(failure);
+                }
+            };
             let successful_samples = successes
                 .iter()
                 .filter_map(|success| {
@@ -10914,43 +12879,34 @@ async fn run_dataset_augmentation_task(
     }
     let summary = workspace.finish().map_err(tool_task_failure)?;
     let mut variant_counts = BTreeMap::<String, usize>::new();
-    let mut crop_coverage = BTreeMap::<String, (usize, f64)>::new();
     for sample in &generated_samples {
         *variant_counts.entry(sample.variant.clone()).or_default() += 1;
-        if matches!(
-            sample.variant.as_str(),
-            "portrait" | "upper_body" | "full_body_tight"
-        ) {
-            if let Some(source) = source_media.get(&sample.source_media_id) {
-                let source_width = source.width.unwrap_or_default().max(1) as f64;
-                let source_height = source.height.unwrap_or_default().max(1) as f64;
-                let retained_percent = (f64::from(sample.width) * f64::from(sample.height))
-                    / (source_width * source_height)
-                    * 100.0;
-                let entry = crop_coverage.entry(sample.variant.clone()).or_default();
-                entry.0 += 1;
-                entry.1 += retained_percent;
-            }
-        }
     }
-    let crop_coverage = crop_coverage
-        .into_iter()
-        .map(|(variant, (count, total_percent))| {
+    let smart_crop_requested = summary
+        .smart_crop_by_variant
+        .values()
+        .map(|variant| variant.requested)
+        .sum::<usize>();
+    let smart_crop_generated = summary
+        .smart_crop_by_variant
+        .values()
+        .map(|variant| variant.generated)
+        .sum::<usize>();
+    let smart_crop_rejected = summary
+        .smart_crop_by_variant
+        .values()
+        .map(|variant| variant.rejected)
+        .sum::<usize>();
+    let crop_coverage = summary
+        .smart_crop_by_variant
+        .iter()
+        .map(|(variant, details)| {
             (
-                variant,
-                serde_json::json!({
-                    "count": count,
-                    "average": (total_percent / count.max(1) as f64 * 10.0).round() / 10.0,
-                }),
+                variant.clone(),
+                serde_json::to_value(&details.coverage_percent).unwrap_or(Value::Null),
             )
         })
         .collect::<serde_json::Map<String, Value>>();
-    let smart_crop_rejected = summary
-        .rejection_reasons
-        .iter()
-        .filter(|(reason, _)| reason.starts_with("智能裁剪拒绝："))
-        .map(|(_, count)| count)
-        .sum::<usize>();
     Ok(WorkerOutcome::Complete(serde_json::json!({
         "output_relative_directory": summary.output_relative_directory,
         "derived_relative_directory": summary.derived_relative_directory,
@@ -10973,9 +12929,11 @@ async fn run_dataset_augmentation_task(
         "variant_counts": variant_counts,
         "smart_crop": {
             "enabled": smart_crop_enabled,
-            "generated": generated_samples.iter().filter(|sample| matches!(sample.variant.as_str(), "portrait" | "upper_body" | "full_body_tight")).count(),
+            "requested": smart_crop_requested,
+            "generated": smart_crop_generated,
             "rejected": smart_crop_rejected,
             "coverage_percent": crop_coverage,
+            "by_variant": summary.smart_crop_by_variant,
         },
         "rejection_reasons": summary.rejection_reasons,
         "next_step": if summary.retagging_pending == 0 { "原图保留在所选源目录；已二次打标的派生子集位于 .augmentation，任务元数据位于 .augmentation-metadata。训练工作台会自动发现可用派生子集，并可分别设置 repeat。" } else { "原图保留在源目录且不会复制。派生图没有沿用原标签，待重新打标的状态和原因在 .augmentation-metadata 中；只有完成二次打标的派生图会被训练工作台自动加入。" },
@@ -11609,6 +13567,7 @@ struct IndexedMediaCandidate {
     relative_path: String,
     extension: String,
     byte_size: u64,
+    file_mtime: i64,
     width: Option<u32>,
     height: Option<u32>,
     post_id: Option<u64>,
@@ -11632,6 +13591,9 @@ impl IndexingStatusGuard {
     }
 
     fn mark_indexed(&mut self) -> Result<(), TaskFailure> {
+        self.database
+            .advance_catalog_revision(&self.root.id)
+            .map_err(database_task_failure)?;
         self.database
             .update_root(
                 &self.root.id,
@@ -11703,7 +13665,9 @@ async fn run_index_task(
         )
         .map_err(database_task_failure)?;
     let mut indexing_status = IndexingStatusGuard::new(state.database.clone(), root.clone());
-    let candidates = tokio::task::spawn_blocking(move || scan_media_root(&root_path))
+    let candidates = tokio::task::spawn_blocking(move || {
+        scan_media_root(&root_path, &HashMap::new())
+    })
         .await
         .map_err(join_task_failure)??;
     let scanned_paths = candidates
@@ -11718,61 +13682,11 @@ async fn run_index_task(
         if worker_was_stopped(state, &task.id) {
             return Ok(WorkerOutcome::Stopped);
         }
-        let mut local_posts = Vec::new();
-        let mut media_files = Vec::with_capacity(batch.len());
-        for candidate in batch {
-            if let Some(post_id) = candidate.post_id {
-                let tag_string = candidate.tags.join(" ");
-                local_posts.push((
-                    PostRecordInput {
-                        id: post_id as i64,
-                        md5: None,
-                        rating: "unknown".to_string(),
-                        score: candidate.score,
-                        fav_count: 0,
-                        width: i64::from(candidate.width.unwrap_or(0)),
-                        height: i64::from(candidate.height.unwrap_or(0)),
-                        file_ext: Some(candidate.extension.clone()),
-                        file_size: Some(i64::try_from(candidate.byte_size).unwrap_or(i64::MAX)),
-                        source: None,
-                        duration: None,
-                        status: "local".to_string(),
-                        tag_string: tag_string.clone(),
-                        tag_string_general: tag_string,
-                        tag_string_character: String::new(),
-                        tag_string_copyright: String::new(),
-                        tag_string_artist: String::new(),
-                        tag_string_meta: String::new(),
-                    },
-                    candidate
-                        .tags
-                        .iter()
-                        .map(|tag| PostTagInput::new(tag, 0))
-                        .collect::<Vec<_>>(),
-                ));
-            }
-            let mut id_hash = Sha256::new();
-            id_hash.update(request.root_id.as_bytes());
-            id_hash.update([0]);
-            id_hash.update(candidate.relative_path.as_bytes());
-            media_files.push(MediaFileInput {
-                id: format!("indexed-{}", hex::encode(id_hash.finalize())),
-                root_id: request.root_id.clone(),
-                post_id: candidate.post_id.map(|id| id as i64),
-                relative_path: candidate.relative_path.clone(),
-                variant: "original".to_string(),
-                mime_type: media_mime_type(&candidate.extension).to_string(),
-                byte_size: i64::try_from(candidate.byte_size).unwrap_or(i64::MAX),
-                sha256: None,
-                md5: None,
-                width: candidate.width.map(i64::from),
-                height: candidate.height.map(i64::from),
-                duration: None,
-            });
-        }
+        let (local_posts, media_files, file_mtimes) =
+            indexed_media_batch(&request.root_id, batch);
         state
             .database
-            .upsert_indexed_media_batch(&local_posts, &media_files)
+            .upsert_indexed_media_batch_with_mtimes(&local_posts, &media_files, &file_mtimes)
             .map_err(database_task_failure)?;
         indexed = indexed.saturating_add(batch.len() as u64);
         if !report_download_progress(state, &task.id, indexed, total, 0, started)? {
@@ -11792,7 +13706,10 @@ async fn run_index_task(
     })))
 }
 
-fn scan_media_root(root_path: &Path) -> Result<Vec<IndexedMediaCandidate>, TaskFailure> {
+fn scan_media_root(
+    root_path: &Path,
+    existing: &HashMap<String, MediaIndexFingerprint>,
+) -> Result<Vec<IndexedMediaCandidate>, TaskFailure> {
     const EXTENSIONS: &[&str] = &[
         "jpg", "jpeg", "png", "webp", "gif", "avif", "mp4", "webm", "zip", "heic", "heif",
     ];
@@ -11846,9 +13763,29 @@ fn scan_media_root(root_path: &Path) -> Result<Vec<IndexedMediaCandidate>, TaskF
             message: error.to_string(),
             retryable: true,
         })?;
-        let (width, height) = image::image_dimensions(&canonical)
-            .map(|(width, height)| (Some(width), Some(height)))
-            .unwrap_or((None, None));
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        let file_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| i64::try_from(value.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let cached = existing.get(&relative_path).filter(|fingerprint| {
+            fingerprint.byte_size == i64::try_from(metadata.len()).unwrap_or(i64::MAX)
+                && fingerprint.file_mtime == file_mtime
+        });
+        let (width, height) = cached
+            .map(|fingerprint| {
+                (
+                    fingerprint.width.and_then(|value| u32::try_from(value).ok()),
+                    fingerprint.height.and_then(|value| u32::try_from(value).ok()),
+                )
+            })
+            .unwrap_or_else(|| {
+                image::image_dimensions(&canonical)
+                    .map(|(width, height)| (Some(width), Some(height)))
+                    .unwrap_or((None, None))
+            });
         let stem = relative
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -11869,9 +13806,10 @@ fn scan_media_root(root_path: &Path) -> Result<Vec<IndexedMediaCandidate>, TaskF
         let sidecar = canonical.with_extension("txt");
         let tags = read_sidecar_tags(&root, &sidecar);
         candidates.push(IndexedMediaCandidate {
-            relative_path: relative.to_string_lossy().replace('\\', "/"),
+            relative_path,
             extension,
             byte_size: metadata.len(),
+            file_mtime,
             width,
             height,
             post_id,
@@ -12907,6 +14845,60 @@ fn worker_was_stopped(state: &AppState, task_id: &str) -> bool {
     }
 }
 
+fn task_root_schedule_path(state: &AppState, task: &TaskSnapshot) -> Option<PathBuf> {
+    if !matches!(
+        task.kind.as_str(),
+        "download"
+            | "index_library"
+            | "reindex_library"
+            | "exact_dedup"
+            | "integrity_scan"
+            | "near_dedup"
+            | "delete_by_tag"
+            | "delete_selected"
+            | "vllm_tag"
+            | "resize"
+            | "heic_convert"
+            | "tag_pipeline"
+            | "dataset_augmentation"
+    ) {
+        return None;
+    }
+    let root_id = task.payload.get("root_id")?.as_str()?;
+    let root = state.database.get_root(root_id).ok().flatten()?;
+    current_platform_path(&root).ok().map(PathBuf::from)
+}
+
+async fn acquire_queued_task_root_schedule(
+    state: &AppState,
+    task_id: &str,
+    root_path: &Path,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, TaskFailure> {
+    const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    let is_queued = || {
+        matches!(
+            state.tasks.get(task_id),
+            Ok(Some(task)) if task.status == TaskStatus::Queued
+        )
+    };
+    if !is_queued() {
+        return Ok(None);
+    }
+    let acquire = state.root_scheduling.acquire(root_path);
+    tokio::pin!(acquire);
+    loop {
+        tokio::select! {
+            result = &mut acquire => return result.map(Some).map_err(root_write_task_failure),
+            _ = tokio::time::sleep(STOP_POLL_INTERVAL) => {
+                if !is_queued() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 async fn acquire_task_root_write(
     state: &AppState,
     task_id: &str,
@@ -13782,6 +15774,7 @@ fn post_record_input(post: &Post) -> PostRecordInput {
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
         source: (!post.source.is_empty()).then(|| post.source.clone()),
         duration: post.duration,
+        post_created_at: post.created_at.clone(),
         status: if post.file_url.is_some() {
             "available"
         } else {
@@ -13890,7 +15883,7 @@ async fn task_events(
     Query(query): Query<TaskEventsQuery>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let tasks = state.tasks.clone();
-    let database = state.database.clone();
+    let event_state = state.clone();
     let mut receiver = tasks.subscribe();
     let requested_sequence = headers
         .get("last-event-id")
@@ -13911,13 +15904,13 @@ async fn task_events(
                     continue;
                 }
                 last_sequence = event.sequence;
-                yield Ok(task_sse_event(&database, event));
+                yield Ok(task_sse_event(&event_state, event));
             }
 
             match receiver.recv().await {
                 Ok(event) if event.sequence > last_sequence => {
                     last_sequence = event.sequence;
-                    yield Ok(task_sse_event(&database, event));
+                    yield Ok(task_sse_event(&event_state, event));
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -13943,7 +15936,7 @@ fn task_sse_resync_event(sequence: u64) -> Event {
         .expect("task resync event serialization is infallible")
 }
 
-fn task_sse_event(database: &Database, event: crate::tasks::TaskEvent) -> Event {
+fn task_sse_event(state: &AppState, event: crate::tasks::TaskEvent) -> Event {
     let response = TaskEventResponse {
         sequence: event.sequence,
         task_id: event.task_id,
@@ -13953,7 +15946,7 @@ fn task_sse_event(database: &Database, event: crate::tasks::TaskEvent) -> Event 
             "deleted" => "deleted",
             _ => "updated",
         },
-        task: task_summary_response(database, event.task),
+        task: task_summary_response(state, event.task),
     };
     Event::default()
         .id(response.sequence.to_string())
@@ -14328,7 +16321,7 @@ fn danbooru_error_code(kind: DanbooruErrorKind) -> &'static str {
     }
 }
 
-fn task_summary_response(database: &Database, task: TaskSnapshot) -> TaskSummaryResponse {
+fn task_summary_response(state: &AppState, task: TaskSnapshot) -> TaskSummaryResponse {
     let title = task
         .payload
         .get("title")
@@ -14345,7 +16338,7 @@ fn task_summary_response(database: &Database, task: TaskSnapshot) -> TaskSummary
             retryable: failure.retryable,
         })
         .collect::<Vec<_>>();
-    match database.list_task_items_page(&task.id, Some("failed"), None, 20) {
+    match state.database.list_task_items_page(&task.id, Some("failed"), None, 20) {
         Ok(page) => {
             failures.extend(page.items.into_iter().filter_map(|item| {
                 item.error.as_ref().map(|error| {
@@ -14364,6 +16357,7 @@ fn task_summary_response(database: &Database, task: TaskSnapshot) -> TaskSummary
         }
     }
     let training = training_task_summary(&task);
+    let scheduling = task_scheduling_response(state, &task);
     TaskSummaryResponse {
         id: task.id,
         kind: task.kind,
@@ -14378,11 +16372,326 @@ fn task_summary_response(database: &Database, task: TaskSnapshot) -> TaskSummary
             speed_bytes_per_sec: task.speed_bytes_per_sec,
             eta_seconds: task.eta_seconds,
         },
+        scheduling,
         failures,
         preview: task.preview,
         training,
         created_at: format_unix_timestamp(task.created_at),
         updated_at: format_unix_timestamp(task.updated_at),
+    }
+}
+
+struct ReindexStagingGuard {
+    database: Arc<Database>,
+    tasks: Arc<PersistentTaskManager>,
+    task_id: String,
+    root: RootRecord,
+    armed: bool,
+}
+
+impl ReindexStagingGuard {
+    fn new(
+        database: Arc<Database>,
+        tasks: Arc<PersistentTaskManager>,
+        task_id: String,
+        root: RootRecord,
+    ) -> Self {
+        Self { database, tasks, task_id, root, armed: true }
+    }
+
+    fn committed(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReindexStagingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let preserve_for_resume = matches!(
+            self.tasks.get(&self.task_id),
+            Ok(Some(task)) if matches!(task.status, TaskStatus::Pausing | TaskStatus::Paused)
+        );
+        if !preserve_for_resume {
+            if let Err(error) = self.database.discard_library_reindex_staging(&self.task_id) {
+                tracing::error!(task_id = %self.task_id, %error, "无法清理中断的图库重建暂存数据");
+            }
+        }
+        if let Err(error) = self.database.update_root(
+            &self.root.id,
+            &self.root.name,
+            self.root.windows_path.as_deref(),
+            self.root.linux_path.as_deref(),
+            &self.root.indexing_status,
+        ) {
+            tracing::error!(root_id = %self.root.id, %error, "无法恢复图库重建前的根状态");
+        }
+    }
+}
+
+async fn run_reindex_task(
+    state: &AppState,
+    task: &TaskSnapshot,
+) -> Result<WorkerOutcome, TaskFailure> {
+    let database_path = state.settings_path.parent()
+        .unwrap_or(Path::new("."))
+        .join("danbooru_tool.db");
+    let backup_directory = state.settings_path.parent()
+        .unwrap_or(Path::new("."))
+        .join("backups");
+    let backup_path = backup_directory.join(format!("catalog-before-{}.db", task.id));
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        std::fs::create_dir_all(&backup_directory)
+            .map_err(|error| format!("无法创建数据库备份目录: {error}"))?;
+        let source = rusqlite::Connection::open_with_flags(
+            &database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| format!("无法打开待备份数据库: {error}"))?;
+        let mut destination = rusqlite::Connection::open(&backup_path)
+            .map_err(|error| format!("无法创建数据库备份: {error}"))?;
+        rusqlite::backup::Backup::new(&source, &mut destination)
+            .and_then(|backup| backup.run_to_completion(
+                100,
+                Duration::from_millis(10),
+                None,
+            ))
+            .map_err(|error| format!("数据库一致性备份失败: {error}"))
+    })
+    .await
+    .map_err(|error| TaskFailure {
+        code: "catalog_backup_worker_failed".to_string(),
+        message: format!("图库备份线程异常: {error}"),
+        retryable: true,
+    })?
+    .map_err(|message| TaskFailure {
+        code: "catalog_backup_failed".to_string(),
+        message,
+        retryable: true,
+    })?;
+    let request: CreateTaskRequest = serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
+        code: "invalid_task_payload".to_string(),
+        message: error.to_string(),
+        retryable: false,
+    })?;
+    let root = state.database.get_root(&request.root_id)
+        .map_err(database_task_failure)?
+        .ok_or_else(|| TaskFailure {
+            code: "root_not_found".to_string(),
+            message: "媒体根不存在".to_string(),
+            retryable: false,
+        })?;
+    let root_path = current_platform_path(&root)
+        .map(PathBuf::from)
+        .map_err(|error| TaskFailure {
+            code: error.code,
+            message: error.message,
+            retryable: false,
+        })?;
+    let Some(_root_write) = acquire_task_root_write(state, &task.id, &root_path).await? else {
+        return Ok(WorkerOutcome::Stopped);
+    };
+    state.database.begin_library_reindex_staging(&task.id, &root.id)
+        .map_err(database_task_failure)?;
+    state.database.update_root(
+        &root.id,
+        &root.name,
+        root.windows_path.as_deref(),
+        root.linux_path.as_deref(),
+        "reindexing",
+    ).map_err(database_task_failure)?;
+    let mut staging = ReindexStagingGuard::new(
+        state.database.clone(),
+        state.tasks.clone(),
+        task.id.clone(),
+        root.clone(),
+    );
+    let mut fingerprints = state
+        .database
+        .active_media_index_fingerprints(&request.root_id)
+        .map_err(database_task_failure)?;
+    fingerprints.extend(
+        state.database
+            .library_reindex_staging_fingerprints(&task.id, &request.root_id)
+            .map_err(database_task_failure)?,
+    );
+    let candidates = tokio::task::spawn_blocking(move || scan_media_root(&root_path, &fingerprints))
+        .await
+        .map_err(join_task_failure)??;
+    let scanned_paths = candidates
+        .iter()
+        .map(|candidate| candidate.relative_path.clone())
+        .collect::<HashSet<_>>();
+    state.database
+        .prune_library_reindex_staging(&task.id, &request.root_id, &scanned_paths)
+        .map_err(database_task_failure)?;
+    let total = candidates.len() as u64;
+    let started = Instant::now();
+    let mut indexed = 0_u64;
+    for batch in candidates.chunks(256) {
+        if worker_was_stopped(state, &task.id) {
+            return Ok(WorkerOutcome::Stopped);
+        }
+        let (local_posts, media_files, file_mtimes) = indexed_media_batch(&request.root_id, batch);
+        state.database.stage_library_reindex_batch(
+            &task.id,
+            &request.root_id,
+            &local_posts,
+            &media_files,
+            &file_mtimes,
+        ).map_err(database_task_failure)?;
+        indexed = indexed.saturating_add(batch.len() as u64);
+        if !report_download_progress(state, &task.id, indexed, total, 0, started)? {
+            return Ok(WorkerOutcome::Stopped);
+        }
+        tokio::task::yield_now().await;
+    }
+    let (catalog_revision, removed) = state.database.commit_library_reindex(
+        &task.id,
+        &request.root_id,
+        candidates.len(),
+    ).map_err(database_task_failure)?;
+    staging.committed();
+    Ok(WorkerOutcome::Complete(serde_json::json!({
+        "indexed": indexed,
+        "deleted": removed,
+        "catalog_revision": catalog_revision,
+        "backup_created": true,
+    })))
+}
+
+fn indexed_media_batch(
+    root_id: &str,
+    candidates: &[IndexedMediaCandidate],
+) -> (
+    Vec<(PostRecordInput, Vec<PostTagInput>)>,
+    Vec<MediaFileInput>,
+    Vec<(String, i64)>,
+) {
+    let mut local_posts = Vec::new();
+    let mut media_files = Vec::with_capacity(candidates.len());
+    let mut file_mtimes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(post_id) = candidate.post_id {
+            let tag_string = candidate.tags.join(" ");
+            local_posts.push((
+                PostRecordInput {
+                    id: post_id as i64,
+                    md5: None,
+                    rating: "unknown".to_string(),
+                    score: candidate.score,
+                    fav_count: 0,
+                    width: i64::from(candidate.width.unwrap_or(0)),
+                    height: i64::from(candidate.height.unwrap_or(0)),
+                    file_ext: Some(candidate.extension.clone()),
+                    file_size: Some(i64::try_from(candidate.byte_size).unwrap_or(i64::MAX)),
+                    source: None,
+                    duration: None,
+                    post_created_at: None,
+                    status: "local".to_string(),
+                    tag_string: tag_string.clone(),
+                    tag_string_general: tag_string,
+                    tag_string_character: String::new(),
+                    tag_string_copyright: String::new(),
+                    tag_string_artist: String::new(),
+                    tag_string_meta: String::new(),
+                },
+                candidate.tags.iter().map(|tag| PostTagInput::new(tag, 0)).collect(),
+            ));
+        }
+        let mut id_hash = Sha256::new();
+        id_hash.update(root_id.as_bytes());
+        id_hash.update([0]);
+        id_hash.update(candidate.relative_path.as_bytes());
+        let media_id = format!("indexed-{}", hex::encode(id_hash.finalize()));
+        file_mtimes.push((media_id.clone(), candidate.file_mtime));
+        media_files.push(MediaFileInput {
+            id: media_id,
+            root_id: root_id.to_string(),
+            post_id: candidate.post_id.map(|id| id as i64),
+            relative_path: candidate.relative_path.clone(),
+            variant: "original".to_string(),
+            mime_type: media_mime_type(&candidate.extension).to_string(),
+            byte_size: i64::try_from(candidate.byte_size).unwrap_or(i64::MAX),
+            sha256: None,
+            md5: None,
+            width: candidate.width.map(i64::from),
+            height: candidate.height.map(i64::from),
+            duration: None,
+        });
+    }
+    (local_posts, media_files, file_mtimes)
+}
+
+fn task_scheduling_response(state: &AppState, task: &TaskSnapshot) -> TaskSchedulingResponse {
+    let resource_class = task_resource_class(&task.kind);
+    if task.status != TaskStatus::Queued {
+        return TaskSchedulingResponse {
+            resource_class,
+            queue_position: None,
+            wait_reason: None,
+            blocking_task_ids: Vec::new(),
+            estimated_wait_seconds: None,
+        };
+    }
+
+    let mut tasks = state.tasks.snapshot().unwrap_or_default();
+    tasks.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let same_resource = tasks
+        .iter()
+        .filter(|candidate| task_resource_class(&candidate.kind) == resource_class)
+        .collect::<Vec<_>>();
+    let queue_position = same_resource
+        .iter()
+        .filter(|candidate| candidate.status == TaskStatus::Queued)
+        .position(|candidate| candidate.id == task.id)
+        .map(|index| index as u64 + 1);
+    let mut blocking_task_ids = same_resource
+        .iter()
+        .filter(|candidate| {
+            candidate.id != task.id
+                && matches!(candidate.status, TaskStatus::Running | TaskStatus::Pausing)
+        })
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+
+    if resource_class == TaskResourceClass::Gpu {
+        if let Some(wait) = state
+            .training_leases
+            .waiting_snapshot()
+            .into_iter()
+            .find(|wait| wait.task_id == task.id)
+        {
+            blocking_task_ids = wait.blocker_task_ids;
+        }
+    }
+    let estimated_wait_seconds = blocking_task_ids
+        .iter()
+        .filter_map(|blocking_id| tasks.iter().find(|task| &task.id == blocking_id))
+        .filter_map(|task| task.eta_seconds)
+        .max();
+    let wait_reason = Some(if blocking_task_ids.is_empty() {
+        match resource_class {
+            TaskResourceClass::Network => "等待网络下载槽位".to_string(),
+            TaskResourceClass::Io => "等待图库 I/O 槽位".to_string(),
+            TaskResourceClass::Cpu => "等待 CPU 处理槽位".to_string(),
+            TaskResourceClass::Gpu => "等待 GPU 调度器分配设备".to_string(),
+            TaskResourceClass::Maintenance => "等待维护任务槽位".to_string(),
+        }
+    } else {
+        format!("等待任务 {} 释放资源", blocking_task_ids.join("、"))
+    });
+    TaskSchedulingResponse {
+        resource_class,
+        queue_position,
+        wait_reason,
+        blocking_task_ids,
+        estimated_wait_seconds,
     }
 }
 
@@ -14436,6 +16745,7 @@ fn task_title(kind: &str) -> &'static str {
     match kind {
         "download" => "Danbooru 下载",
         "index_library" => "索引本地图库",
+        "reindex_library" => "重建图库索引",
         "integrity_scan" => "完整性检查",
         "exact_dedup" => "精确去重预检",
         "near_dedup" => "近似图片预检",
@@ -14459,6 +16769,10 @@ fn format_unix_timestamp(timestamp: u64) -> String {
     let minute = (seconds % 3_600) / 60;
     let second = seconds % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn format_post_created_at(timestamp: i64) -> Option<String> {
+    u64::try_from(timestamp).ok().map(format_unix_timestamp)
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
@@ -14497,21 +16811,27 @@ fn test_router() -> (Router, AppState, tempfile::TempDir) {
 #[cfg(test)]
 mod security_contract_tests {
     use super::{
-        apply_tool_manifest, cleanup_download_part_files, configure_training_samples,
+        acquire_vllm_runtime, apply_tool_manifest, cleanup_download_part_files,
+        configure_training_samples,
         download_post, download_post_to_destination, downsample_training_metrics,
         has_incomplete_augmentation_marker, is_static_image_post, isolated_mode_enabled,
         meets_minimum_resolution, migrate_legacy_database_from, normalize_task_relative_directory,
         parse_media_variant, prepare_owned_training_output_dir,
         purge_registered_quarantine_file_with, run_resize_task, safetensors_artifact_step,
         segmented_batch_anchor_query, segmented_batch_verification_query, sort_posts_for_download,
-        spawn_task_worker, split_batch_verification_groups, task_average_speed, task_run_speed,
+        enforce_thumbnail_cache_quota, scan_media_root, spawn_task_worker, split_batch_verification_groups,
+        task_average_speed, task_gpu_lease_request, task_resource_class, task_run_speed,
         test_router, training_gallery_dataset_toml, training_gallery_datasets_toml,
         training_sample_prompt_lines, validate_batch_download_filter, validate_task_request,
         BatchDownloadFilter, CreateTaskRequest, DownloadDestination, DownloadSource,
         MediaPolicyRequest, OnlineMetricSampler, PostDownloadOutcome,
-        TrainingGalleryDatasetInspection,
+        TrainingGalleryDatasetInspection, inspect_path_training_dataset,
+        training_model_path_ready, training_output_available_mib, training_resume_state_ready,
+        vllm_runtime_key,
     };
     use crate::models::DownloadConfig;
+    use crate::database::MediaIndexFingerprint;
+    use crate::openapi::TaskResourceClass;
     use crate::secrets::SecretKind;
     use crate::services::danbooru::{
         DanbooruClient, DanbooruClientConfig, MediaAsset, MediaAssetVariant, Post,
@@ -14527,10 +16847,97 @@ mod security_contract_tests {
     use axum::{Json, Router};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tower::ServiceExt;
+
+    #[test]
+    fn incremental_index_reuses_dimensions_only_for_an_unchanged_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("fixture.jpg");
+        std::fs::write(&source, b"not an actual jpeg").unwrap();
+        let metadata = source.metadata().unwrap();
+        let mtime = metadata.modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap()
+            .as_secs() as i64;
+        let fingerprints = HashMap::from([(
+            "fixture.jpg".to_string(),
+            MediaIndexFingerprint {
+                id: "media-1".to_string(),
+                byte_size: metadata.len() as i64,
+                file_mtime: mtime,
+                width: Some(1200),
+                height: Some(800),
+            },
+        )]);
+
+        let unchanged = scan_media_root(directory.path(), &fingerprints).unwrap();
+        assert_eq!((unchanged[0].width, unchanged[0].height), (Some(1200), Some(800)));
+
+        std::fs::write(&source, b"changed and still not an actual jpeg").unwrap();
+        let changed = scan_media_root(directory.path(), &fingerprints).unwrap();
+        assert_eq!((changed[0].width, changed[0].height), (None, None));
+    }
+
+    #[test]
+    fn training_preflight_accepts_diffusers_models_and_requires_real_resume_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("diffusers-model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model_index.json"), "{}").unwrap();
+        assert!(training_model_path_ready(&model));
+
+        let resume = directory.path().join("state");
+        std::fs::create_dir_all(&resume).unwrap();
+        std::fs::write(resume.join("optimizer.bin"), b"state").unwrap();
+        assert!(!training_resume_state_ready(&resume));
+        std::fs::write(resume.join("random_states_0.pkl"), b"state").unwrap();
+        assert!(training_resume_state_ready(&resume));
+    }
+
+    #[test]
+    fn path_training_dataset_preflight_counts_matching_captions() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.jpg"), b"fixture").unwrap();
+        std::fs::write(directory.path().join("a.txt"), b"tag").unwrap();
+        std::fs::write(directory.path().join("b.png"), b"fixture").unwrap();
+
+        assert_eq!(inspect_path_training_dataset(directory.path()), (2, 1));
+    }
+
+    #[test]
+    fn training_disk_preflight_is_read_only_and_uses_the_nearest_existing_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("new-output").join("run-1");
+
+        let available = training_output_available_mib(&output).unwrap();
+
+        assert!(available > 0);
+        assert!(!output.exists(), "a read-only preflight must not create output directories");
+    }
+
+    #[test]
+    fn thumbnail_quota_evicts_oldest_entries_and_keeps_the_current_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let oldest = directory.path().join("a.jpg");
+        let newest = directory.path().join("b.jpg");
+        let protected = directory.path().join("c.jpg");
+        std::fs::write(&oldest, vec![1_u8; 6]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&newest, vec![2_u8; 6]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&protected, vec![3_u8; 6]).unwrap();
+
+        let removed = enforce_thumbnail_cache_quota(directory.path(), 12, Some(&protected))
+            .expect("quota cleanup should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+        assert!(protected.exists());
+    }
 
     #[test]
     fn training_gallery_detects_an_incomplete_augmentation_ancestor() {
@@ -14572,7 +16979,11 @@ mod security_contract_tests {
             "smart_crop": {
                 "portrait": true,
                 "upper_body": true,
-                "full_body_tight": true
+                "cowboy_shot": false,
+                "full_body_tight": true,
+                "lower_body": false,
+                "feet": true,
+                "require_both_feet": true
             }
         });
         let config = super::parse_dataset_augmentation_config(Some(&options)).unwrap();
@@ -14582,7 +16993,12 @@ mod security_contract_tests {
         assert_eq!(config.smart_crop.quality_profile, "anime-quality");
         assert!(config.smart_crop.portrait);
         assert!(config.smart_crop.upper_body);
+        assert!(!config.smart_crop.cowboy_shot);
         assert!(config.smart_crop.full_body_tight);
+        assert!(!config.smart_crop.lower_body);
+        assert!(config.smart_crop.feet);
+        assert!(config.smart_crop.require_both_feet);
+        assert_eq!(config.smart_crop.max_derived_per_family, 6);
     }
 
     #[test]
@@ -14640,13 +17056,41 @@ mod security_contract_tests {
                     "quality_profile": "anime-quality",
                     "portrait": true,
                     "upper_body": true,
+                    "cowboy_shot": true,
                     "full_body_tight": true,
-                    "max_derived_per_family": 3
+                    "lower_body": true,
+                    "feet": true,
+                    "require_both_feet": false,
+                    "max_derived_per_family": 6
                 }
             })),
             training: None,
         };
         assert!(validate_task_request(&state, &request).is_ok());
+    }
+
+    #[test]
+    fn augmentation_paths_distinguish_immutable_masters_from_train_ready_copies() {
+        assert_eq!(
+            super::task_media_domain("mika/source.png"),
+            super::TaskMediaDomain::Source
+        );
+        assert_eq!(
+            super::task_media_domain(
+                "mika/.augmentation/task/derived/cowboy_shot/images/a.png"
+            ),
+            super::TaskMediaDomain::AugmentationDerived
+        );
+        assert_eq!(
+            super::task_media_domain(
+                "mika/.augmentation/task/ready/train/cowboy_shot/images/a.png"
+            ),
+            super::TaskMediaDomain::AugmentationReady
+        );
+        assert_eq!(
+            super::task_media_domain("mika/.augmentation-metadata/task/READY.json"),
+            super::TaskMediaDomain::Internal
+        );
     }
 
     #[test]
@@ -14829,6 +17273,50 @@ mod security_contract_tests {
     }
 
     #[test]
+    fn batch_filter_accepts_a_colon_inside_a_parenthesized_tag_qualifier() {
+        let filter = BatchDownloadFilter {
+            include_tags: vec!["himeko_(honkai:_star_rail)".to_string()],
+            exclude_tags: vec![],
+            minimum_score: 0,
+            minimum_resolution: 0,
+        };
+
+        assert!(validate_batch_download_filter(&filter).is_ok());
+    }
+
+    #[test]
+    fn batch_filter_accepts_a_colon_when_the_prefix_is_not_a_metatag() {
+        let filter = BatchDownloadFilter {
+            include_tags: vec!["namespace:value".to_string()],
+            exclude_tags: vec![],
+            minimum_score: 0,
+            minimum_resolution: 0,
+        };
+
+        assert!(validate_batch_download_filter(&filter).is_ok());
+    }
+
+    #[test]
+    fn batch_filter_still_rejects_known_metatags_case_insensitively() {
+        for tag in [
+            "score:>=10",
+            "RATING:e",
+            "id:123",
+            "order:score",
+            "ratio:16:9",
+        ] {
+            let filter = BatchDownloadFilter {
+                include_tags: vec![tag.to_string()],
+                exclude_tags: vec![],
+                minimum_score: 0,
+                minimum_resolution: 0,
+            };
+
+            assert!(validate_batch_download_filter(&filter).is_err(), "{tag}");
+        }
+    }
+
+    #[test]
     fn download_task_accepts_a_limit_above_ten_thousand() {
         let (_application, state, directory) = test_router();
         let media = directory.path().join("large-download-limit");
@@ -14967,6 +17455,80 @@ mod security_contract_tests {
         assert_eq!(
             manifest["output_directory"],
             output.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn ordinary_vllm_tagging_reserves_gpu_zero() {
+        let (_application, state, _directory) = test_router();
+        let task = state
+            .tasks
+            .create(
+                "vllm_tag",
+                serde_json::json!({
+                    "type": "vllm_tag",
+                    "root_id": "root",
+                    "options": { "media_ids": ["media-1"] }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            task_gpu_lease_request(task),
+            Some(("vllm".to_string(), vec!["0".to_string()]))
+        );
+    }
+
+    #[test]
+    fn retag_only_dataset_augmentation_reserves_vllm_gpu() {
+        let (_application, state, _directory) = test_router();
+        let task = state
+            .tasks
+            .create(
+                "dataset_augmentation",
+                serde_json::json!({
+                    "type": "dataset_augmentation",
+                    "root_id": "root",
+                    "options": {
+                        "media_ids": ["media-1"],
+                        "smart_crop": { "enabled": false },
+                        "retagging": { "send_to_vllm": true }
+                    }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            task_gpu_lease_request(task),
+            Some(("vllm".to_string(), vec!["0".to_string()]))
+        );
+    }
+
+    #[test]
+    fn crop_and_retag_reserve_both_configured_crop_gpu_and_vllm_gpu() {
+        let (_application, state, _directory) = test_router();
+        let task = state
+            .tasks
+            .create(
+                "dataset_augmentation",
+                serde_json::json!({
+                    "type": "dataset_augmentation",
+                    "root_id": "root",
+                    "options": {
+                        "media_ids": ["media-1"],
+                        "smart_crop": { "enabled": true, "gpu_id": "1" },
+                        "retagging": { "send_to_vllm": true }
+                    }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            task_gpu_lease_request(task),
+            Some((
+                "conda:lora".to_string(),
+                vec!["0".to_string(), "1".to_string()]
+            ))
         );
     }
 
@@ -16286,6 +18848,16 @@ mod security_contract_tests {
         (format!("http://{address}/"), server)
     }
 
+    async fn mock_vllm_models() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "data": [
+                { "id": "local/vision-model" },
+                { "id": "unsloth/Qwen3.6-27B-NVFP4" },
+                { "id": "local/custom-vision" }
+            ]
+        }))
+    }
+
     async fn mock_vllm_tags() -> (String, tokio::task::JoinHandle<()>) {
         async fn completions() -> Json<serde_json::Value> {
             Json(serde_json::json!({
@@ -16294,7 +18866,9 @@ mod security_contract_tests {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = Router::new().route("/v1/chat/completions", axum::routing::post(completions));
+        let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
+            .route("/v1/chat/completions", axum::routing::post(completions));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -16303,14 +18877,9 @@ mod security_contract_tests {
     }
 
     async fn mock_vllm_health() -> (String, tokio::task::JoinHandle<()>) {
-        async fn models() -> Json<serde_json::Value> {
-            Json(serde_json::json!({
-                "data": [{ "id": "local/vision-model" }]
-            }))
-        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = Router::new().route("/v1/models", get(models));
+        let app = Router::new().route("/v1/models", get(mock_vllm_models));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -16339,6 +18908,7 @@ mod security_contract_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
             .route("/v1/chat/completions", axum::routing::post(completions))
             .with_state(calls);
         let server = tokio::spawn(async move {
@@ -16361,6 +18931,7 @@ mod security_contract_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
             .route("/v1/chat/completions", axum::routing::post(completions))
             .with_state(calls);
         let server = tokio::spawn(async move {
@@ -16387,6 +18958,7 @@ mod security_contract_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
             .route("/v1/chat/completions", axum::routing::post(completions))
             .with_state(capture);
         let server = tokio::spawn(async move {
@@ -16443,7 +19015,10 @@ mod security_contract_tests {
     async fn vllm_health_endpoint_reports_models_from_the_configured_local_service() {
         let (application, state, _directory) = test_router();
         let (endpoint, server) = mock_vllm_health().await;
-        state.settings.write().await.vllm_base_url = endpoint;
+        let mut settings = state.settings.write().await;
+        settings.vllm_base_url = endpoint;
+        settings.vllm_model = "local/vision-model".to_string();
+        drop(settings);
 
         let response = application
             .oneshot(
@@ -16462,6 +19037,80 @@ mod security_contract_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["data"]["available"], true);
         assert_eq!(json["data"]["models"][0], "local/vision-model");
+    }
+
+    #[tokio::test]
+    async fn manual_load_promotes_a_preexisting_exact_model_without_auto_unload() {
+        let (application, state, _directory) = test_router();
+        let (endpoint, server) = mock_vllm_health().await;
+        let mut settings = state.settings.write().await;
+        settings.vllm_base_url = endpoint;
+        settings.vllm_model = "local/vision-model".to_string();
+        drop(settings);
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vllm/load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        server.abort();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let runtime = state.vllm_runtime.state.lock().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["state"], "ready");
+        assert!(runtime.ready);
+        assert!(!runtime.auto_started);
+        assert!(runtime.keep_loaded);
+        assert_eq!(runtime.active_leases, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_acquire_reserves_a_lease_while_the_leader_is_starting() {
+        let (_application, state, _directory) = test_router();
+        let settings = state.settings.read().await.clone();
+        let key = vllm_runtime_key(&settings);
+        {
+            let mut runtime = state.vllm_runtime.state.lock().await;
+            runtime.key = Some(key);
+            runtime.generation = 41;
+            runtime.starting = true;
+        }
+
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move { acquire_vllm_runtime(&waiting_state, false).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.vllm_runtime.state.lock().await.pending_acquires == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the waiter should reserve its lease before startup finishes");
+
+        {
+            let mut runtime = state.vllm_runtime.state.lock().await;
+            runtime.starting = false;
+            runtime.ready = true;
+            runtime.auto_started = true;
+            runtime.active_leases = 1;
+        }
+        state.vllm_runtime.changed.notify_waiters();
+
+        let lease = waiter.await.unwrap().unwrap();
+        let runtime = state.vllm_runtime.state.lock().await;
+        assert_eq!(lease.generation, 41);
+        assert_eq!(runtime.pending_acquires, 0);
+        assert_eq!(runtime.active_leases, 2);
     }
 
     #[tokio::test]
@@ -16508,6 +19157,34 @@ mod security_contract_tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["code"], "invalid_vllm_launch_endpoint");
+    }
+
+    #[tokio::test]
+    async fn vllm_unload_endpoint_refuses_to_interrupt_an_active_tagging_lease() {
+        let (application, state, _directory) = test_router();
+        {
+            let mut runtime = state.vllm_runtime.state.lock().await;
+            runtime.generation = 1;
+            runtime.active_leases = 1;
+            runtime.auto_started = true;
+        }
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vllm/unload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"]["code"], "vllm_in_use");
     }
 
     #[tokio::test]
@@ -17116,6 +19793,102 @@ mod security_contract_tests {
     }
 
     #[tokio::test]
+    async fn same_root_waiter_does_not_consume_a_worker_slot() {
+        let (_application, mut state, directory) = test_router();
+        state.worker_slots = Arc::new(tokio::sync::Semaphore::new(2));
+        for (id, name) in [("root-shared", "shared"), ("root-independent", "independent")] {
+            let path = directory.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            state
+                .database
+                .create_root(
+                    id,
+                    name,
+                    Some(path.to_str().unwrap()),
+                    Some(path.to_str().unwrap()),
+                )
+                .unwrap();
+        }
+        let shared_lock = state
+            .root_writes
+            .acquire(&directory.path().join("shared"))
+            .await
+            .unwrap();
+        let independent_lock = state
+            .root_writes
+            .acquire(&directory.path().join("independent"))
+            .await
+            .unwrap();
+        let first = state
+            .tasks
+            .create(
+                "index_library",
+                serde_json::json!({"type":"index_library","root_id":"root-shared"}),
+            )
+            .unwrap();
+        let same_root = state
+            .tasks
+            .create(
+                "index_library",
+                serde_json::json!({"type":"index_library","root_id":"root-shared"}),
+            )
+            .unwrap();
+        let independent = state
+            .tasks
+            .create(
+                "index_library",
+                serde_json::json!({"type":"index_library","root_id":"root-independent"}),
+            )
+            .unwrap();
+
+        spawn_task_worker(state.clone(), first.id.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.tasks.get(&first.id).unwrap().unwrap().status != TaskStatus::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first task should reach the root writer");
+        spawn_task_worker(state.clone(), same_root.id.clone()).await;
+        spawn_task_worker(state.clone(), independent.id.clone()).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.tasks.get(&independent.id).unwrap().unwrap().status != TaskStatus::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent root should reach the second execution slot");
+
+        assert_eq!(
+            state.tasks.get(&same_root.id).unwrap().unwrap().status,
+            TaskStatus::Queued,
+            "a same-root waiter must remain outside the execution slots"
+        );
+        assert_eq!(
+            state.tasks.get(&independent.id).unwrap().unwrap().status,
+            TaskStatus::Running,
+            "an independent root must be able to use the free worker slot"
+        );
+        let _ = state.tasks.cancel(&first.id);
+        let _ = state.tasks.cancel(&same_root.id);
+        let _ = state.tasks.cancel(&independent.id);
+        drop((shared_lock, independent_lock));
+    }
+
+    #[test]
+    fn task_kinds_are_partitioned_into_resource_aware_queues() {
+        assert_eq!(task_resource_class("download"), TaskResourceClass::Network);
+        assert_eq!(task_resource_class("index_library"), TaskResourceClass::Io);
+        assert_eq!(task_resource_class("resize"), TaskResourceClass::Cpu);
+        assert_eq!(task_resource_class("training"), TaskResourceClass::Gpu);
+        assert_eq!(
+            task_resource_class("dataset_augmentation"),
+            TaskResourceClass::Gpu
+        );
+        assert_eq!(task_resource_class("runtime_install"), TaskResourceClass::Maintenance);
+    }
+
+    #[tokio::test]
     async fn pausing_a_task_waiting_for_a_root_lock_releases_its_worker_slot() {
         let (_application, mut state, directory) = test_router();
         state.worker_slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -17701,6 +20474,20 @@ mod security_contract_tests {
         assert_eq!(super::post_record_input(&post).rating, "unknown");
     }
 
+    #[test]
+    fn danbooru_post_created_at_is_kept_for_download_persistence() {
+        let post = crate::services::danbooru::Post {
+            id: 42,
+            created_at: Some("2024-01-02T03:04:05Z".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::post_record_input(&post).post_created_at.as_deref(),
+            Some("2024-01-02T03:04:05Z")
+        );
+    }
+
     #[tokio::test]
     async fn danbooru_media_proxy_forwards_range_and_streams_partial_response() {
         let (application, state, _directory) = test_router();
@@ -17984,6 +20771,24 @@ mod security_contract_tests {
                 Some(media_root.to_str().unwrap()),
             )
             .unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "augmentation-ready-query".into(),
+                root_id: "root-vllm-library-query".into(),
+                post_id: None,
+                relative_path:
+                    ".augmentation/task/ready/train/portrait/images/augmentation.jpg".into(),
+                variant: "dataset_augmentation_portrait".into(),
+                mime_type: "image/jpeg".into(),
+                byte_size: 7,
+                sha256: None,
+                md5: None,
+                width: None,
+                height: None,
+                duration: None,
+            })
+            .unwrap();
         for index in 0..=200 {
             state
                 .database
@@ -18022,6 +20827,7 @@ mod security_contract_tests {
                             "root_id": "root-vllm-library-query",
                             "options": {
                                 "library_query": "",
+                                "library_relative_directory": "",
                                 "excluded_media_ids": ["media-042"]
                             }
                         })
@@ -18076,6 +20882,7 @@ mod security_contract_tests {
                         file_size: None,
                         source: None,
                         duration: None,
+                        post_created_at: None,
                         status: "available".into(),
                         tag_string: String::new(),
                         tag_string_general: String::new(),
@@ -18157,10 +20964,188 @@ mod security_contract_tests {
     }
 
     #[tokio::test]
+    async fn creating_dataset_augmentation_task_persists_per_source_items_for_diagnostics() {
+        let (application, state, directory) = test_router();
+        let media_root = directory.path().join("augmentation-task-items");
+        std::fs::create_dir_all(&media_root).unwrap();
+        state
+            .database
+            .create_root(
+                "root-augmentation-items",
+                "Augmentation items",
+                Some(media_root.to_str().unwrap()),
+                Some(media_root.to_str().unwrap()),
+            )
+            .unwrap();
+        std::fs::write(media_root.join("one.png"), b"fixture").unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "augmentation-media-1".into(),
+                root_id: "root-augmentation-items".into(),
+                post_id: None,
+                relative_path: "one.png".into(),
+                variant: "original".into(),
+                mime_type: "image/png".into(),
+                byte_size: 7,
+                sha256: None,
+                md5: None,
+                width: Some(1600),
+                height: Some(2000),
+                duration: None,
+            })
+            .unwrap();
+        let _worker_guard = state
+            .worker_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "dataset_augmentation",
+                            "root_id": "root-augmentation-items",
+                            "options": {
+                                "media_ids": ["augmentation-media-1"],
+                                "smart_crop": { "enabled": false }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id = json["data"]["id"].as_str().unwrap();
+
+        let items = state.database.list_task_items(task_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_key, "media:augmentation-media-1");
+        assert_eq!(items[0].payload["media_id"], "augmentation-media-1");
+    }
+
+    #[tokio::test]
+    async fn creating_a_library_task_keeps_its_post_created_time_filter() {
+        let (application, state, directory) = test_router();
+        let media_root = directory.path().join("post-time-library-task-items");
+        std::fs::create_dir_all(&media_root).unwrap();
+        state
+            .database
+            .create_root(
+                "post-time-task-root",
+                "Post time library query",
+                Some(media_root.to_str().unwrap()),
+                Some(media_root.to_str().unwrap()),
+            )
+            .unwrap();
+        for (post_id, created_at) in [
+            (301, "2024-01-01T00:00:00Z"),
+            (302, "2024-01-02T00:00:00Z"),
+        ] {
+            state
+                .database
+                .upsert_post_with_tags(
+                    &crate::database::PostRecordInput {
+                        id: post_id,
+                        md5: None,
+                        rating: "g".into(),
+                        score: 0,
+                        fav_count: 0,
+                        width: 100,
+                        height: 100,
+                        file_ext: Some("jpg".into()),
+                        file_size: Some(1),
+                        source: None,
+                        duration: None,
+                        post_created_at: Some(created_at.into()),
+                        status: "available".into(),
+                        tag_string: String::new(),
+                        tag_string_general: String::new(),
+                        tag_string_character: String::new(),
+                        tag_string_copyright: String::new(),
+                        tag_string_artist: String::new(),
+                        tag_string_meta: String::new(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            state
+                .database
+                .upsert_media_file(&crate::database::MediaFileInput {
+                    id: format!("post-time-task-media-{post_id}"),
+                    root_id: "post-time-task-root".into(),
+                    post_id: Some(post_id),
+                    relative_path: format!("{post_id}.jpg"),
+                    variant: "original".into(),
+                    mime_type: "image/jpeg".into(),
+                    byte_size: 1,
+                    sha256: None,
+                    md5: None,
+                    width: Some(100),
+                    height: Some(100),
+                    duration: None,
+                })
+                .unwrap();
+        }
+        let _worker_guard = state
+            .worker_slots
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "vllm_tag",
+                            "root_id": "post-time-task-root",
+                            "options": {
+                                "library_query": "",
+                                "library_post_created_from": 1704153600,
+                                "library_post_created_to": 1704153600,
+                                "excluded_media_ids": []
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let task_id = json["data"]["id"].as_str().unwrap();
+        let items = state.database.list_task_items(task_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].payload["media_id"], "post-time-task-media-302");
+    }
+
+    #[tokio::test]
     async fn creating_vllm_task_expands_a_safe_relative_directory_recursively() {
         let (application, state, directory) = test_router();
         let media_root = directory.path().join("vllm-directory-items");
         std::fs::create_dir_all(media_root.join("people/nested")).unwrap();
+        std::fs::create_dir_all(
+            media_root.join("people/.augmentation/task/ready/train/portrait/images"),
+        )
+        .unwrap();
         std::fs::create_dir_all(media_root.join("people-old")).unwrap();
         state
             .database
@@ -18174,6 +21159,10 @@ mod security_contract_tests {
         for (id, relative_path) in [
             ("direct", "people/direct.jpg"),
             ("nested", "people/nested/image.jpg"),
+            (
+                "augmentation-ready",
+                "people/.augmentation/task/ready/train/portrait/images/image.jpg",
+            ),
             ("sibling", "people-old/image.jpg"),
         ] {
             std::fs::write(media_root.join(relative_path), b"fixture").unwrap();
@@ -18234,6 +21223,67 @@ mod security_contract_tests {
                 .collect::<Vec<_>>(),
             ["direct", "nested"]
         );
+    }
+
+    #[tokio::test]
+    async fn mutating_tasks_reject_an_immutable_augmentation_master_selected_by_id() {
+        let (application, state, directory) = test_router();
+        let media_root = directory.path().join("protected-augmentation-master");
+        let relative_path =
+            "people/.augmentation/task/derived/portrait/images/master.png";
+        std::fs::create_dir_all(media_root.join(relative_path).parent().unwrap()).unwrap();
+        std::fs::write(media_root.join(relative_path), b"fixture").unwrap();
+        state
+            .database
+            .create_root(
+                "protected-augmentation-root",
+                "Protected augmentation",
+                Some(media_root.to_str().unwrap()),
+                Some(media_root.to_str().unwrap()),
+            )
+            .unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "augmentation-master".into(),
+                root_id: "protected-augmentation-root".into(),
+                post_id: None,
+                relative_path: relative_path.into(),
+                variant: "dataset_augmentation_portrait".into(),
+                mime_type: "image/png".into(),
+                byte_size: 7,
+                sha256: None,
+                md5: None,
+                width: Some(1024),
+                height: Some(1536),
+                duration: None,
+            })
+            .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "resize",
+                            "root_id": "protected-augmentation-root",
+                            "options": { "media_ids": ["augmentation-master"], "max_size": 1216 }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "augmentation_master_protected");
     }
 
     #[tokio::test]
@@ -19157,6 +22207,129 @@ mod security_contract_tests {
             .unwrap()
             .to_string()
             .contains(media.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn tag_pipeline_applies_to_an_explicit_ready_subset_without_touching_derived_master() {
+        let (application, state, directory) = test_router();
+        let media = directory.path().join("tag-ready-augmentation");
+        let ready_directory =
+            "people/.augmentation/task/ready/train/cowboy_shot/images";
+        let derived_directory = "people/.augmentation/task/derived/cowboy_shot/images";
+        std::fs::create_dir_all(media.join(ready_directory)).unwrap();
+        std::fs::create_dir_all(media.join(derived_directory)).unwrap();
+        std::fs::write(media.join(ready_directory).join("sample.png"), b"media").unwrap();
+        std::fs::write(
+            media.join(ready_directory).join("sample.txt"),
+            "blue_hair,blue_hair",
+        )
+        .unwrap();
+        std::fs::write(media.join(derived_directory).join("sample.png"), b"media").unwrap();
+        std::fs::write(
+            media.join(derived_directory).join("sample.txt"),
+            "blue_hair,blue_hair",
+        )
+        .unwrap();
+        state
+            .database
+            .create_root(
+                "root-tag-ready",
+                "Ready augmentation",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+        state
+            .database
+            .set_tag_category("blue_hair", Some(0))
+            .unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "media-tag-ready".into(),
+                root_id: "root-tag-ready".into(),
+                post_id: None,
+                relative_path: format!("{ready_directory}/sample.png"),
+                variant: "dataset_augmentation_cowboy_shot".into(),
+                mime_type: "image/png".into(),
+                byte_size: 5,
+                sha256: None,
+                md5: None,
+                width: Some(1024),
+                height: Some(1536),
+                duration: None,
+            })
+            .unwrap();
+
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "tag_pipeline",
+                            "root_id": "root-tag-ready",
+                            "options": { "relative_directory": ready_directory }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let task_id = json["data"]["id"].as_str().unwrap().to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if state.tasks.get(&task_id).unwrap().unwrap().status
+                    == TaskStatus::AwaitingConfirmation
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/confirm"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let current = state.tasks.get(&task_id).unwrap().unwrap();
+                if matches!(current.status, TaskStatus::Completed | TaskStatus::Failed) {
+                    break current;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(completed.status, TaskStatus::Completed, "{:?}", completed.error);
+        assert_eq!(
+            std::fs::read_to_string(media.join(ready_directory).join("sample.txt")).unwrap(),
+            "blue hair"
+        );
+        assert_eq!(
+            std::fs::read_to_string(media.join(derived_directory).join("sample.txt")).unwrap(),
+            "blue_hair,blue_hair"
+        );
     }
 
     #[tokio::test]
@@ -20333,6 +23506,7 @@ mod security_contract_tests {
                         file_size: None,
                         source: None,
                         duration: None,
+                        post_created_at: None,
                         status: "available".into(),
                         tag_string: String::new(),
                         tag_string_general: String::new(),
@@ -20563,6 +23737,217 @@ mod security_contract_tests {
         assert_eq!(
             json["data"]["items"][0]["tags"],
             serde_json::json!(["cat", "artist_name"])
+        );
+    }
+
+    #[tokio::test]
+    async fn library_items_filter_and_return_post_created_at() {
+        let (application, state, directory) = test_router();
+        let media = directory.path().join("post-time-media");
+        std::fs::create_dir_all(&media).unwrap();
+        state
+            .database
+            .create_root(
+                "post-time-root",
+                "Post time library",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+        for (post_id, created_at) in [
+            (1, "2024-01-01T00:00:00Z"),
+            (2, "2024-01-02T00:00:00Z"),
+        ] {
+            state
+                .database
+                .upsert_post_with_tags(
+                    &crate::database::PostRecordInput {
+                        id: post_id,
+                        md5: None,
+                        rating: "g".into(),
+                        score: 0,
+                        fav_count: 0,
+                        width: 100,
+                        height: 100,
+                        file_ext: Some("jpg".into()),
+                        file_size: Some(1),
+                        source: None,
+                        duration: None,
+                        post_created_at: Some(created_at.into()),
+                        status: "available".into(),
+                        tag_string: String::new(),
+                        tag_string_general: String::new(),
+                        tag_string_character: String::new(),
+                        tag_string_copyright: String::new(),
+                        tag_string_artist: String::new(),
+                        tag_string_meta: String::new(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            state
+                .database
+                .upsert_media_file(&crate::database::MediaFileInput {
+                    id: format!("post-time-media-{post_id}"),
+                    root_id: "post-time-root".into(),
+                    post_id: Some(post_id),
+                    relative_path: format!("{post_id}.jpg"),
+                    variant: "original".into(),
+                    mime_type: "image/jpeg".into(),
+                    byte_size: 1,
+                    sha256: None,
+                    md5: None,
+                    width: Some(100),
+                    height: Some(100),
+                    duration: None,
+                })
+                .unwrap();
+        }
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/items?root_id=post-time-root&post_created_from=1704153600&post_created_to=1704153600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["data"]["total"], 1);
+        assert_eq!(json["data"]["items"][0]["post_id"], 2);
+        assert_eq!(
+            json["data"]["items"][0]["post_created_at"],
+            "2024-01-02T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_items_reject_an_inverted_post_created_range() {
+        let (application, state, directory) = test_router();
+        let media = directory.path().join("invalid-post-time-media");
+        std::fs::create_dir_all(&media).unwrap();
+        state
+            .database
+            .create_root(
+                "invalid-post-time-root",
+                "Invalid post time library",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/items?root_id=invalid-post-time-root&post_created_from=1704240000&post_created_to=1704153600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "invalid_post_created_range");
+    }
+
+    #[tokio::test]
+    async fn library_facets_respect_the_post_created_range() {
+        let (application, state, directory) = test_router();
+        let media = directory.path().join("post-time-facets-media");
+        std::fs::create_dir_all(&media).unwrap();
+        state
+            .database
+            .create_root(
+                "post-time-facets-root",
+                "Post time facets",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+        for (post_id, created_at, score) in [
+            (1, "2024-01-01T00:00:00Z", 0),
+            (2, "2024-01-02T00:00:00Z", 100),
+        ] {
+            state
+                .database
+                .upsert_post_with_tags(
+                    &crate::database::PostRecordInput {
+                        id: post_id,
+                        md5: None,
+                        rating: "g".into(),
+                        score,
+                        fav_count: 0,
+                        width: 100,
+                        height: 100,
+                        file_ext: Some("jpg".into()),
+                        file_size: Some(1),
+                        source: None,
+                        duration: None,
+                        post_created_at: Some(created_at.into()),
+                        status: "available".into(),
+                        tag_string: String::new(),
+                        tag_string_general: String::new(),
+                        tag_string_character: String::new(),
+                        tag_string_copyright: String::new(),
+                        tag_string_artist: String::new(),
+                        tag_string_meta: String::new(),
+                    },
+                    &[],
+                )
+                .unwrap();
+            state
+                .database
+                .upsert_media_file(&crate::database::MediaFileInput {
+                    id: format!("post-time-facet-media-{post_id}"),
+                    root_id: "post-time-facets-root".into(),
+                    post_id: Some(post_id),
+                    relative_path: format!("{post_id}.jpg"),
+                    variant: "original".into(),
+                    mime_type: "image/jpeg".into(),
+                    byte_size: 1,
+                    sha256: None,
+                    md5: None,
+                    width: Some(100),
+                    height: Some(100),
+                    duration: None,
+                })
+                .unwrap();
+        }
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/api/library/facets?root_id=post-time-facets-root&post_created_from=1704153600&post_created_to=1704153600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["data"]["total"], 1);
+        assert_eq!(
+            json["data"]["score_ranges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|range| range["count"].as_i64().unwrap())
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            json["data"]["resolution_ranges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|range| range["count"].as_i64().unwrap())
+                .sum::<i64>(),
+            1
         );
     }
 
@@ -21596,6 +24981,7 @@ mod security_contract_tests {
                     file_size: Some(4),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "available".into(),
                     tag_string: String::new(),
                     tag_string_general: String::new(),
@@ -21900,6 +25286,7 @@ mod security_contract_tests {
                     file_size: Some(4),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "available".into(),
                     tag_string: String::new(),
                     tag_string_general: String::new(),
@@ -21986,6 +25373,7 @@ mod security_contract_tests {
                     file_size: Some(4),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "available".into(),
                     tag_string: String::new(),
                     tag_string_general: String::new(),
@@ -22189,6 +25577,7 @@ mod security_contract_tests {
                     file_size: Some(3),
                     source: None,
                     duration: None,
+                    post_created_at: None,
                     status: "available".into(),
                     tag_string: String::new(),
                     tag_string_general: String::new(),

@@ -19,6 +19,7 @@ import {
   getTrainingRuntimeDiagnostics,
   getTrainingRuntimeProfiles,
   installTrainingRuntime,
+  preflightTraining,
   previewTraining,
   previewTrainingGalleryDataset,
   type MediaRoot,
@@ -30,6 +31,7 @@ import {
   type TrainingGalleryDatasetPreview,
   type TrainingGpu,
   type TrainingPathBrowser,
+  type TrainingPreflight,
   type TrainingQueueEntry,
   type TrainingRuntimeDiagnostics,
   type TrainingRuntimeProfile,
@@ -55,6 +57,8 @@ const query = ref('')
 const selectedGpuIds = ref<string[]>([])
 const loading = ref(true)
 const submitting = ref(false)
+const preflightLoading = ref(false)
+const preflight = ref<TrainingPreflight | null>(null)
 const preview = ref('')
 const requestedTab = new URLSearchParams(window.location.search).get('tab')
 const requestedPresetId = new URLSearchParams(window.location.search).get('preset')
@@ -852,6 +856,25 @@ async function refreshPreview(): Promise<void> {
   }
 }
 
+async function runPreflight(): Promise<void> {
+  if (!adapter.value || !activeProfile.value) return
+  preflightLoading.value = true
+  try {
+    preflight.value = await preflightTraining({
+      adapter_id: adapter.value.id,
+      runtime_profile_id: activeProfile.value.id,
+      parameters: parameters(),
+      gpu_ids: selectedGpuIds.value,
+      gallery_datasets: galleryDatasets.value,
+      sample: sampleSettings.value,
+    })
+  } catch (reason: unknown) {
+    toast.error('训练预检失败', reason instanceof Error ? reason.message : '请检查当前字段')
+  } finally {
+    preflightLoading.value = false
+  }
+}
+
 async function submit(): Promise<void> {
   if (!adapter.value || !activeProfile.value) return
   if (!activeProfile.value.installed) {
@@ -983,6 +1006,7 @@ onBeforeUnmount(() => {
         <p class="page-description">创建可复现的 LoRA 训练配置，跟踪指标与队列状态，并以奇异值分解评估已导出权重的 rank 余量。</p>
       </div>
       <div v-if="activeTab === 'setup'" class="training-actions">
+        <button class="button" type="button" :disabled="preflightLoading" @click="runPreflight"><Gauge :size="16" /> {{ preflightLoading ? '预检中…' : '训练预检' }}</button>
         <button class="button" type="button" @click="refreshPreview"><FileCode2 :size="16" /> 预览 TOML</button>
         <button class="button button-primary" type="button" :disabled="submitting || loading || !adapter" @click="submit"><CirclePlay :size="16" /> {{ submitting ? '正在加入…' : '加入训练队列' }}</button>
       </div>
@@ -1004,6 +1028,18 @@ onBeforeUnmount(() => {
       <section v-if="runtimeDiagnostics" class="surface training-runtime-diagnostics" aria-label="训练运行时诊断">
         <div><strong>{{ runtimeDiagnostics.profile.label }} 诊断</strong><small>{{ runtimeDiagnostics.profile.runtime_root }}</small></div>
         <span v-for="check in runtimeDiagnostics.checks" :key="check.id" :class="check.ok ? 'ok' : 'failed'"><b>{{ check.ok ? '通过' : '待处理' }}</b>{{ check.id }} · {{ check.detail }}</span>
+      </section>
+      <section v-if="preflight" class="surface training-runtime-diagnostics" aria-label="训练预检结果">
+        <header><strong>{{ preflight.ready ? '预检通过' : '预检发现阻塞项' }}</strong><span>有效步数 {{ preflight.effective_steps.toLocaleString() }} · 预计显存 {{ preflight.estimated_vram_mib.toLocaleString() }} MiB</span></header>
+        <ul>
+          <li v-for="check in preflight.checks" :key="check.id" :class="check.ok ? 'ok-text' : 'warning-text'">
+            <strong>{{ check.ok ? '通过' : '需处理' }}</strong><span>{{ check.message }}<small v-if="check.recovery">{{ check.recovery }}</small></span>
+          </li>
+        </ul>
+        <div v-if="preflight.suggestions.length" class="training-preflight-suggestions">
+          <strong>参数建议（不会自动应用）</strong>
+          <p v-for="suggestion in preflight.suggestions" :key="suggestion.field"><code>{{ suggestion.field }} = {{ suggestion.value }}</code> · {{ suggestion.reason }}</p>
+        </div>
       </section>
 
       <div class="surface training-toolbar">

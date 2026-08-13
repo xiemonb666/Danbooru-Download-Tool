@@ -478,7 +478,7 @@ impl<S: TaskStore> TaskManager<S> {
                 // Training state is written at safe reporting boundaries by the
                 // telemetry bridge. On application restart it remains
                 // resumable rather than being treated as an unrecoverable job.
-                TaskStatus::Running if matches!(task.kind.as_str(), "download" | "training") => {
+                TaskStatus::Running if matches!(task.kind.as_str(), "download" | "training" | "reindex_library") => {
                     task.status = TaskStatus::Paused;
                     task.error = None;
                 }

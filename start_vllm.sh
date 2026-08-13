@@ -90,7 +90,12 @@ echo "[INFO] 按 Ctrl+C 停止服务"
 echo ""
 
 state_temp="$VLLM_STATE_FILE.$$"
-printf '{"status":"loading","port":%s,"pid":%s}\n' "$VLLM_PORT" "$$" > "$state_temp"
+process_stat="$(<"/proc/$$/stat")"
+process_stat_tail="${process_stat##*) }"
+read -r -a process_stat_fields <<< "$process_stat_tail"
+process_start_ticks="${process_stat_fields[19]:-0}"
+printf '{"status":"loading","port":%s,"pid":%s,"start_ticks":%s}\n' \
+  "$VLLM_PORT" "$$" "$process_start_ticks" > "$state_temp"
 mv -f "$state_temp" "$VLLM_STATE_FILE"
 
 exec vllm serve "$MODEL_PATH" \
