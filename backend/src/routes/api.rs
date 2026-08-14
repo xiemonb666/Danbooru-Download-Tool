@@ -13331,15 +13331,16 @@ fn augmentation_identity_tag_prefixes(
         {
             for tag in metadata.tags {
                 match tag.category {
-                    1 => prefixes.push(format!("artist:{}", tag.name)),
-                    4 => prefixes.push(tag.name),
+                    1 | 4 => prefixes.push(tag.name.clone()),
                     _ => {}
                 }
             }
         }
     }
     // Locally supplied captions may carry explicit identity prefixes even
-    // when this root has no indexed Danbooru post metadata.
+    // when this root has no indexed Danbooru post metadata. Prefixes are
+    // stripped so training captions stay bare (artist/character are ordinary
+    // tags, not typed fields).
     if prefixes.is_empty() {
         let sidecar = root
             .resolve(&source.relative_path)
@@ -13350,7 +13351,14 @@ fn augmentation_identity_tag_prefixes(
         prefixes.extend(caption.split(',').filter_map(|raw| {
             let tag = raw.trim();
             (tag.starts_with("artist:") || tag.starts_with('@') || tag.starts_with("character:"))
-                .then(|| tag.to_string())
+                .then(|| {
+                    tag.strip_prefix("artist:")
+                        .or_else(|| tag.strip_prefix("character:"))
+                        .or_else(|| tag.strip_prefix('@'))
+                        .unwrap_or(tag)
+                        .trim()
+                        .to_string()
+                })
         }));
     }
     prefixes.sort();

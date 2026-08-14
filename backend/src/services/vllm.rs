@@ -737,6 +737,12 @@ fn parse_tag_output(raw: &str) -> Result<Vec<String>, VllmError> {
             !tag.is_empty()
                 && tag.len() <= 80
                 && !tag.starts_with("http")
+                // Typed identity prefixes are never inferred: artist/character
+                // tags come from the source caption, and a model that fabricates
+                // them would add characters the image does not actually have.
+                && !tag.starts_with("artist:")
+                && !tag.starts_with("character:")
+                && !tag.starts_with('@')
                 && seen.insert(tag.clone())
         })
         .collect::<Vec<_>>();
@@ -1315,6 +1321,15 @@ mod secure_tests {
         assert_eq!(
             parse_tag_output("cat, blue hair, solo").expect("plain tag list"),
             vec!["cat", "blue_hair", "solo"]
+        );
+    }
+
+    #[test]
+    fn typed_identity_prefixes_are_never_inferred_from_model_output() {
+        assert_eq!(
+            parse_tag_output("blush, artist:aramedraw, character:alice_(alice_in_wonderland), @pixiv_id")
+                .expect("prefix tags dropped"),
+            vec!["blush"]
         );
     }
 
