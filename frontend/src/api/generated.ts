@@ -1214,6 +1214,7 @@ export interface components {
                 /** Format: int64 */
                 revision: number;
                 scheduling: components["schemas"]["TaskScheduling"];
+                stage: string;
                 status: components["schemas"]["TaskStatus"];
                 title: string;
                 training?: null | components["schemas"]["TrainingTaskSummary"];
@@ -2275,7 +2276,11 @@ export interface components {
         TaskKind: "download" | "index_library" | "reindex_library" | "integrity_scan" | "exact_dedup" | "near_dedup" | "resize" | "heic_convert" | "delete_by_tag" | "delete_selected" | "tag_pipeline" | "vllm_tag" | "dataset_augmentation" | "training" | "runtime_install";
         TaskPreview: {
             candidates?: components["schemas"]["TaskPreviewCandidate"][] | null;
+            message?: string | null;
             pairs?: components["schemas"]["NearDuplicatePair"][] | null;
+            /** Format: int64 */
+            pending?: number | null;
+            type?: string | null;
         };
         TaskPreviewCandidate: {
             companion_paths?: string[] | null;
@@ -2327,6 +2332,7 @@ export interface components {
             /** Format: int64 */
             revision: number;
             scheduling: components["schemas"]["TaskScheduling"];
+            stage: string;
             status: components["schemas"]["TaskStatus"];
             title: string;
             training?: null | components["schemas"]["TrainingTaskSummary"];

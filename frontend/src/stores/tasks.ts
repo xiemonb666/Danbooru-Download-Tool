@@ -176,8 +176,8 @@ export const useTasksStore = defineStore('tasks', () => {
     connection.value = 'idle'
   }
 
-  async function control(id: string, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm'): Promise<void> {
-    const updated = await taskAction(id, action)
+  async function control(id: string, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm', decision?: string): Promise<void> {
+    const updated = await taskAction(id, action, decision)
     const index = tasks.value.findIndex((task) => task.id === id)
     if (index === -1) tasks.value.unshift(updated)
     else tasks.value[index] = updated

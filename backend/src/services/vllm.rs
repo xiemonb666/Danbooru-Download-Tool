@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use crate::services::danbooru::DanbooruErrorKind;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -8,6 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -224,6 +226,7 @@ pub struct VllmService {
     output: Arc<VllmOutputOptions>,
     danbooru_client: Option<crate::services::danbooru::DanbooruClient>,
     danbooru_tag_cache: Arc<RwLock<HashMap<String, bool>>>,
+    abort: Arc<AtomicBool>,
 }
 
 impl VllmService {
@@ -264,6 +267,7 @@ impl VllmService {
             output: Arc::new(VllmOutputOptions::default()),
             danbooru_client: None,
             danbooru_tag_cache: Arc::new(RwLock::new(HashMap::new())),
+            abort: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -301,6 +305,7 @@ impl VllmService {
 
         let mut successes = Vec::new();
         let mut failures = Vec::new();
+        let mut aborted = false;
         while let Some(result) = running.join_next().await {
             match result {
                 Ok(Ok(success)) => successes.push(success),
@@ -312,9 +317,27 @@ impl VllmService {
                     retryable: true,
                 }),
             }
-            if let Some(item) = pending.next() {
-                let service = self.clone();
-                running.spawn(async move { service.process_item(item).await });
+            // A Danbooru connectivity failure inside verification flips the
+            // abort flag: stop dispatching new items so the batch stalls at a
+            // known point instead of burning rate-limited requests.
+            if !aborted && self.abort.load(Ordering::Relaxed) {
+                aborted = true;
+            }
+            if !aborted {
+                if let Some(item) = pending.next() {
+                    let service = self.clone();
+                    running.spawn(async move { service.process_item(item).await });
+                }
+            }
+        }
+        if aborted {
+            while let Some(item) = pending.next() {
+                failures.push(VllmRetryItem {
+                    media_id: item.media_id,
+                    code: VllmErrorKind::Upstream,
+                    message: "批处理因 Danbooru API 无法连接而中止，等待用户决定后续处理方式".to_string(),
+                    retryable: true,
+                });
             }
         }
         successes.sort_by(|left, right| left.media_id.cmp(&right.media_id));
@@ -529,6 +552,14 @@ impl VllmService {
         )
     }
 
+    /// True when the last `tag_batch` was cut short by a Danbooru API
+    /// connectivity failure (see `verify_danbooru_tags`). The caller decides
+    /// how to proceed; the returned batch result already contains every item
+    /// that still needs work.
+    pub fn aborted(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+
     async fn verify_danbooru_tags(&self, tags: Vec<String>) -> Result<Vec<String>, VllmError> {
         let client = self.danbooru_client.as_ref().ok_or_else(|| VllmError {
             kind: VllmErrorKind::InvalidRequest,
@@ -541,20 +572,42 @@ impl VllmService {
             let exists = match cached {
                 Some(exists) => exists,
                 None => {
-                    let exists = client
-                        .tag_category(&tag)
-                        .await
-                        .map_err(|error| VllmError {
-                            kind: VllmErrorKind::Upstream,
-                            message: format!("Danbooru 标签校验失败: {}", error.message),
-                            retryable: error.retryable,
-                        })?
-                        .is_some();
-                    self.danbooru_tag_cache
-                        .write()
-                        .await
-                        .insert(tag.clone(), exists);
-                    exists
+                    match client.tag_category(&tag).await {
+                        Ok(Some(_)) => {
+                            self.danbooru_tag_cache.write().await.insert(tag.clone(), true);
+                            true
+                        }
+                        Ok(None) => {
+                            self.danbooru_tag_cache.write().await.insert(tag.clone(), false);
+                            false
+                        }
+                        Err(error) => match error.kind {
+                            // Connectivity/credential failures must surface to
+                            // the user instead of silently degrading: stall the
+                            // batch so the task can ask for a decision.
+                            DanbooruErrorKind::Network
+                            | DanbooruErrorKind::UpstreamUnavailable
+                            | DanbooruErrorKind::InvalidCredentials
+                            | DanbooruErrorKind::RateLimited => {
+                                self.abort.store(true, Ordering::Relaxed);
+                                return Err(VllmError {
+                                    kind: VllmErrorKind::Upstream,
+                                    message: format!(
+                                        "Danbooru API 无法连接（{}）：{}",
+                                        kind_name(&error.kind),
+                                        error.message
+                                    ),
+                                    retryable: true,
+                                });
+                            }
+                            // A single-tag lookup hiccup is not worth stalling
+                            // on: keep the tag and continue.
+                            _ => {
+                                self.danbooru_tag_cache.write().await.insert(tag.clone(), true);
+                                true
+                            }
+                        },
+                    }
                 }
             };
             if exists {
@@ -569,6 +622,16 @@ impl VllmService {
             });
         }
         Ok(verified)
+    }
+}
+
+fn kind_name(kind: &DanbooruErrorKind) -> &'static str {
+    match kind {
+        DanbooruErrorKind::Network => "网络错误",
+        DanbooruErrorKind::UpstreamUnavailable => "上游服务不可用",
+        DanbooruErrorKind::InvalidCredentials => "凭据无效",
+        DanbooruErrorKind::RateLimited => "请求频率受限",
+        _ => "错误",
     }
 }
 

@@ -64,6 +64,14 @@ const labels: Record<TaskStatus, string> = {
   awaiting_confirmation: '等待确认', completed: '已完成', failed: '失败', cancelled: '已取消',
 }
 
+const stageLabels: Record<string, string> = {
+  detect_model_loading: '检测模型加载中…',
+  detecting: '智能裁剪检测中…',
+  augmenting: '正在增广图片…',
+  vllm_loading: 'vLLM 模型加载中…',
+  retagging: 'AI 打标进行中…',
+}
+
 const kindLabels: Record<string, string> = {
   download: '下载', index_library: '刷新图库', reindex_library: '重建图库索引', integrity_scan: '完整性检查', exact_dedup: '精确去重',
   near_dedup: '相似图片检查', resize: '缩放图片', heic_convert: 'HEIC 转换', delete_by_tag: '按标签隔离', delete_selected: '删除所选媒体',
@@ -333,12 +341,13 @@ async function repeatDownload(record: DownloadHistoryRecord): Promise<void> {
   }
 }
 
-async function control(task: TaskSummary, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm'): Promise<void> {
+async function control(task: TaskSummary, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm', decision?: string): Promise<void> {
   const next = new Set(controlling.value)
   next.add(task.id)
   controlling.value = next
   try {
-    await tasks.control(task.id, action)
+    if (decision) await tasks.control(task.id, action, decision)
+    else await tasks.control(task.id, action)
   } catch (reason: unknown) {
     toast.error('任务操作失败', reason instanceof Error ? reason.message : '未知错误')
   } finally {
@@ -351,7 +360,11 @@ async function control(task: TaskSummary, action: 'pause' | 'resume' | 'cancel' 
 async function confirmReviewedTask(): Promise<void> {
   const task = confirmingTask.value
   if (!task) return
-  await control(task, 'confirm')
+  if (task.preview?.type === 'danbooru_unreachable') {
+    await control(task, 'confirm', 'skip_danbooru_verify')
+  } else {
+    await control(task, 'confirm')
+  }
   confirmingTask.value = null
 }
 
@@ -378,6 +391,27 @@ async function confirmDeleteTask(): Promise<void> {
 function confirmationLabel(_task: TaskSummary): string {
   return '移入隔离区'
 }
+
+const confirmDialogTitle = computed(() => {
+  const task = confirmingTask.value
+  return task?.preview?.type === 'danbooru_unreachable' ? 'Danbooru API 无法连接' : '确认执行预检清单'
+})
+
+const confirmDialogLabel = computed(() => {
+  const task = confirmingTask.value
+  return task?.preview?.type === 'danbooru_unreachable'
+    ? '跳过验证，继续打标'
+    : confirmingTask.value ? confirmationLabel(confirmingTask.value) : '确认'
+})
+
+const confirmDialogBody = computed(() => {
+  const task = confirmingTask.value
+  if (task?.preview?.type === 'danbooru_unreachable') {
+    const pending = task.preview.pending ?? 0
+    return `无法连接 Danbooru API（${task.preview.message ?? '未知原因'}）。还有 ${pending} 张图片等待打标。跳过在线校验将直接把标签写入文件（不做存在性过滤）；取消则停止打标任务。`
+  }
+  return '只会处理上方已展示的根目录内相对路径。执行前后端还会重新校验清单，原文件不会被永久删除，而是移入隐藏隔离区。'
+})
 
 function taskCanRetry(task: TaskSummary): boolean {
   return task.status === 'failed' && task.failures.some((failure) => failure.retryable)
@@ -490,6 +524,7 @@ onBeforeUnmount(() => detailsController?.abort())
             <small>{{ kindLabels[task.kind] }} · {{ new Date(task.updated_at).toLocaleString() }}</small>
           </div>
           <span class="status-pill" :class="task.status">{{ labels[task.status] }}</span>
+          <span v-if="task.status === 'running' && task.stage" class="stage-pill">{{ stageLabels[task.stage] ?? task.stage }}</span>
         </div>
 
         <div class="progress-track" :aria-label="`任务进度 ${percent(task)}%`">
@@ -715,14 +750,14 @@ onBeforeUnmount(() => detailsController?.abort())
 
     <ConfirmDialog
       :open="Boolean(confirmingTask)"
-      title="确认执行预检清单"
-      :confirm-label="confirmingTask ? confirmationLabel(confirmingTask) : '确认'"
+      :title="confirmDialogTitle"
+      :confirm-label="confirmDialogLabel"
       :busy="confirmingTask ? controlling.has(confirmingTask.id) : false"
-      destructive
+      :destructive="confirmingTask?.preview?.type !== 'danbooru_unreachable'"
       @cancel="confirmingTask = null"
       @confirm="confirmReviewedTask"
     >
-      <p>只会处理上方已展示的根目录内相对路径。执行前后端还会重新校验清单，原文件不会被永久删除，而是移入隐藏隔离区。</p>
+      <p>{{ confirmDialogBody }}</p>
     </ConfirmDialog>
 
     <ConfirmDialog

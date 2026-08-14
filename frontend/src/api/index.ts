@@ -153,8 +153,11 @@ export function createTask(request: CreateTaskRequest): Promise<TaskSummary> {
   return apiClient.post<TaskSummary>('/tasks', request)
 }
 
-export function taskAction(id: string, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm'): Promise<TaskSummary> {
-  return apiClient.post<TaskSummary>(`/tasks/${encodeURIComponent(id)}/${action}`)
+export function taskAction(id: string, action: 'pause' | 'resume' | 'cancel' | 'retry' | 'confirm', decision?: string): Promise<TaskSummary> {
+  return apiClient.post<TaskSummary>(
+    `/tasks/${encodeURIComponent(id)}/${action}`,
+    decision ? { decision } : undefined,
+  )
 }
 
 export function deleteTask(id: string): Promise<TaskSummary> {

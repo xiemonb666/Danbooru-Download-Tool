@@ -361,6 +361,8 @@ img, video { display: block; max-width: 100%; }
 .status-pill.completed { background: #effaf4; color: var(--green); }
 .status-pill.failed, .status-pill.cancelling, .status-pill.cancelled { background: var(--red-soft); color: var(--red); }
 .status-pill.awaiting_confirmation { background: #fff8e8; color: var(--amber); }
+.stage-pill { display: inline-flex; min-height: 25px; align-items: center; padding: 0 8px; border-radius: 999px; background: #eef4ff; color: var(--blue); font-size: 10px; font-weight: 650; animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 .progress-track { overflow: hidden; height: 5px; margin-top: 16px; border-radius: 999px; background: #eceef1; }
 .progress-fill { height: 100%; border-radius: inherit; background: var(--blue); transition: width 160ms ease; }
 .task-stats { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; color: var(--text-secondary); font-size: 10px; }

@@ -4044,6 +4044,7 @@
               "progress",
               "scheduling",
               "failures",
+              "stage",
               "created_at",
               "updated_at"
             ],
@@ -4083,6 +4084,9 @@
               },
               "scheduling": {
                 "$ref": "#/components/schemas/TaskScheduling"
+              },
+              "stage": {
+                "type": "string"
               },
               "status": {
                 "$ref": "#/components/schemas/TaskStatus"
@@ -8206,6 +8210,12 @@
               "$ref": "#/components/schemas/TaskPreviewCandidate"
             }
           },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pairs": {
             "type": [
               "array",
@@ -8214,6 +8224,20 @@
             "items": {
               "$ref": "#/components/schemas/NearDuplicatePair"
             }
+          },
+          "pending": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -8395,6 +8419,7 @@
           "progress",
           "scheduling",
           "failures",
+          "stage",
           "created_at",
           "updated_at"
         ],
@@ -8434,6 +8459,9 @@
           },
           "scheduling": {
             "$ref": "#/components/schemas/TaskScheduling"
+          },
+          "stage": {
+            "type": "string"
           },
           "status": {
             "$ref": "#/components/schemas/TaskStatus"

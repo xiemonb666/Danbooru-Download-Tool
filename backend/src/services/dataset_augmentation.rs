@@ -73,7 +73,7 @@ impl Default for SmartCropConfig {
             lower_body: true,
             feet: true,
             require_both_feet: false,
-            max_derived_per_family: 6,
+            max_derived_per_family: 12,
         }
     }
 }
@@ -101,8 +101,8 @@ impl SmartCropConfig {
         {
             return Err("智能裁剪至少需要启用一种构图".to_string());
         }
-        if !(1..=6).contains(&self.max_derived_per_family) {
-            return Err("每个 family 的智能裁剪数量必须在 1..=6 之间".to_string());
+        if !(1..=18).contains(&self.max_derived_per_family) {
+            return Err("每个 family 的智能裁剪数量必须在 1..=18 之间".to_string());
         }
         Ok(())
     }
@@ -1435,8 +1435,8 @@ fn complete_pose_for_subject(
         .filter(|pose| pose.torso_score >= 0.20)
         .filter_map(|pose| {
             let bbox = detection_rect(&pose.bbox, width, height)?;
-            let left_ankle = reliable_point(&pose.keypoints.left_ankle, 0.25, width, height);
-            let right_ankle = reliable_point(&pose.keypoints.right_ankle, 0.25, width, height);
+            let left_ankle = reliable_point(&pose.keypoints.left_ankle, 0.12, width, height);
+            let right_ankle = reliable_point(&pose.keypoints.right_ankle, 0.12, width, height);
             let left_foot = complete_foot_side(pose, true, width, height);
             let right_foot = complete_foot_side(pose, false, width, height);
             (left_ankle.is_some()
@@ -1552,19 +1552,14 @@ fn complete_foot_side(
             &pose.keypoints.right_heel,
         )
     };
-    let ankle = reliable_point(ankle, 0.25, width, height)?;
-    let heel = reliable_point(heel, 0.28, width, height)?;
-    let toe = reliable_point(big_toe, 0.30, width, height)
-        .or_else(|| reliable_point(small_toe, 0.30, width, height))?;
-    let edge_margin = ((width.min(height) as f32 * 0.01).round() as u32).max(8);
-    if [heel, toe].iter().any(|point| {
-        point.x0 <= edge_margin
-            || point.y0 <= edge_margin
-            || point.x1.saturating_add(edge_margin) >= width
-            || point.y1.saturating_add(edge_margin) >= height
-    }) {
-        return None;
-    }
+    let ankle = reliable_point(ankle, 0.12, width, height)?;
+    let heel = reliable_point(heel, 0.15, width, height)?;
+    let toe = reliable_point(big_toe, 0.15, width, height)
+        .or_else(|| reliable_point(small_toe, 0.15, width, height))?;
+    // Anime full-body art commonly places feet against the canvas bottom
+    // edge.  reliable_point already rejects coordinates outside the canvas,
+    // and the foot-length check below proves the heel-to-toe extent, so a
+    // visible foot near the edge is accepted as complete evidence.
     let center = |rect: CropRect| {
         (
             (f64::from(rect.x0) + f64::from(rect.x1)) / 2.0,
@@ -1903,26 +1898,31 @@ fn smart_crop_candidates(
                 x1: head.x1,
                 y1: chest_bottom,
             };
-            let mut rect = expand_crop(base, 0.35, 0.08, width, height);
-            rect.y1 = rect.y1.min(chest_limit);
-            rect = expand_crop_for_native_bucket(
-                rect,
-                "portrait",
-                config.min_short_side,
-                width,
-                height,
-                true,
-            );
-            let candidate = CropCandidate {
-                kind: "portrait",
-                rect,
-                score: subject_score + 0.35,
-            };
-            if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
-                && crop_does_not_clip_parts(candidate.rect, &hands)
-                && crop_excludes_other_people(candidate.rect, &other_people)
+            for (index, (padding_x, padding_y)) in [(0.35, 0.08), (0.18, 0.05), (0.50, 0.10)]
+                .into_iter()
+                .enumerate()
             {
-                candidates.push(candidate);
+                let mut rect = expand_crop(base, padding_x, padding_y, width, height);
+                rect.y1 = rect.y1.min(chest_limit);
+                rect = expand_crop_for_native_bucket(
+                    rect,
+                    "portrait",
+                    config.min_short_side,
+                    width,
+                    height,
+                    true,
+                );
+                let candidate = CropCandidate {
+                    kind: "portrait",
+                    rect,
+                    score: subject_score + 0.35 - index as f32 * 0.02,
+                };
+                if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
+                    && crop_does_not_clip_parts(candidate.rect, &hands)
+                    && crop_excludes_other_people(candidate.rect, &other_people)
+                {
+                    candidates.push(candidate);
+                }
             }
         }
     }
@@ -1938,7 +1938,8 @@ fn smart_crop_candidates(
         let detected_bottom = half_body
             .map(|detected| detected.y1)
             .unwrap_or(subject.y0 + subject.height() * 60 / 100);
-        let bottom = anatomical_waist.unwrap_or_else(|| detected_bottom.clamp(waist_minimum, hip_limit));
+        let bottom = anatomical_waist
+            .unwrap_or_else(|| detected_bottom.clamp(waist_minimum, hip_limit));
         let upper_x0 = upper_critical
             .iter()
             .map(|part| part.x0)
@@ -1955,26 +1956,33 @@ fn smart_crop_candidates(
             x1: upper_x1,
             y1: bottom,
         };
-        let mut rect = expand_crop(base, 0.14, 0.08, width, height);
-        rect.y1 = anatomical_waist.unwrap_or_else(|| rect.y1.clamp(waist_minimum, hip_limit));
-        rect = expand_crop_for_native_bucket(
-            rect,
-            "upper_body",
-            config.min_short_side,
-            width,
-            height,
-            true,
-        );
-        let candidate = CropCandidate {
-            kind: "upper_body",
-            rect,
-            score: subject_score + 0.25,
-        };
-        if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
-            && crop_does_not_clip_parts(candidate.rect, &hands)
-            && crop_excludes_other_people(candidate.rect, &other_people)
+        for (index, (padding_x, padding_y)) in [(0.14, 0.08), (0.22, 0.12), (0.08, 0.04)]
+            .into_iter()
+            .enumerate()
         {
-            candidates.push(candidate);
+            let mut rect = expand_crop(base, padding_x, padding_y, width, height);
+            rect.y1 = anatomical_waist
+                .map(|waist| waist.clamp(subject.y0 + subject.height() * 35 / 100, hip_limit))
+                .unwrap_or_else(|| rect.y1.clamp(waist_minimum, hip_limit));
+            rect = expand_crop_for_native_bucket(
+                rect,
+                "upper_body",
+                config.min_short_side,
+                width,
+                height,
+                true,
+            );
+            let candidate = CropCandidate {
+                kind: "upper_body",
+                rect,
+                score: subject_score + 0.25 - index as f32 * 0.02,
+            };
+            if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
+                && crop_does_not_clip_parts(candidate.rect, &hands)
+                && crop_excludes_other_people(candidate.rect, &other_people)
+            {
+                candidates.push(candidate);
+            }
         }
     }
     if config.smart_crop.cowboy_shot && !upper_critical.is_empty() {
@@ -1995,26 +2003,33 @@ fn smart_crop_candidates(
             x1: subject.x1,
             y1: anatomical_thigh.unwrap_or(subject.y0 + subject.height() * 82 / 100),
         };
-        let mut rect = expand_crop(base, 0.10, 0.04, width, height);
-        rect.y1 = anatomical_thigh.unwrap_or_else(|| rect.y1.clamp(mid_thigh, knee_limit));
-        rect = expand_crop_for_native_bucket(
-            rect,
-            "cowboy_shot",
-            config.min_short_side,
-            width,
-            height,
-            true,
-        );
-        let candidate = CropCandidate {
-            kind: "cowboy_shot",
-            rect,
-            score: subject_score + 0.20,
-        };
-        if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
-            && crop_does_not_clip_parts(candidate.rect, &hands)
-            && crop_excludes_other_people(candidate.rect, &other_people)
+        for (index, (padding_x, padding_y)) in [(0.10, 0.04), (0.16, 0.08), (0.05, 0.02)]
+            .into_iter()
+            .enumerate()
         {
-            candidates.push(candidate);
+            let mut rect = expand_crop(base, padding_x, padding_y, width, height);
+            rect.y1 = anatomical_thigh
+                .map(|thigh| thigh.min(knee_limit))
+                .unwrap_or_else(|| rect.y1.clamp(mid_thigh, knee_limit));
+            rect = expand_crop_for_native_bucket(
+                rect,
+                "cowboy_shot",
+                config.min_short_side,
+                width,
+                height,
+                true,
+            );
+            let candidate = CropCandidate {
+                kind: "cowboy_shot",
+                rect,
+                score: subject_score + 0.20 - index as f32 * 0.02,
+            };
+            if candidate_is_native_and_safe(candidate, &upper_critical, config, width, height)
+                && crop_does_not_clip_parts(candidate.rect, &hands)
+                && crop_excludes_other_people(candidate.rect, &other_people)
+            {
+                candidates.push(candidate);
+            }
         }
     }
     if config.smart_crop.full_body_tight {
@@ -2036,37 +2051,42 @@ fn smart_crop_candidates(
                 })
                 .map(|mask| base.union(mask))
                 .unwrap_or(base);
-            let rect = expand_crop(base, 0.08, 0.03, width, height);
-            let rect = expand_crop_for_native_bucket(
-                rect,
-                "full_body_tight",
-                config.min_short_side,
-                width,
-                height,
-                false,
-            );
             let mut full_critical = upper_critical.clone();
             full_critical.extend(hands.iter().copied());
             full_critical.push(pose);
-            let candidate = CropCandidate {
-                kind: "full_body_tight",
-                rect,
-                score: subject_score + 0.15,
-            };
-            if candidate_is_native_and_safe(candidate, &full_critical, config, width, height)
-                && crop_excludes_other_people(candidate.rect, &other_people)
-                && crop_excludes_other_pose_lower_parts(
-                    candidate.rect,
-                    analysis,
-                    pose_record,
+            for (index, (padding_x, padding_y)) in [(0.08, 0.03), (0.04, 0.01), (0.14, 0.06)]
+                .into_iter()
+                .enumerate()
+            {
+                let rect = expand_crop(base, padding_x, padding_y, width, height);
+                let rect = expand_crop_for_native_bucket(
+                    rect,
+                    "full_body_tight",
+                    config.min_short_side,
                     width,
                     height,
-                )
-            {
-                candidates.push(candidate);
+                    false,
+                );
+                let candidate = CropCandidate {
+                    kind: "full_body_tight",
+                    rect,
+                    score: subject_score + 0.15 - index as f32 * 0.02,
+                };
+                if candidate_is_native_and_safe(candidate, &full_critical, config, width, height)
+                    && crop_excludes_other_people(candidate.rect, &other_people)
+                    && crop_excludes_other_pose_lower_parts(
+                        candidate.rect,
+                        analysis,
+                        pose_record,
+                        width,
+                        height,
+                    )
+                {
+                    candidates.push(candidate);
+                }
             }
         }
-    }
+        }
     if let Some(pose) = associated_pose {
         if config.smart_crop.lower_body {
             let left_leg = complete_lower_side(pose, true, width, height);
@@ -2087,37 +2107,42 @@ fn smart_crop_candidates(
                     .expect("complete lower-body evidence is non-empty");
                 base.x0 = subject.x0;
                 base.x1 = subject.x1;
-                let rect = expand_crop(base, 0.12, 0.08, width, height);
-                let rect = expand_crop_for_native_bucket(
-                    rect,
-                    "lower_body",
-                    config.min_short_side,
-                    width,
-                    height,
-                    true,
-                );
-                let candidate = CropCandidate {
-                    kind: "lower_body",
-                    rect,
-                    score: subject_score + 0.12,
-                };
-                if candidate_is_native_and_safe(
-                    candidate,
-                    &lower_critical,
-                    config,
-                    width,
-                    height,
-                ) && crop_does_not_clip_parts(candidate.rect, &hands)
-                    && crop_excludes_other_people(candidate.rect, &other_people)
-                    && crop_excludes_other_pose_lower_parts(
-                        candidate.rect,
-                        analysis,
-                        pose,
+                for (index, (padding_x, padding_y)) in [(0.12, 0.08), (0.20, 0.12), (0.06, 0.04)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let rect = expand_crop(base, padding_x, padding_y, width, height);
+                    let rect = expand_crop_for_native_bucket(
+                        rect,
+                        "lower_body",
+                        config.min_short_side,
                         width,
                         height,
-                    )
-                {
-                    candidates.push(candidate);
+                        true,
+                    );
+                    let candidate = CropCandidate {
+                        kind: "lower_body",
+                        rect,
+                        score: subject_score + 0.12 - index as f32 * 0.02,
+                    };
+                    if candidate_is_native_and_safe(
+                        candidate,
+                        &lower_critical,
+                        config,
+                        width,
+                        height,
+                    ) && crop_does_not_clip_parts(candidate.rect, &hands)
+                        && crop_excludes_other_people(candidate.rect, &other_people)
+                        && crop_excludes_other_pose_lower_parts(
+                            candidate.rect,
+                            analysis,
+                            pose,
+                            width,
+                            height,
+                        )
+                    {
+                        candidates.push(candidate);
+                    }
                 }
             }
         }
@@ -2139,39 +2164,43 @@ fn smart_crop_candidates(
                     .copied()
                     .reduce(CropRect::union)
                     .expect("complete feet evidence is non-empty");
-                let rect = expand_crop(base, 0.55, 0.35, width, height);
-                let rect = expand_crop_to_minimum_size(
-                    rect,
-                    config.min_short_side,
-                    width,
-                    height,
-                );
-                let rect = expand_crop_for_native_bucket(
-                    rect,
-                    "feet",
-                    config.min_short_side,
-                    width,
-                    height,
-                    true,
-                );
-                let candidate = CropCandidate {
-                    kind: "feet",
-                    rect,
-                    score: subject_score + 0.10,
-                };
-                if candidate_is_native_and_safe(
-                    candidate,
-                    &feet_critical,
-                    config,
-                    width,
-                    height,
-                ) && crop_does_not_clip_parts(candidate.rect, &hands)
-                    && crop_excludes_other_people(candidate.rect, &other_people)
-                    && crop_excludes_other_pose_lower_parts(
-                        candidate.rect,
-                        analysis,
-                        pose,
+                for (index, (padding_x, padding_y)) in [(0.55, 0.35), (0.35, 0.20), (0.75, 0.45)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let rect = expand_crop(base, padding_x, padding_y, width, height);
+                    let rect = expand_crop_to_minimum_size(
+                        rect,
+                        config.min_short_side,
                         width,
+                        height,
+                    );
+                    let rect = expand_crop_for_native_bucket(
+                        rect,
+                        "feet",
+                        config.min_short_side,
+                        width,
+                        height,
+                        true,
+                    );
+                    let candidate = CropCandidate {
+                        kind: "feet",
+                        rect,
+                        score: subject_score + 0.10 - index as f32 * 0.02,
+                    };
+                    if candidate_is_native_and_safe(
+                        candidate,
+                        &feet_critical,
+                        config,
+                        width,
+                        height,
+                    ) && crop_does_not_clip_parts(candidate.rect, &hands)
+                        && crop_excludes_other_people(candidate.rect, &other_people)
+                        && crop_excludes_other_pose_lower_parts(
+                            candidate.rect,
+                            analysis,
+                            pose,
+                            width,
                         height,
                     )
                 {
@@ -2179,6 +2208,7 @@ fn smart_crop_candidates(
                 }
             }
         }
+    }
     }
     deduplicate_crop_candidates(candidates)
 }
@@ -2233,7 +2263,8 @@ mod tests {
     use super::{
         candidate_is_native_and_safe, choose_bucket, crop_does_not_clip_parts,
         deduplicate_crop_candidates, enabled_smart_crop_variants,
-        smart_crop_candidates, split_for_family, AnimeCropAnalysis, AnimeCropBox, AnimeCropPoint,
+        smart_crop_candidates, split_for_family, AnimeCropAnalysis,
+        AnimeCropBox, AnimeCropPoint,
         AnimeCropPose, AnimeCropPoseKeypoints, CropCandidate, CropRect,
         DatasetAugmentationConfig, DatasetAugmentationItemResult, DatasetAugmentationSource,
         DatasetAugmentationWorkspace, SmartCropConfig,
@@ -2786,7 +2817,7 @@ mod tests {
         assert!(config.smart_crop.lower_body);
         assert!(config.smart_crop.feet);
         assert!(!config.smart_crop.require_both_feet);
-        assert_eq!(config.smart_crop.max_derived_per_family, 6);
+        assert_eq!(config.smart_crop.max_derived_per_family, 12);
     }
 
     #[test]
@@ -2822,11 +2853,10 @@ mod tests {
             ..AnimeCropAnalysis::default()
         };
         let candidates = smart_crop_candidates(&analysis, 1700, 2100, &crop_config());
-        assert_eq!(
-            candidates.len(),
-            6,
-            "generated variants: {:?}",
-            candidates.iter().map(|candidate| candidate.kind).collect::<Vec<_>>()
+        let kinds = candidates.iter().map(|candidate| candidate.kind).collect::<Vec<_>>();
+        assert!(
+            candidates.len() >= 6,
+            "every enabled composition should produce at least one safe candidate: {kinds:?}"
         );
         assert!(candidates
             .iter()
@@ -2850,6 +2880,8 @@ mod tests {
             .iter()
             .any(|candidate| candidate.kind == "lower_body"));
         assert!(candidates.iter().any(|candidate| candidate.kind == "feet"));
+        let distinct = kinds.iter().copied().collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), 6, "all six compositions are represented: {kinds:?}");
     }
 
     #[test]
@@ -3296,5 +3328,47 @@ mod tests {
             2000,
             2000,
         ));
+    }
+
+    #[test]
+    fn feet_crop_generates_for_real_world_pose_with_complete_visible_feet() {
+        let analysis = AnimeCropAnalysis {
+            persons: vec![crop_box(567.0, 407.0, 1844.0, 3077.0)],
+            heads: vec![crop_box(853.0, 621.0, 1563.0, 1120.0)],
+            faces: vec![crop_box(970.0, 680.0, 1390.0, 1050.0)],
+            poses: vec![AnimeCropPose {
+                bbox: crop_box(853.0, 621.0, 1563.0, 2807.0),
+                torso_score: 0.29,
+                left_ankle_score: 0.49,
+                right_ankle_score: 0.47,
+                keypoints: AnimeCropPoseKeypoints {
+                    left_hip: scored_crop_point(1439.7, 1424.5, 0.22),
+                    right_hip: scored_crop_point(1113.9, 1504.1, 0.23),
+                    left_knee: scored_crop_point(1352.8, 1620.0, 0.36),
+                    right_knee: scored_crop_point(1077.7, 1670.6, 0.36),
+                    left_ankle: scored_crop_point(1504.9, 2351.3, 0.49),
+                    right_ankle: scored_crop_point(947.4, 2401.9, 0.47),
+                    left_big_toe: scored_crop_point(1418.0, 2807.4, 0.45),
+                    right_big_toe: scored_crop_point(1034.3, 2807.4, 0.50),
+                    left_small_toe: scored_crop_point(1562.8, 2785.7, 0.47),
+                    right_small_toe: scored_crop_point(853.2, 2778.4, 0.49),
+                    left_heel: scored_crop_point(1541.1, 2430.9, 0.45),
+                    right_heel: scored_crop_point(925.6, 2488.8, 0.46),
+                },
+            }],
+            ..AnimeCropAnalysis::default()
+        };
+        let mut config = crop_config();
+        config.smart_crop.portrait = false;
+        config.smart_crop.upper_body = false;
+        config.smart_crop.cowboy_shot = false;
+        config.smart_crop.full_body_tight = false;
+        config.smart_crop.lower_body = false;
+
+        let candidates = smart_crop_candidates(&analysis, 2508, 3541, &config);
+        assert!(
+            candidates.iter().any(|candidate| candidate.kind == "feet"),
+            "feet evidence is complete (ankle/heel/toe visible); expected a feet crop: {candidates:?}"
+        );
     }
 }

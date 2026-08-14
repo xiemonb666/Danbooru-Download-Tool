@@ -38,8 +38,10 @@ pub struct TaskSnapshot {
     pub speed_bytes_per_sec: u64,
     pub eta_seconds: Option<u64>,
     pub attempts: u32,
+    pub stage: String,
     pub payload: Value,
     pub preview: Option<Value>,
+    pub confirm_decision: Option<Value>,
     pub result: Option<Value>,
     pub error: Option<TaskFailure>,
 }
@@ -195,6 +197,8 @@ impl SqliteTaskStore {
             "eta_seconds": task.eta_seconds,
             "attempts": task.attempts,
             "preview": task.preview,
+            "stage": task.stage,
+            "confirm_decision": task.confirm_decision,
             "created_at_unix": task.created_at,
             "updated_at_unix": task.updated_at,
             "total_items": task.total_items,
@@ -301,10 +305,21 @@ pub(crate) fn task_from_record(record: crate::database::TaskRecord) -> Option<Ta
             .get("attempts")
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
+        stage: record
+            .progress
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         payload: record.payload,
         preview: record
             .progress
             .get("preview")
+            .cloned()
+            .filter(|value| !value.is_null()),
+        confirm_decision: record
+            .progress
+            .get("confirm_decision")
             .cloned()
             .filter(|value| !value.is_null()),
         result: record.result,
@@ -398,8 +413,10 @@ impl<S: TaskStore> TaskManager<S> {
             speed_bytes_per_sec: 0,
             eta_seconds: None,
             attempts: 0,
+            stage: String::new(),
             payload,
             preview: None,
+            confirm_decision: None,
             result: None,
             error: None,
         };
@@ -811,6 +828,69 @@ impl<S: TaskStore> TaskManager<S> {
             TaskStatus::Queued,
             "confirmed",
         )
+    }
+
+    /// Resolves an in-flight confirmation by moving the task back to
+    /// Running (the worker is alive and waiting for this decision) and
+    /// recording the user's choice. The worker picks it up via
+    /// [`TaskManager::take_confirm_decision`].
+    pub fn confirm_with_decision(
+        &self,
+        id: &str,
+        decision: Option<Value>,
+    ) -> Result<TaskSnapshot, TaskManagerError> {
+        let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
+        if task.status != TaskStatus::AwaitingConfirmation {
+            return Err(TaskManagerError::InvalidTransition {
+                from: task.status,
+                to: TaskStatus::Running,
+            });
+        }
+        task.status = TaskStatus::Running;
+        task.confirm_decision = decision;
+        task.revision += 1;
+        task.updated_at = unix_timestamp();
+        self.persist_task(&task)?;
+        self.clear_progress_throttle(id);
+        self.emit("confirmed", &task);
+        Ok(task)
+    }
+
+    /// Reads and clears the decision attached by the last
+    /// `confirm_with_decision` call. Called by the waiting worker once it
+    /// resumes, so a stale decision never leaks into a later phase.
+    pub fn take_confirm_decision(&self, id: &str) -> Result<Option<Value>, TaskManagerError> {
+        let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
+        let decision = task.confirm_decision.take();
+        if decision.is_none() {
+            return Ok(None);
+        }
+        task.revision += 1;
+        task.updated_at = unix_timestamp();
+        self.persist_task(&task)?;
+        self.emit("confirmed", &task);
+        Ok(decision)
+    }
+
+    /// Reports a coarse-grained execution stage (e.g. "detecting",
+    /// "retagging") without touching numeric progress. Changes are always
+    /// persisted and broadcast immediately, so a phase change is visible on
+    /// the frontend even while item counts stay identical.
+    pub fn set_stage(&self, id: &str, stage: impl Into<String>) -> Result<TaskSnapshot, TaskManagerError> {
+        let _mutation = self.mutations.lock().expect("task mutation lock poisoned");
+        let mut task = self.load_task(id)?.ok_or(TaskManagerError::NotFound)?;
+        let stage = stage.into();
+        if task.status != TaskStatus::Running || task.stage == stage {
+            return Ok(task);
+        }
+        task.stage = stage;
+        task.revision += 1;
+        task.updated_at = unix_timestamp();
+        self.persist_task(&task)?;
+        self.emit("stage", &task);
+        Ok(task)
     }
 
     fn transition(

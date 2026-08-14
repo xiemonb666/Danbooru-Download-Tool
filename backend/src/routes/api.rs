@@ -3994,21 +3994,6 @@ fn run_anime_crop_worker(
     })
 }
 
-fn run_anime_crop_detection_worker(
-    training_root: &Path,
-    profile: &ResolvedTrainingRuntimeProfile,
-    gpu_id: &str,
-    payload: Value,
-) -> Result<Vec<AnimeCropAnalysis>, String> {
-    let output = run_anime_crop_worker_output(training_root, profile, gpu_id, payload)?;
-    parse_anime_crop_detection_jsonl(&output.stdout).map_err(|error| {
-        format!(
-            "动漫检测 worker JSONL 输出无效: {error}; stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    })
-}
-
 fn run_anime_crop_worker_output(
     training_root: &Path,
     profile: &ResolvedTrainingRuntimeProfile,
@@ -4054,7 +4039,118 @@ fn run_anime_crop_worker_output(
     Ok(output)
 }
 
+/// Streaming counterpart of `run_anime_crop_detection_worker`: reads the
+/// worker's JSONL stdout line by line and invokes `on_detection` for every
+/// detection record the moment its line arrives, so model loading and the
+/// per-image pass can be surfaced as task progress. stderr is drained on a
+/// side thread to avoid pipe back-pressure deadlocks.
+fn run_anime_crop_detection_worker_stream(
+    training_root: &Path,
+    profile: &ResolvedTrainingRuntimeProfile,
+    gpu_id: &str,
+    mut payload: Value,
+    on_detection: &mut dyn FnMut(&AnimeCropAnalysis),
+) -> Result<Vec<AnimeCropAnalysis>, String> {
+    let runtime_root = installed_training_runtime_root(training_root);
+    let worker = training_root.join("anime_crop_worker.py");
+    if !worker.is_file() {
+        return Err("动漫智能裁剪 worker 不存在，请重启应用以同步内置脚本".to_string());
+    }
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "智能裁剪 worker 请求格式无效".to_string())?;
+    object.insert("gpu_id".to_string(), Value::String(gpu_id.to_string()));
+    let worker_argument = runtime_argument_path(&worker, profile)?;
+    let mut command = training_runtime_python_command(&runtime_root, profile)?;
+    command
+        .arg(worker_argument)
+        .env("CUDA_VISIBLE_DEVICES", gpu_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动动漫检测 worker: {error}"))?;
+    let input = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法写入动漫检测 worker".to_string())?
+        .write_all(&input)
+        .map_err(|error| format!("无法写入动漫检测 worker: {error}"))?;
+
+    use std::io::BufRead;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取动漫检测 worker".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取动漫检测 worker 错误输出".to_string())?;
+    let stderr_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_thread = {
+        let stderr_bytes = stderr_bytes.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut bytes = Vec::new();
+            let _ = reader.read_to_end(&mut bytes);
+            *stderr_bytes.lock().expect("worker stderr mutex poisoned") = bytes;
+        })
+    };
+
+    // Buffer the full stream for strict validation while invoking the
+    // progress callback on every detection line as soon as it is read.
+    let mut collected = Vec::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| format!("读取动漫检测 worker 输出失败: {error}"))?;
+        collected.extend_from_slice(line.as_bytes());
+        collected.push(b'\n');
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<Value>(trimmed) {
+            if record.get("type").and_then(Value::as_str) == Some("detection") {
+                let item_value = record.get("item").cloned().unwrap_or(Value::Null);
+                if let Ok(item) = serde_json::from_value::<AnimeCropAnalysis>(item_value) {
+                    on_detection(&item);
+                }
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("等待动漫检测 worker 失败: {error}"))?;
+    let _ = stderr_thread.join();
+    if !status.success() {
+        return Err(format!(
+            "动漫检测 worker 失败: {}",
+            String::from_utf8_lossy(
+                stderr_bytes
+                    .lock()
+                    .expect("worker stderr mutex poisoned")
+                    .as_slice()
+            )
+            .trim()
+        ));
+    }
+    parse_anime_crop_detection_jsonl_streaming(&collected, &mut |_| {})
+}
+
+#[allow(dead_code)] // exercised by anime_crop_worker_contract_tests
 fn parse_anime_crop_detection_jsonl(output: &[u8]) -> Result<Vec<AnimeCropAnalysis>, String> {
+    parse_anime_crop_detection_jsonl_streaming(output, &mut |_| {})
+}
+
+/// Streaming variant of `parse_anime_crop_detection_jsonl`: every detection
+/// record invokes `on_detection` as soon as its line is read, so a long
+/// worker run can surface per-item progress before the process exits.
+fn parse_anime_crop_detection_jsonl_streaming(
+    output: &[u8],
+    on_detection: &mut dyn FnMut(&AnimeCropAnalysis),
+) -> Result<Vec<AnimeCropAnalysis>, String> {
     let source = std::str::from_utf8(output)
         .map_err(|error| format!("worker stdout 不是 UTF-8: {error}"))?;
     let mut analyses = Vec::new();
@@ -4075,6 +4171,7 @@ fn parse_anime_crop_detection_jsonl(output: &[u8]) -> Result<Vec<AnimeCropAnalys
                     serde_json::from_value::<AnimeCropAnalysis>(item).map_err(|error| {
                         format!("第 {} 行检测结果格式无效: {error}", line_number + 1)
                     })?;
+                on_detection(&analysis);
                 analyses.push(analysis);
             }
             Some("complete") => {
@@ -7951,6 +8048,7 @@ struct TaskSummaryResponse {
     preview: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     training: Option<TrainingTaskSummaryResponse>,
+    stage: String,
     created_at: String,
     updated_at: String,
 }
@@ -10249,14 +10347,31 @@ fn is_augmentation_derived_path(relative_path: &str) -> bool {
 async fn task_action(
     State(state): State<AppState>,
     AxumPath((id, action)): AxumPath<(String, String)>,
+    body: Option<axum::extract::Json<Value>>,
 ) -> Result<Json<ApiSuccess<TaskSummaryResponse>>, ApiError> {
+    let mut worker_alive_confirm = false;
     let should_start = matches!(action.as_str(), "resume" | "retry" | "confirm");
     let task = match action.as_str() {
         "pause" => state.tasks.pause(&id),
         "resume" => state.tasks.resume(&id),
         "cancel" => state.tasks.cancel(&id),
         "retry" => state.tasks.retry(&id),
-        "confirm" => state.tasks.confirm(&id),
+        // A decision-carrying confirm resolves an in-flight confirmation
+        // (the worker is alive and waiting), so no new worker may start. A
+        // plain confirm keeps the original queued restart semantics.
+        "confirm" => {
+            let decision = body
+                .as_ref()
+                .and_then(|body| body.0.get("decision"))
+                .cloned();
+            match decision {
+                Some(decision) => {
+                    worker_alive_confirm = true;
+                    state.tasks.confirm_with_decision(&id, Some(decision))
+                }
+                None => state.tasks.confirm(&id),
+            }
+        }
         _ => {
             return Err(ApiError::not_found("task_action_not_found", "未知任务动作"));
         }
@@ -10287,7 +10402,7 @@ async fn task_action(
             });
         }
     }
-    if should_start {
+    if should_start && !worker_alive_confirm {
         spawn_task_worker(state.clone(), task.id.clone()).await;
     }
     Ok(Json(ApiSuccess {
@@ -12656,27 +12771,72 @@ async fn run_dataset_augmentation_task(
         });
         source_media.insert(media.id.clone(), media);
     }
+    let total = sources.len() as u64;
+    let started = Instant::now();
 
     let analyses = if config.smart_crop.enabled {
         let root_for_worker = root_path.clone();
         let sources_for_worker = sources.clone();
         let training_root = state.training_root.clone();
         let smart_crop = config.smart_crop.clone();
-        tokio::task::spawn_blocking(move || {
+        state
+            .tasks
+            .set_stage(&task.id, "detect_model_loading")
+            .map_err(task_manager_task_failure)?;
+        let total_detect = sources_for_worker.len() as u64;
+        let task_id_for_progress = task.id.clone();
+        let state_for_progress = state.clone();
+        let (detect_tx, mut detect_rx) = tokio::sync::mpsc::channel::<u64>(256);
+        let detect_handle = tokio::task::spawn_blocking(move || {
+            let mut done = 0u64;
+            let mut on_detection = |_item: &AnimeCropAnalysis| {
+                done += 1;
+                let _ = detect_tx.blocking_send(done);
+            };
             run_dataset_vision_detection(
                 &training_root,
                 &root_for_worker,
                 &sources_for_worker,
                 &smart_crop,
+                &mut on_detection,
             )
-        })
-        .await
-        .map_err(join_task_failure)?
-        .map_err(|message| TaskFailure {
-            code: "vision_crop_preflight_failed".to_string(),
-            message,
-            retryable: true,
-        })?
+        });
+        let mut detection_stop_requested = false;
+        let detection_result = loop {
+            tokio::select! {
+                maybe = detect_rx.recv() => match maybe {
+                    Some(done) => {
+                        let _ = state_for_progress
+                            .tasks
+                            .set_stage(&task_id_for_progress, "detecting");
+                        if detection_stop_requested {
+                            continue;
+                        }
+                        if !report_download_progress(
+                            &state_for_progress,
+                            &task_id_for_progress,
+                            done,
+                            total_detect,
+                            0,
+                            started,
+                        )? {
+                            detection_stop_requested = true;
+                        }
+                    }
+                    None => break detect_handle.await,
+                },
+            }
+        };
+        if detection_stop_requested {
+            return Ok(WorkerOutcome::Stopped);
+        }
+        detection_result
+            .map_err(join_task_failure)?
+            .map_err(|message| TaskFailure {
+                code: "vision_crop_preflight_failed".to_string(),
+                message,
+                retryable: true,
+            })?
     } else {
         HashMap::new()
     };
@@ -12698,10 +12858,12 @@ async fn run_dataset_augmentation_task(
     .map_err(join_task_failure)?
     .map_err(tool_task_failure)?;
 
-    let total = sources.len() as u64;
-    let started = Instant::now();
     let mut generated_samples = Vec::new();
     let mut rejections = Vec::new();
+    state
+        .tasks
+        .set_stage(&task.id, "augmenting")
+        .map_err(task_manager_task_failure)?;
     let augmentation_item_keys = state
         .database
         .list_task_items(&task.id)
@@ -12827,54 +12989,162 @@ async fn run_dataset_augmentation_task(
     let mut retagging_successes = Vec::new();
     let mut retagging_failures = Vec::new();
     if retagging_config.send_to_vllm {
-        let retagging_samples = generated_samples
+        let mut retagging_samples = generated_samples
             .iter()
             .filter(|sample| sample.requires_retagging)
             .cloned()
             .collect::<Vec<_>>();
         if !retagging_samples.is_empty() {
+            state
+                .tasks
+                .set_stage(&task.id, "vllm_loading")
+                .map_err(task_manager_task_failure)?;
             let mut lease = acquire_vllm_runtime(state, false).await?;
-            let retagging_result = retag_dataset_augmentation_samples(
-                state,
-                &root_path,
-                &source_lookup,
-                &source_media,
-                &retagging_samples,
-                retagging_config.preserve_artist_character_tags,
-            )
-            .await;
-            let cleanup = release_vllm_runtime(state, &mut lease).await;
-            let (successes, failures) = match (retagging_result, cleanup) {
-                (Ok(result), Ok(())) => result,
-                (Ok(_), Err(cleanup)) => return Err(cleanup),
-                (Err(failure), Ok(())) => return Err(failure),
-                (Err(failure), Err(cleanup)) => {
-                    tracing::warn!(code = %cleanup.code, message = %cleanup.message, "增广重打标失败后自动卸载也失败");
-                    return Err(failure);
-                }
+            state
+                .tasks
+                .set_stage(&task.id, "retagging")
+                .map_err(task_manager_task_failure)?;
+            let wave_size = {
+                let settings = state.settings.read().await;
+                settings.vllm_concurrency.clamp(1, 64)
             };
-            let successful_samples = successes
-                .iter()
-                .filter_map(|success| {
-                    retagging_samples
+            let total_retag = retagging_samples.len() as u64;
+            let retag_started = Instant::now();
+            let mut skip_danbooru_verify = false;
+            let mut stopped = false;
+            loop {
+                if worker_was_stopped(state, &task.id) {
+                    stopped = true;
+                    break;
+                }
+                let wave = retagging_samples
+                    .iter()
+                    .take(wave_size)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if wave.is_empty() {
+                    break;
+                }
+                let outcome = retag_dataset_augmentation_samples(
+                    state,
+                    &root_path,
+                    &source_lookup,
+                    &source_media,
+                    &wave,
+                    retagging_config.preserve_artist_character_tags,
+                    skip_danbooru_verify,
+                )
+                .await?;
+                let successful_samples = outcome
+                    .successes
+                    .iter()
+                    .filter_map(|success| {
+                        wave.iter()
+                            .find(|sample| sample.sample_id == success.media_id)
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                if !successful_samples.is_empty() {
+                    let (next_workspace, promoted) = tokio::task::spawn_blocking(move || {
+                        let mut workspace = workspace;
+                        let promoted = workspace.promote_retagged_samples(&successful_samples);
+                        (workspace, promoted)
+                    })
+                    .await
+                    .map_err(join_task_failure)?;
+                    workspace = next_workspace;
+                    promoted.map_err(tool_task_failure)?;
+                }
+                let processed =
+                    total_retag.saturating_sub(retagging_samples.len() as u64);
+                if !report_download_progress(state, &task.id, processed, total_retag, 0, retag_started)?
+                {
+                    stopped = true;
+                    break;
+                }
+                if let Some(reason) = outcome.danbooru_unreachable {
+                    // Return every item that still needs work (wave failures
+                    // plus anything never dispatched) to the queue, then ask
+                    // the user how to proceed.
+                    let failed_ids = outcome
+                        .failures
                         .iter()
-                        .find(|sample| sample.sample_id == success.media_id)
-                        .cloned()
-                })
-                .collect::<Vec<_>>();
-            if !successful_samples.is_empty() {
-                let (next_workspace, promoted) = tokio::task::spawn_blocking(move || {
-                    let mut workspace = workspace;
-                    let promoted = workspace.promote_retagged_samples(&successful_samples);
-                    (workspace, promoted)
-                })
-                .await
-                .map_err(join_task_failure)?;
-                workspace = next_workspace;
-                promoted.map_err(tool_task_failure)?;
+                        .map(|failure| failure.media_id.as_str())
+                        .collect::<HashSet<_>>();
+                    retagging_samples.retain(|sample| {
+                        failed_ids.contains(sample.sample_id.as_str())
+                    });
+                    state
+                        .tasks
+                        .await_confirmation(
+                            &task.id,
+                            serde_json::json!({
+                                "type": "danbooru_unreachable",
+                                "message": reason,
+                                "pending": retagging_samples.len(),
+                            }),
+                        )
+                        .map_err(task_manager_task_failure)?;
+                    let mut resolved = false;
+                    while !resolved {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let snapshot = state
+                            .tasks
+                            .get(&task.id)
+                            .map_err(task_manager_task_failure)?
+                            .ok_or_else(|| TaskFailure {
+                                code: "task_not_found".to_string(),
+                                message: "任务在等待用户决定期间消失".to_string(),
+                                retryable: false,
+                            })?;
+                        match snapshot.status {
+                            crate::tasks::TaskStatus::Running => {
+                                let decision = state
+                                    .tasks
+                                    .take_confirm_decision(&task.id)
+                                    .map_err(task_manager_task_failure)?;
+                                if decision.as_ref().and_then(Value::as_str)
+                                    == Some("skip_danbooru_verify")
+                                {
+                                    skip_danbooru_verify = true;
+                                    resolved = true;
+                                }
+                            }
+                            crate::tasks::TaskStatus::Cancelling
+                            | crate::tasks::TaskStatus::Cancelled => {
+                                stopped = true;
+                                resolved = true;
+                            }
+                            crate::tasks::TaskStatus::Failed => {
+                                return Err(TaskFailure {
+                                    code: "task_failed_while_waiting".to_string(),
+                                    message: "任务在等待用户决定期间失败".to_string(),
+                                    retryable: false,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    if stopped {
+                        break;
+                    }
+                    continue;
+                }
+                retagging_successes.extend(outcome.successes);
+                retagging_failures.extend(outcome.failures);
+                let wave_ids = wave
+                    .iter()
+                    .map(|sample| sample.sample_id.clone())
+                    .collect::<HashSet<_>>();
+                retagging_samples.retain(|sample| !wave_ids.contains(&sample.sample_id));
             }
-            retagging_successes = successes;
-            retagging_failures = failures;
+            let cleanup = release_vllm_runtime(state, &mut lease).await;
+            if let Err(cleanup) = cleanup {
+                return Err(cleanup);
+            }
+            if stopped {
+                return Ok(WorkerOutcome::Stopped);
+            }
         }
     }
     let summary = workspace.finish().map_err(tool_task_failure)?;
@@ -12940,6 +13210,15 @@ async fn run_dataset_augmentation_task(
     })))
 }
 
+struct AugmentationRetagOutcome {
+    successes: Vec<VllmTagSuccess>,
+    failures: Vec<VllmRetryItem>,
+    /// Some(reason) when the batch was cut short by a Danbooru API
+    /// connectivity failure and the caller should ask the user how to
+    /// proceed before retrying the unfinished items.
+    danbooru_unreachable: Option<String>,
+}
+
 async fn retag_dataset_augmentation_samples(
     state: &AppState,
     root_path: &Path,
@@ -12947,7 +13226,8 @@ async fn retag_dataset_augmentation_samples(
     source_media: &HashMap<String, MediaFileRecord>,
     samples: &[crate::services::dataset_augmentation::DatasetAugmentationSample],
     preserve_artist_character_tags: bool,
-) -> Result<(Vec<VllmTagSuccess>, Vec<VllmRetryItem>), TaskFailure> {
+    skip_danbooru_verify: bool,
+) -> Result<AugmentationRetagOutcome, TaskFailure> {
     let root = VerifiedMediaRoot::open(root_path).map_err(tool_task_failure)?;
     let settings = state.settings.read().await.clone();
     let mut items = Vec::with_capacity(samples.len());
@@ -12986,7 +13266,7 @@ async fn retag_dataset_augmentation_samples(
         language: settings.vllm_language,
         max_tags: settings.vllm_max_tags,
         max_length: settings.vllm_max_length,
-        verify_danbooru: settings.vllm_verify_danbooru,
+        verify_danbooru: settings.vllm_verify_danbooru && !skip_danbooru_verify,
         reference_existing: false,
     };
     let verify_danbooru =
@@ -13020,7 +13300,20 @@ async fn retag_dataset_augmentation_samples(
         service = service.with_danbooru_client(state.danbooru.read().await.clone());
     }
     let result = service.tag_batch(items).await.map_err(vllm_task_failure)?;
-    Ok((result.successes, result.retry_manifest.items))
+    let danbooru_unreachable = service.aborted().then(|| {
+        result
+            .retry_manifest
+            .items
+            .iter()
+            .find(|failure| failure.message.contains("Danbooru API 无法连接"))
+            .map(|failure| failure.message.clone())
+            .unwrap_or_else(|| "Danbooru API 无法连接".to_string())
+    });
+    Ok(AugmentationRetagOutcome {
+        successes: result.successes,
+        failures: result.retry_manifest.items,
+        danbooru_unreachable,
+    })
 }
 
 fn augmentation_identity_tag_prefixes(
@@ -13072,6 +13365,7 @@ fn run_dataset_vision_detection(
     root_path: &Path,
     sources: &[DatasetAugmentationSource],
     smart_crop: &SmartCropConfig,
+    on_detection: &mut dyn FnMut(&AnimeCropAnalysis),
 ) -> Result<HashMap<String, AnimeCropAnalysis>, String> {
     let gpu = training_gpu_inventory()
         .into_iter()
@@ -13113,11 +13407,12 @@ fn run_dataset_vision_detection(
             "path": path.to_string_lossy(),
         }));
     }
-    let analyses = run_anime_crop_detection_worker(
+    let analyses = run_anime_crop_detection_worker_stream(
         training_root,
         &profile,
         &smart_crop.gpu_id,
         serde_json::json!({"action": "detect", "items": items}),
+        on_detection,
     )?;
     if analyses.len() != sources.len() {
         return Err("动漫检测 worker 返回数量与受检图片数量不一致".to_string());
@@ -16376,6 +16671,7 @@ fn task_summary_response(state: &AppState, task: TaskSnapshot) -> TaskSummaryRes
         failures,
         preview: task.preview,
         training,
+        stage: task.stage,
         created_at: format_unix_timestamp(task.created_at),
         updated_at: format_unix_timestamp(task.updated_at),
     }
@@ -16805,7 +17101,57 @@ fn test_router() -> (Router, AppState, tempfile::TempDir) {
     )
     .unwrap();
     let state = AppState::open_internal(paths, SecretManager::session_only(), false).unwrap();
+    // Point the shared Danbooru client at a local mock so tests never depend
+    // on live network access (which makes them slow or flaky whenever
+    // danbooru.donmai.us is unreachable). try_write is safe inside a
+    // current-thread tokio test runtime (no other task holds the lock yet).
+    *state
+        .danbooru
+        .try_write()
+        .expect("danbooru client lock unavailable during test setup") = mock_danbooru_client();
     (router_with_state(state.clone()), state, directory)
+}
+
+/// Spawns a throwaway plain-std socket server that answers every Danbooru tag
+/// query as "exists, general category" and returns a client configured against
+/// it. Runs on its own thread with blocking IO so it never depends on the
+/// current tokio runtime. Tests that care about filtering semantics spin up
+/// their own mock.
+#[cfg(test)]
+fn mock_danbooru_client() -> crate::services::danbooru::DanbooruClient {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let body = br#"[{"category":0}]"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let response = response.clone();
+            let body = body.to_vec();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let mut buffer = [0u8; 8192];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    crate::services::danbooru::DanbooruClient::new(
+        crate::services::danbooru::DanbooruClientConfig {
+            base_url: format!("http://{address}"),
+            requests_per_second: 1_000,
+            ..crate::services::danbooru::DanbooruClientConfig::default()
+        },
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -16998,7 +17344,7 @@ mod security_contract_tests {
         assert!(!config.smart_crop.lower_body);
         assert!(config.smart_crop.feet);
         assert!(config.smart_crop.require_both_feet);
-        assert_eq!(config.smart_crop.max_derived_per_family, 6);
+        assert_eq!(config.smart_crop.max_derived_per_family, 12);
     }
 
     #[test]
@@ -17061,7 +17407,7 @@ mod security_contract_tests {
                     "lower_body": true,
                     "feet": true,
                     "require_both_feet": false,
-                    "max_derived_per_family": 6
+                    "max_derived_per_family": 12
                 }
             })),
             training: None,
@@ -19970,8 +20316,10 @@ mod security_contract_tests {
             .unwrap();
 
         let response = application
+            .clone()
             .oneshot(
                 Request::builder()
+                    .method("GET")
                     .uri("/api/tasks")
                     .body(Body::empty())
                     .unwrap(),
@@ -26787,5 +27135,187 @@ mod security_contract_tests {
             completed.error
         );
         assert_eq!(completed.completed_items, 1);
+    }
+
+    #[tokio::test]
+    async fn dataset_augmentation_retag_survives_danbooru_unreachable_decision() {
+        let (application, state, directory) = test_router();
+        // Point the shared Danbooru client at a port that refuses connections
+        // so tag verification aborts and the task stalls for a decision.
+        *state
+            .danbooru
+            .try_write()
+            .expect("danbooru client lock unavailable during test setup") =
+            crate::services::danbooru::DanbooruClient::new(
+                crate::services::danbooru::DanbooruClientConfig {
+                    base_url: "http://127.0.0.1:1".into(),
+                    requests_per_second: 1_000,
+                    ..crate::services::danbooru::DanbooruClientConfig::default()
+                },
+            )
+            .unwrap();
+        let (endpoint, server) = mock_vllm_tags().await;
+        state.settings.write().await.vllm_base_url = endpoint;
+        state.settings.write().await.vllm_model = "unsloth/Qwen3.6-27B-NVFP4".into();
+
+        let media = directory.path().join("augmentation-retag-root");
+        std::fs::create_dir_all(&media).unwrap();
+        image::RgbImage::from_pixel(800, 1000, image::Rgb([30, 60, 90]))
+            .save(media.join("sample.png"))
+            .unwrap();
+        state
+            .database
+            .create_root(
+                "augmentation-retag-root",
+                "Augmentation retag root",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "augmentation-retag-media".into(),
+                root_id: "augmentation-retag-root".into(),
+                post_id: None,
+                relative_path: "sample.png".into(),
+                variant: "original".into(),
+                mime_type: "image/png".into(),
+                byte_size: 4,
+                sha256: None,
+                md5: None,
+                width: Some(800),
+                height: Some(1000),
+                duration: None,
+            })
+            .unwrap();
+
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "dataset_augmentation",
+                            "root_id": "augmentation-retag-root",
+                            "options": {
+                                "media_ids": ["augmentation-retag-media"],
+                                "min_megapixels": 0.5,
+                                "min_long_side": 512,
+                                "min_short_side": 384,
+                                "horizontal_flip": true,
+                                "smart_crop": { "enabled": false },
+                                "retagging": {
+                                    "send_to_vllm": true,
+                                    "preserve_artist_character_tags": false
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let task_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The first retagging wave must stall on the unreachable Danbooru API
+        // instead of failing the whole task.
+        let preview_type = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let task = state.tasks.get(&task_id).unwrap().unwrap();
+                if task.status == crate::tasks::TaskStatus::AwaitingConfirmation {
+                    break task;
+                }
+                assert_ne!(
+                    task.status,
+                    crate::tasks::TaskStatus::Failed,
+                    "task failed before confirmation: {:?}",
+                    task.error
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task should stall awaiting the Danbooru decision")
+        .preview
+        .and_then(|preview| {
+            preview
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .expect("awaiting_confirmation preview must carry a type");
+        assert_eq!(preview_type, "danbooru_unreachable");
+
+        // Skip verification: the wave reruns without duplicated samples so the
+        // promote step never collides with files it already placed.
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/confirm"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "decision": "skip_danbooru_verify" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let task = state.tasks.get(&task_id).unwrap().unwrap();
+                if matches!(
+                    task.status,
+                    crate::tasks::TaskStatus::Completed | crate::tasks::TaskStatus::Failed
+                ) {
+                    break task;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task should finish after the skip decision");
+        server.abort();
+
+        assert_eq!(
+            completed.status,
+            crate::tasks::TaskStatus::Completed,
+            "{:?}",
+            completed.error
+        );
+        let ready_images = std::fs::read_dir(
+            media.join(".augmentation")
+                .join(&task_id)
+                .join("ready/train/horizontal_flip/images"),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let captions = ready_images
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "txt")
+            })
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0], "cat,solo");
     }
 }

@@ -398,6 +398,10 @@ pub struct NearDuplicatePair {
 pub struct TaskPreview {
     pub candidates: Option<Vec<TaskPreviewCandidate>>,
     pub pairs: Option<Vec<NearDuplicatePair>>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub message: Option<String>,
+    pub pending: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -412,6 +416,7 @@ pub struct TaskSummary {
     pub failures: Vec<TaskFailure>,
     pub preview: Option<TaskPreview>,
     pub training: Option<TrainingTaskSummary>,
+    pub stage: String,
     pub created_at: String,
     pub updated_at: String,
 }
