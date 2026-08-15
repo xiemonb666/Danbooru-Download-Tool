@@ -36,6 +36,8 @@ keyring = "4.1.5"
 utoipa = "5.5.0"
 toml = "0.8"
 fs2 = "0.4"
+ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
+ndarray = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

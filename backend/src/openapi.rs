@@ -563,6 +563,7 @@ pub struct MediaIdsTaskOptions {
     pub excluded_media_ids: Option<Vec<String>>,
     pub library_post_created_from: Option<i64>,
     pub library_post_created_to: Option<i64>,
+    pub vllm: Option<VllmRetagTaskOptions>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -656,9 +657,39 @@ pub struct SmartCropTaskOptions {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivedRetaggingMode {
+    Vllm,
+    ClTagger,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VllmRetagTaskOptions {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub language: Option<VllmLanguage>,
+    pub max_length: Option<u32>,
+    pub concurrency: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClTaggerRetagTaskOptions {
+    pub model_path: Option<String>,
+    pub general_threshold: Option<f32>,
+    pub character_threshold: Option<f32>,
+    pub copyright_threshold: Option<f32>,
+    pub quality_threshold: Option<f32>,
+    pub max_tags: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DerivedRetaggingTaskOptions {
     pub send_to_vllm: Option<bool>,
     pub preserve_artist_character_tags: Option<bool>,
+    pub mode: Option<DerivedRetaggingMode>,
+    pub vllm: Option<VllmRetagTaskOptions>,
+    pub cl_tagger: Option<ClTaggerRetagTaskOptions>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1634,6 +1665,9 @@ mod paths {
         DatasetAugmentationTaskOptions,
         SmartCropTaskOptions,
         DerivedRetaggingTaskOptions,
+        DerivedRetaggingMode,
+        VllmRetagTaskOptions,
+        ClTaggerRetagTaskOptions,
         TrainingGalleryDataset,
         TrainingSamplePromptSource,
         TrainingSampleSettings,

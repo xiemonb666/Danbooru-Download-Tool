@@ -2,9 +2,9 @@ use crate::services::image_processor::{ToolError, VerifiedMediaRoot};
 use image::{codecs::png::PngEncoder, ColorType, GenericImageView, ImageEncoder, ImageReader};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 
 const RESOLUTION_BUCKETS: &[(u32, u32)] = &[
@@ -125,10 +125,23 @@ fn enabled_smart_crop_variants(config: &SmartCropConfig) -> Vec<&'static str> {
 /// Controls the optional second-pass captioning of transformed images. This
 /// is opt-in because a derived image is never safe to train from until a new
 /// caption has actually been written.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetagMode {
+    #[default]
+    Vllm,
+    ClTagger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DerivedRetaggingConfig {
     pub send_to_vllm: bool,
     pub preserve_artist_character_tags: bool,
+    pub mode: RetagMode,
+    #[serde(default)]
+    pub vllm: VllmRetagConfig,
+    #[serde(default)]
+    pub cl_tagger: ClTaggerRetagConfig,
 }
 
 impl Default for DerivedRetaggingConfig {
@@ -136,6 +149,107 @@ impl Default for DerivedRetaggingConfig {
         Self {
             send_to_vllm: false,
             preserve_artist_character_tags: true,
+            mode: RetagMode::default(),
+            vllm: VllmRetagConfig::default(),
+            cl_tagger: ClTaggerRetagConfig::default(),
+        }
+    }
+}
+
+/// Per-task vLLM tagging parameters. Natural-language description is the
+/// default language: CL Tagger is the Danbooru tag-format engine, so the
+/// vision model stays free to describe in plain text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VllmRetagConfig {
+    #[serde(default = "default_vllm_retag_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_vllm_retag_model")]
+    pub model: String,
+    #[serde(default = "default_vllm_retag_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_vllm_retag_language")]
+    pub language: crate::services::vllm::VllmLanguage,
+    #[serde(default = "default_vllm_retag_max_length")]
+    pub max_length: usize,
+    #[serde(default = "default_vllm_retag_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_vllm_retag_base_url() -> String {
+    "http://127.0.0.1:8000/v1".to_string()
+}
+fn default_vllm_retag_model() -> String {
+    crate::services::vllm::DEFAULT_MODEL.to_string()
+}
+fn default_vllm_retag_system_prompt() -> String {
+    crate::services::vllm::DEFAULT_SYSTEM_PROMPT.to_string()
+}
+fn default_vllm_retag_language() -> crate::services::vllm::VllmLanguage {
+    crate::services::vllm::VllmLanguage::English
+}
+fn default_vllm_retag_max_length() -> usize {
+    400
+}
+fn default_vllm_retag_concurrency() -> usize {
+    8
+}
+
+impl Default for VllmRetagConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_vllm_retag_base_url(),
+            model: default_vllm_retag_model(),
+            system_prompt: default_vllm_retag_system_prompt(),
+            language: default_vllm_retag_language(),
+            max_length: default_vllm_retag_max_length(),
+            concurrency: default_vllm_retag_concurrency(),
+        }
+    }
+}
+
+/// Per-task CL Tagger parameters. The model directory is intentionally not
+/// shared globally: every task configures its own engine explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClTaggerRetagConfig {
+    #[serde(default)]
+    pub model_path: String,
+    #[serde(default = "default_cl_tagger_general_threshold")]
+    pub general_threshold: f32,
+    #[serde(default = "default_cl_tagger_character_threshold")]
+    pub character_threshold: f32,
+    #[serde(default = "default_cl_tagger_copyright_threshold")]
+    pub copyright_threshold: f32,
+    #[serde(default = "default_cl_tagger_quality_threshold")]
+    pub quality_threshold: f32,
+    #[serde(default = "default_cl_tagger_max_tags")]
+    pub max_tags: usize,
+}
+
+fn default_cl_tagger_general_threshold() -> f32 {
+    0.35
+}
+fn default_cl_tagger_character_threshold() -> f32 {
+    0.6
+}
+fn default_cl_tagger_copyright_threshold() -> f32 {
+    0.6
+}
+fn default_cl_tagger_quality_threshold() -> f32 {
+    0.35
+}
+fn default_cl_tagger_max_tags() -> usize {
+    60
+}
+
+impl Default for ClTaggerRetagConfig {
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            general_threshold: default_cl_tagger_general_threshold(),
+            character_threshold: default_cl_tagger_character_threshold(),
+            copyright_threshold: default_cl_tagger_copyright_threshold(),
+            quality_threshold: default_cl_tagger_quality_threshold(),
+            max_tags: default_cl_tagger_max_tags(),
         }
     }
 }
@@ -503,6 +617,22 @@ struct ResolutionBucket {
     width: u32,
     height: u32,
     upscale_ratio: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetaggingRecord {
+    sample_id: String,
+    family_id: String,
+    split: String,
+    relative_path: PathBuf,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FamilyMetadataRecordOwned {
+    family_id: String,
+    source_media_id: String,
 }
 
 pub struct DatasetAugmentationWorkspace {
@@ -1020,6 +1150,116 @@ impl DatasetAugmentationWorkspace {
         Ok(())
     }
 
+    /// Rebuilds the retagging queue from persisted workspace state. A resumed
+    /// worker fast-forwards past already-committed augmentation items, so this
+    /// run's generation results are empty; every sample that still has a
+    /// pending entry in `metadata/retagging.jsonl` (no `status` field yet) is
+    /// returned for another tagging attempt. The owning source media id is
+    /// recovered from `metadata/families.jsonl` via the family id.
+    pub fn retagging_pending_samples(&self) -> Result<Vec<DatasetAugmentationSample>, ToolError> {
+        let retagging_path = self
+            .root
+            .resolve(&self.metadata_relative.join("metadata/retagging.jsonl"))?;
+        if !retagging_path.exists() {
+            return Ok(Vec::new());
+        }
+        let families_path = self
+            .root
+            .resolve(&self.metadata_relative.join("metadata/families.jsonl"))?;
+        let mut family_sources = HashMap::new();
+        if families_path.exists() {
+            for line in std::io::BufReader::new(
+                fs::File::open(&families_path).map_err(ToolError::Io)?,
+            )
+            .lines()
+            {
+                let line = line.map_err(ToolError::Io)?;
+                if let Ok(record) = serde_json::from_str::<FamilyMetadataRecordOwned>(&line) {
+                    family_sources.insert(record.family_id, record.source_media_id);
+                }
+            }
+        }
+        let mut samples = Vec::new();
+        let mut terminal_ids = HashSet::new();
+        for line in std::io::BufReader::new(fs::File::open(&retagging_path).map_err(ToolError::Io)?)
+            .lines()
+        {
+            let line = line.map_err(ToolError::Io)?;
+            if let Ok(record) = serde_json::from_str::<RetaggingRecord>(&line) {
+                if record.status.is_some() {
+                    // Promote and failure records are append-only; the original
+                    // pending entry is left in place, so any sample that already
+                    // reached a terminal state must not be pulled back in.
+                    terminal_ids.insert(record.sample_id);
+                }
+            }
+        }
+        for line in std::io::BufReader::new(fs::File::open(&retagging_path).map_err(ToolError::Io)?)
+            .lines()
+        {
+            let line = line.map_err(ToolError::Io)?;
+            let record: RetaggingRecord = serde_json::from_str(&line).map_err(|error| {
+                ToolError::InvalidManifest(format!("无法解析 retagging 记录: {error}"))
+            })?;
+            if record.status.is_some() || terminal_ids.contains(&record.sample_id) {
+                continue;
+            }
+            // Skip records whose derived image is no longer on disk; tagging
+            // them would fail the whole task on resolve_existing_file.
+            if !self.root.resolve(&record.relative_path)?.exists() {
+                continue;
+            }
+            let variant = record
+                .relative_path
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|window| {
+                    (window[0] == "derived").then(|| window[1].clone())
+                })
+                .unwrap_or_else(|| "horizontal_flip".to_string());
+            samples.push(DatasetAugmentationSample {
+                source_media_id: family_sources
+                    .get(&record.family_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                sample_id: record.sample_id,
+                family_id: record.family_id,
+                variant,
+                output_relative_path: record.relative_path,
+                width: 0,
+                height: 0,
+                split: record.split,
+                requires_retagging: true,
+            });
+        }
+        Ok(samples)
+    }
+
+    /// Records a permanently failed retagging attempt so a later resume does
+    /// not keep pulling the sample back into the queue.
+    pub fn record_retagging_failure(
+        &mut self,
+        sample: &DatasetAugmentationSample,
+        reason: &str,
+    ) -> Result<(), ToolError> {
+        self.append_json_line(
+            "metadata/retagging.jsonl",
+            &serde_json::json!({
+                "sample_id": sample.sample_id,
+                "family_id": sample.family_id,
+                "split": sample.split,
+                "relative_path": sample.output_relative_path,
+                "status": "failed",
+                "message": reason,
+            }),
+        )
+    }
+
     pub fn finish(&self) -> Result<DatasetAugmentationSummary, ToolError> {
         let training_relative_directory = self.output_relative.join("ready/train");
         let ready = serde_json::json!({
@@ -1172,7 +1412,19 @@ fn next_augmentation_directories(
         };
         let image_relative = requested.join(&name);
         let metadata_relative = augmentation_metadata_directory(requested)?.join(name);
-        if !root.resolve(&image_relative)?.exists() && !root.resolve(&metadata_relative)?.exists() {
+        let image_absolute = root.resolve(&image_relative)?;
+        let metadata_absolute = root.resolve(&metadata_relative)?;
+        if !image_absolute.exists() && !metadata_absolute.exists() {
+            return Ok((image_relative, metadata_relative));
+        }
+        // A workspace marked incomplete (INCOMPLETE.json present) belongs to an
+        // interrupted run of this exact task and is resumed in place; resuming
+        // into a fresh -2 directory would orphan the derived images and the
+        // persisted retagging queue. Finished workspaces are never reused.
+        if attempt == 1
+            && image_absolute.exists()
+            && metadata_absolute.join("INCOMPLETE.json").exists()
+        {
             return Ok((image_relative, metadata_relative));
         }
     }
@@ -2366,6 +2618,74 @@ mod tests {
         let retagging =
             std::fs::read_to_string(metadata_output.join("metadata/retagging.jsonl")).unwrap();
         assert!(retagging.contains("media1_horizontal_flip"));
+    }
+
+    #[test]
+    fn pending_retagging_samples_are_rebuilt_from_workspace_records() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_directory = temporary.path().join("characters/alice");
+        std::fs::create_dir_all(&source_directory).unwrap();
+        RgbImage::new(800, 800)
+            .save(source_directory.join("source.png"))
+            .unwrap();
+        std::fs::write(source_directory.join("source.txt"), "1girl").unwrap();
+        let config = DatasetAugmentationConfig {
+            output_directory: PathBuf::from("characters/alice/.augmentation"),
+            min_megapixels: 0.1,
+            min_long_side: 1,
+            min_short_side: 1,
+            horizontal_flip: true,
+            smart_crop: super::SmartCropConfig {
+                enabled: false,
+                ..super::SmartCropConfig::default()
+            },
+            ..DatasetAugmentationConfig::default()
+        };
+        let root = VerifiedMediaRoot::open(temporary.path()).unwrap();
+        let workspace = DatasetAugmentationWorkspace::create(root, "task-pending", config).unwrap();
+        let metadata_dir = temporary
+            .path()
+            .join("characters/alice/.augmentation-metadata/task-pending/metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let sample_path = temporary.path().join(
+            "characters/alice/.augmentation/task-pending/derived/horizontal_flip/images/sample-1.png",
+        );
+        std::fs::create_dir_all(sample_path.parent().unwrap()).unwrap();
+        std::fs::write(&sample_path, b"png").unwrap();
+        std::fs::write(
+            metadata_dir.join("retagging.jsonl"),
+            concat!(
+                "{\"sample_id\":\"sample-1\",\"family_id\":\"family-1\",\"split\":\"train\",",
+                "\"relative_path\":\"characters/alice/.augmentation/task-pending/derived/horizontal_flip/images/sample-1.png\",",
+                "\"reason\":\"derived image requires a newly generated caption\"}\n",
+                "{\"sample_id\":\"sample-2\",\"family_id\":\"family-1\",\"split\":\"train\",",
+                "\"relative_path\":\"characters/alice/.augmentation/task-pending/derived/horizontal_flip/images/sample-2.png\",",
+                "\"status\":\"completed\"}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            metadata_dir.join("families.jsonl"),
+            concat!(
+                "{\"family_id\":\"family-1\",\"source_media_id\":\"media-1\",",
+                "\"split\":\"train\",\"source_sha256\":null}\n",
+            ),
+        )
+        .unwrap();
+
+        let pending = workspace.retagging_pending_samples().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sample_id, "sample-1");
+        assert_eq!(pending[0].source_media_id, "media-1");
+        assert_eq!(pending[0].variant, "horizontal_flip");
+        assert_eq!(pending[0].split, "train");
+        assert_eq!(
+            pending[0].output_relative_path,
+            PathBuf::from(
+                "characters/alice/.augmentation/task-pending/derived/horizontal_flip/images/sample-1.png"
+            )
+        );
+        assert!(pending[0].requires_retagging);
     }
 
     #[test]

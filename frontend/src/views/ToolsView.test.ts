@@ -43,6 +43,15 @@ vi.mock('../stores/tasks', () => ({
   useTasksStore: () => ({ loadSnapshot: vi.fn() }),
 }))
 
+vi.mock('../stores/config', () => ({
+  useConfigStore: () => ({
+    config: {
+      vllm_base_url: undefined,
+      vllm_model: undefined,
+    },
+  }),
+}))
+
 vi.mock('../stores/toast', () => ({
   useToastStore: () => ({
     info: mocks.info,
@@ -293,6 +302,23 @@ describe('ToolsView media selection boundary', () => {
         retagging: {
           send_to_vllm: false,
           preserve_artist_character_tags: true,
+          mode: undefined,
+          vllm: {
+            base_url: 'http://127.0.0.1:8000/v1',
+            model: 'unsloth/Qwen3.6-27B-NVFP4',
+            system_prompt: 'Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.',
+            language: 'en',
+            max_length: 400,
+            concurrency: 8,
+          },
+          cl_tagger: {
+            model_path: '',
+            general_threshold: 0.35,
+            character_threshold: 0.6,
+            copyright_threshold: 0.6,
+            quality_threshold: 0.35,
+            max_tags: 60,
+          },
         },
       },
     })

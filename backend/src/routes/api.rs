@@ -18,7 +18,7 @@ use crate::services::danbooru::{
 };
 use crate::services::dataset_augmentation::{
     AnimeCropAnalysis, DatasetAugmentationConfig, DatasetAugmentationItemResult,
-    DatasetAugmentationSource, DatasetAugmentationWorkspace, SmartCropConfig,
+    DatasetAugmentationSource, DatasetAugmentationWorkspace, RetagMode, SmartCropConfig,
 };
 use crate::services::image_processor::{
     apply_heic_conversion, apply_quarantine, apply_tag_pipeline, collect_tag_pipeline_tokens,
@@ -31,7 +31,8 @@ use crate::services::image_processor::{
 };
 use crate::services::vllm::{
     TagWriteMode, VllmBatchItem, VllmBatchResult, VllmError, VllmErrorKind, VllmHealth,
-    VllmOutputOptions, VllmRetryItem, VllmService, VllmServiceConfig, VllmTagSuccess,
+    VllmOutputOptions, VllmRetryItem, VllmRetryManifest, VllmService, VllmServiceConfig,
+    VllmTagSuccess, write_sidecar_atomic,
 };
 use crate::tasks::{
     task_from_record, SqliteTaskStore, TaskFailure, TaskManager, TaskManagerError, TaskSnapshot,
@@ -59,6 +60,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::fs;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -258,9 +260,39 @@ struct VllmRuntimeLease {
     released: bool,
 }
 
+#[derive(Clone, Default)]
+struct ClTaggerRuntimeCoordinator {
+    state: Arc<tokio::sync::Mutex<ClTaggerRuntimeState>>,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct ClTaggerRuntimeState {
+    model: Option<Arc<tokio::sync::Mutex<crate::services::cl_tagger::ClTaggerModel>>>,
+    model_path: Option<String>,
+    generation: u64,
+    loading: bool,
+    ready: bool,
+    unloading: bool,
+    auto_loaded: bool,
+    manual_loaded: bool,
+    keep_loaded: bool,
+    active_leases: usize,
+    last_error: Option<String>,
+    downloading: bool,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    download_error: Option<String>,
+}
+
+struct ClTaggerLease {
+    generation: u64,
+    model: Arc<tokio::sync::Mutex<crate::services::cl_tagger::ClTaggerModel>>,
+    released: bool,
+}
+
 impl VllmRuntimeState {
-    fn begin_generation(&mut self, key: String, keep_loaded: bool) -> u64 {
-        self.generation = self.generation.wrapping_add(1).max(1);
+    fn begin_generation(&mut self, key: String, keep_loaded: bool) -> u64 {        self.generation = self.generation.wrapping_add(1).max(1);
         self.key = Some(key);
         self.starting = true;
         self.ready = false;
@@ -650,6 +682,7 @@ pub struct AppState {
     backgrounds_dir: PathBuf,
     vllm_launcher_root: Option<PathBuf>,
     vllm_runtime: VllmRuntimeCoordinator,
+    cl_tagger_runtime: ClTaggerRuntimeCoordinator,
     worker_slots: Arc<Semaphore>,
     resource_slots: ResourceTaskSlots,
     training_root: PathBuf,
@@ -1016,6 +1049,7 @@ impl AppState {
             backgrounds_dir,
             vllm_launcher_root,
             vllm_runtime: VllmRuntimeCoordinator::default(),
+            cl_tagger_runtime: ClTaggerRuntimeCoordinator::default(),
             worker_slots: Arc::new(Semaphore::new(4)),
             resource_slots: ResourceTaskSlots::default(),
             training_root,
@@ -2301,6 +2335,11 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/vllm/health", get(vllm_health))
         .route("/api/vllm/load", axum::routing::post(vllm_load))
         .route("/api/vllm/unload", axum::routing::post(vllm_unload))
+        .route("/api/cltagger/health", get(cl_tagger_health))
+        .route("/api/cltagger/model", get(cl_tagger_resolve_model))
+        .route("/api/cltagger/download", axum::routing::post(cl_tagger_download_model))
+        .route("/api/cltagger/load", axum::routing::post(cl_tagger_load))
+        .route("/api/cltagger/unload", axum::routing::post(cl_tagger_unload))
         .route("/api/config", get(get_config).put(update_config))
         .route(
             "/api/settings/background",
@@ -4577,13 +4616,16 @@ struct TrainingPreviewResponse {
     toml: String,
 }
 
+#[allow(dead_code)]
 fn vllm_runtime_key(settings: &StoredSettings) -> String {
     format!("{}\n{}", settings.vllm_base_url, settings.vllm_model)
 }
 
-fn vllm_runtime_service(
+fn vllm_runtime_service_for(
     state: &AppState,
     settings: &StoredSettings,
+    base_url: &str,
+    model: &str,
 ) -> Result<VllmService, TaskFailure> {
     let api_key = state
         .secrets
@@ -4595,9 +4637,9 @@ fn vllm_runtime_service(
         })?;
     VllmService::new(
         VllmServiceConfig {
-            endpoint: settings.vllm_base_url.clone(),
+            endpoint: base_url.to_string(),
             allowed_hosts: settings.vllm_allowed_hosts.clone(),
-            model: settings.vllm_model.clone(),
+            model: model.to_string(),
             system_prompt: settings.vllm_system_prompt.clone(),
             tag_mode: settings.vllm_tag_mode,
             concurrency: settings.vllm_concurrency,
@@ -4684,13 +4726,17 @@ async fn cancel_pending_vllm_acquire(state: &AppState, generation: u64) {
 async fn acquire_vllm_runtime(
     state: &AppState,
     keep_loaded: bool,
+    endpoint: Option<(&str, &str)>,
 ) -> Result<VllmRuntimeLease, TaskFailure> {
     const START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
     let settings = state.settings.read().await.clone();
-    let key = vllm_runtime_key(&settings);
-    let service = vllm_runtime_service(state, &settings)?;
+    let (base_url, model) = endpoint
+        .map(|(base_url, model)| (base_url.to_string(), model.to_string()))
+        .unwrap_or_else(|| (settings.vllm_base_url.clone(), settings.vllm_model.clone()));
+    let key = format!("{base_url}\n{model}");
+    let service = vllm_runtime_service_for(state, &settings, &base_url, &model)?;
     let mut pending_reservation: Option<PendingVllmAcquire> = None;
     loop {
         let changed = state.vllm_runtime.changed.notified();
@@ -4781,13 +4827,13 @@ async fn acquire_vllm_runtime(
             runtime.begin_generation(key.clone(), keep_loaded)
         };
 
-        let preexisting = configured_vllm_model_is_ready(&service, &settings.vllm_model).await;
+        let preexisting = configured_vllm_model_is_ready(&service, &model).await;
         let mut launch_succeeded = false;
         let mut startup_result: Result<(), TaskFailure> = if preexisting {
             Ok(())
         } else {
             async {
-                let port = configured_local_vllm_port(&settings.vllm_base_url).map_err(|message| {
+                let port = configured_local_vllm_port(&base_url).map_err(|message| {
                     TaskFailure {
                         code: "invalid_vllm_launch_endpoint".to_string(),
                         message: message.to_string(),
@@ -4800,9 +4846,9 @@ async fn acquire_vllm_runtime(
                         message: "找不到随应用提供的 vLLM 启动脚本".to_string(),
                         retryable: false,
                     })?;
-                let model = settings.vllm_model.clone();
+                let launch_model = model.clone();
                 tokio::task::spawn_blocking(move || {
-                    launch_vllm_process(&project_root, port, &model)
+                    launch_vllm_process(&project_root, port, &launch_model)
                 })
                 .await
                 .map_err(join_task_failure)?
@@ -4814,16 +4860,13 @@ async fn acquire_vllm_runtime(
                 launch_succeeded = true;
                 let started = Instant::now();
                 loop {
-                    if configured_vllm_model_is_ready(&service, &settings.vllm_model).await {
+                    if configured_vllm_model_is_ready(&service, &model).await {
                         break Ok(());
                     }
                     if started.elapsed() >= START_TIMEOUT {
                         break Err(TaskFailure {
                             code: "vllm_auto_start_timeout".to_string(),
-                            message: format!(
-                                "vLLM 已启动，但模型 {} 在 15 分钟内未就绪",
-                                settings.vllm_model
-                            ),
+                            message: format!("vLLM 已启动，但模型 {model} 在 15 分钟内未就绪"),
                             retryable: true,
                         });
                     }
@@ -4911,6 +4954,449 @@ async fn release_vllm_runtime(
     unload_vllm_generation(state, lease.generation, "vllm_auto_unload_failed")
         .await
         .map(|_| ())
+}
+
+fn cl_tagger_retag_config_from_settings(
+    settings: &StoredSettings,
+) -> crate::services::dataset_augmentation::ClTaggerRetagConfig {
+    crate::services::dataset_augmentation::ClTaggerRetagConfig {
+        model_path: settings.cl_tagger_model_path.clone(),
+        general_threshold: settings.cl_tagger_general_threshold,
+        character_threshold: settings.cl_tagger_character_threshold,
+        copyright_threshold: settings.cl_tagger_copyright_threshold,
+        quality_threshold: settings.cl_tagger_quality_threshold,
+        max_tags: settings.cl_tagger_max_tags,
+    }
+}
+
+async fn acquire_cl_tagger_runtime(
+    state: &AppState,
+    keep_loaded: bool,
+    retag: &crate::services::dataset_augmentation::ClTaggerRetagConfig,
+) -> Result<ClTaggerLease, TaskFailure> {
+    let model_dir = resolve_cl_tagger_model_dir(state, &retag.model_path).await?;
+    let model_path = model_dir.to_string_lossy().into_owned();
+    let config = crate::services::cl_tagger::ClTaggerConfig {
+        model_dir,
+        general_threshold: retag.general_threshold,
+        character_threshold: retag.character_threshold,
+        copyright_threshold: retag.copyright_threshold,
+        quality_threshold: retag.quality_threshold,
+        max_tags: retag.max_tags,
+    };
+    config.validate().map_err(|message| TaskFailure {
+        code: "invalid_cl_tagger_config".to_string(),
+        message,
+        retryable: false,
+    })?;
+    loop {
+        let changed = state.cl_tagger_runtime.changed.notified();
+        let stale_model = {
+            let mut runtime = state.cl_tagger_runtime.state.lock().await;
+            if runtime.unloading {
+                drop(runtime);
+                changed.await;
+                continue;
+            }
+            if runtime.loading {
+                drop(runtime);
+                changed.await;
+                continue;
+            }
+            if runtime.ready {
+                if runtime.model_path.as_deref() == Some(model_path.as_str()) {
+                    runtime.active_leases += 1;
+                    runtime.keep_loaded |= keep_loaded;
+                    let lease = ClTaggerLease {
+                        generation: runtime.generation,
+                        model: runtime.model.clone().expect("ready implies model loaded"),
+                        released: false,
+                    };
+                    return Ok(lease);
+                }
+                if runtime.active_leases == 0 && !runtime.manual_loaded {
+                    runtime.ready = false;
+                    let stale = runtime.model.take();
+                    runtime.model_path = None;
+                    stale
+                } else {
+                    return Err(TaskFailure {
+                        code: "cl_tagger_config_changed".to_string(),
+                        message: "CL Tagger 模型路径已变更且模型仍在使用，请先卸载后重试".to_string(),
+                        retryable: true,
+                    });
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(model) = stale_model {
+            // ONNX session drop can block on internal thread teardown; drop off the async worker.
+            tokio::task::spawn_blocking(move || drop(model))
+                .await
+                .map_err(join_task_failure)?;
+        }
+        {
+            let mut runtime = state.cl_tagger_runtime.state.lock().await;
+            if runtime.active_leases == 0 {
+                runtime.generation = runtime.generation.wrapping_add(1).max(1);
+                runtime.model_path = Some(model_path.clone());
+                runtime.loading = true;
+                runtime.ready = false;
+                runtime.unloading = false;
+                runtime.auto_loaded = !runtime.manual_loaded;
+                runtime.keep_loaded = keep_loaded;
+                runtime.last_error = None;
+            }
+        }
+        let config = config.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::services::cl_tagger::ClTaggerModel::load(config)
+        })
+        .await
+        .map_err(join_task_failure)?;
+        {
+            let mut runtime = state.cl_tagger_runtime.state.lock().await;
+            if let Err(error) = loaded {
+                runtime.loading = false;
+                runtime.ready = false;
+                runtime.model_path = None;
+                runtime.last_error = Some(error.to_string());
+                drop(runtime);
+                state.cl_tagger_runtime.changed.notify_waiters();
+                return Err(TaskFailure {
+                    code: "cl_tagger_load_failed".to_string(),
+                    message: error,
+                    retryable: true,
+                });
+            }
+            let model = Arc::new(tokio::sync::Mutex::new(loaded.unwrap()));
+            runtime.loading = false;
+            runtime.ready = true;
+            runtime.model = Some(model.clone());
+            runtime.active_leases += 1;
+            let lease = ClTaggerLease {
+                generation: runtime.generation,
+                model,
+                released: false,
+            };
+            drop(runtime);
+            state.cl_tagger_runtime.changed.notify_waiters();
+            return Ok(lease);
+        }
+    }
+}
+
+/// 解析 CL Tagger 模型目录：显式路径优先；为空时先检测 HuggingFace
+/// 缓存，缓存中不存在则自动下载到缓存。
+async fn resolve_cl_tagger_model_dir(
+    state: &AppState,
+    requested: &str,
+) -> Result<PathBuf, TaskFailure> {
+    if !requested.trim().is_empty() {
+        return Ok(PathBuf::from(requested.trim()));
+    }
+    if let Some(model_dir) = crate::services::cl_tagger::detect_model_in_hf_cache() {
+        tracing::info!(path = %model_dir.display(), "检测到 HuggingFace 缓存中的 CL Tagger 模型");
+        return Ok(model_dir);
+    }
+    tracing::info!("未在 HuggingFace 缓存中找到 CL Tagger 模型，开始自动下载");
+    ensure_cl_tagger_model_downloaded(state).await
+}
+
+async fn ensure_cl_tagger_model_downloaded(state: &AppState) -> Result<PathBuf, TaskFailure> {
+    {
+        let mut runtime = state.cl_tagger_runtime.state.lock().await;
+        if runtime.downloading {
+            return Err(TaskFailure {
+                code: "cl_tagger_download_in_progress".to_string(),
+                message: "CL Tagger 模型正在下载，请稍后重试".to_string(),
+                retryable: true,
+            });
+        }
+        runtime.downloading = true;
+        runtime.downloaded_bytes = 0;
+        runtime.total_bytes = None;
+        runtime.download_error = None;
+    }
+    state.cl_tagger_runtime.changed.notify_waiters();
+    let result = download_cl_tagger_model_files(state).await;
+    {
+        let mut runtime = state.cl_tagger_runtime.state.lock().await;
+        runtime.downloading = false;
+        if let Err(error) = &result {
+            runtime.download_error = Some(error.message.clone());
+        }
+    }
+    state.cl_tagger_runtime.changed.notify_waiters();
+    result
+}
+
+async fn download_cl_tagger_model_files(state: &AppState) -> Result<PathBuf, TaskFailure> {
+    use crate::services::cl_tagger as cl;
+    let cache_root = cl::primary_hf_hub_cache().ok_or_else(|| TaskFailure {
+        code: "cl_tagger_download_failed".to_string(),
+        message: "无法确定 HuggingFace 缓存目录（缺少 HOME/USERPROFILE 环境变量）".to_string(),
+        retryable: false,
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|error| TaskFailure {
+            code: "cl_tagger_download_failed".to_string(),
+            message: format!("无法创建下载客户端: {error}"),
+            retryable: false,
+        })?;
+    // 解析仓库提交 hash，失败时退化为 "main" 目录名。
+    let mut snapshot_name = "main".to_string();
+    if let Ok(response) = client
+        .get("https://huggingface.co/api/models/cella110n/cl_tagger")
+        .send()
+        .await
+    {
+        if let Ok(body) = response.json::<serde_json::Value>().await {
+            if let Some(sha) = body.get("sha").and_then(serde_json::Value::as_str) {
+                if !sha.is_empty() {
+                    snapshot_name = sha.to_string();
+                }
+            }
+        }
+    }
+    let model_dir = cache_root
+        .join(cl::CL_TAGGER_REPO_DIR)
+        .join("snapshots")
+        .join(&snapshot_name)
+        .join(cl::CL_TAGGER_MODEL_SUBDIR);
+    fs::create_dir_all(&model_dir).map_err(|error| TaskFailure {
+        code: "cl_tagger_download_failed".to_string(),
+        message: format!("无法创建模型目录 {}: {error}", model_dir.display()),
+        retryable: false,
+    })?;
+    for file in [cl::CL_TAGGER_MAPPING_FILE, cl::CL_TAGGER_MODEL_FILE] {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}/{}",
+            cl::CL_TAGGER_HF_REPO,
+            cl::CL_TAGGER_HF_SUBPATH,
+            file
+        );
+        let destination = model_dir.join(file);
+        if destination.is_file() {
+            continue;
+        }
+        let response = client.get(&url).send().await.map_err(|error| TaskFailure {
+            code: "cl_tagger_download_failed".to_string(),
+            message: format!("下载 {file} 失败: {error}"),
+            retryable: true,
+        })?;
+        let total = response.content_length();
+        {
+            let mut runtime = state.cl_tagger_runtime.state.lock().await;
+            runtime.total_bytes = total;
+        }
+        let mut stream = response.bytes_stream();
+        use tokio_stream::StreamExt;
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| TaskFailure {
+                code: "cl_tagger_download_failed".to_string(),
+                message: format!("下载 {file} 数据流中断: {error}"),
+                retryable: true,
+            })?;
+            buffer.extend_from_slice(&chunk);
+            let mut runtime = state.cl_tagger_runtime.state.lock().await;
+            runtime.downloaded_bytes = runtime.downloaded_bytes.saturating_add(chunk.len() as u64);
+        }
+        let temporary = destination.with_extension(format!("{file}.part"));
+        fs::write(&temporary, &buffer).map_err(|error| TaskFailure {
+            code: "cl_tagger_download_failed".to_string(),
+            message: format!("写入 {file} 失败: {error}"),
+            retryable: true,
+        })?;
+        fs::rename(&temporary, &destination).map_err(|error| TaskFailure {
+            code: "cl_tagger_download_failed".to_string(),
+            message: format!("移动 {file} 失败: {error}"),
+            retryable: true,
+        })?;
+        tracing::info!(file, bytes = buffer.len(), "CL Tagger 模型文件下载完成");
+    }
+    Ok(model_dir)
+}
+
+async fn release_cl_tagger_runtime(
+    state: &AppState,
+    lease: &mut ClTaggerLease,
+) -> Result<(), TaskFailure> {
+    if lease.released {
+        return Ok(());
+    }
+    let should_unload = {
+        let mut runtime = state.cl_tagger_runtime.state.lock().await;
+        lease.released = true;
+        if lease.generation != runtime.generation {
+            return Ok(());
+        }
+        runtime.active_leases = runtime.active_leases.saturating_sub(1);
+        let should = runtime.active_leases == 0
+            && runtime.auto_loaded
+            && !runtime.manual_loaded
+            && !runtime.keep_loaded;
+        if should {
+            runtime.unloading = true;
+        }
+        should
+    };
+    if should_unload {
+        unload_cl_tagger_runtime(state).await?;
+    }
+    state.cl_tagger_runtime.changed.notify_waiters();
+    Ok(())
+}
+
+async fn unload_cl_tagger_runtime(state: &AppState) -> Result<(), TaskFailure> {
+    let old_model = {
+        let mut runtime = state.cl_tagger_runtime.state.lock().await;
+        if runtime.active_leases > 0 {
+            return Err(TaskFailure {
+                code: "cl_tagger_busy".to_string(),
+                message: "CL Tagger 正在被任务使用，无法卸载".to_string(),
+                retryable: true,
+            });
+        }
+        runtime.loading = false;
+        runtime.ready = false;
+        runtime.unloading = false;
+        let old_model = runtime.model.take();
+        runtime.model_path = None;
+        runtime.auto_loaded = false;
+        runtime.manual_loaded = false;
+        runtime.keep_loaded = false;
+        old_model
+    };
+    if let Some(model) = old_model {
+        // ONNX session drop can block on internal thread teardown; drop off the async worker.
+        tokio::task::spawn_blocking(move || drop(model))
+            .await
+            .map_err(join_task_failure)?;
+    }
+    state.cl_tagger_runtime.changed.notify_waiters();
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ClTaggerHealthResponse {
+    model_path: String,
+    loaded: bool,
+    loading: bool,
+    unloading: bool,
+    manual_loaded: bool,
+    active_leases: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    downloading: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_error: Option<String>,
+}
+
+async fn cl_tagger_health(State(state): State<AppState>) -> Json<ApiSuccess<ClTaggerHealthResponse>> {
+    let response = {
+        let runtime = state.cl_tagger_runtime.state.lock().await;
+        let settings = state.settings.read().await;
+        ClTaggerHealthResponse {
+            model_path: runtime
+                .model_path
+                .clone()
+                .unwrap_or_else(|| settings.cl_tagger_model_path.clone()),
+            loaded: runtime.ready,
+            loading: runtime.loading,
+            unloading: runtime.unloading,
+            manual_loaded: runtime.manual_loaded,
+            active_leases: runtime.active_leases,
+            last_error: runtime.last_error.clone(),
+            downloading: runtime.downloading,
+            downloaded_bytes: runtime.downloading.then_some(runtime.downloaded_bytes),
+            total_bytes: runtime.downloading.then_some(runtime.total_bytes).flatten(),
+            download_error: runtime.download_error.clone(),
+        }
+    };
+    Json(ApiSuccess {
+        data: response,
+        meta: None,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ClTaggerModelResolutionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_path: Option<String>,
+    cached: bool,
+    downloading: bool,
+}
+
+async fn cl_tagger_resolve_model(
+    State(state): State<AppState>,
+) -> Json<ApiSuccess<ClTaggerModelResolutionResponse>> {
+    let runtime = state.cl_tagger_runtime.state.lock().await;
+    let detected = crate::services::cl_tagger::detect_model_in_hf_cache();
+    let cached = detected.is_some();
+    let response = ClTaggerModelResolutionResponse {
+        model_path: detected.map(|path| path.to_string_lossy().into_owned()),
+        cached,
+        downloading: runtime.downloading,
+    };
+    Json(ApiSuccess {
+        data: response,
+        meta: None,
+    })
+}
+
+async fn cl_tagger_download_model(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<ClTaggerModelResolutionResponse>>, ApiError> {
+    let model_dir = ensure_cl_tagger_model_downloaded(&state)
+        .await
+        .map_err(|failure| ApiError::bad_request(&failure.code, failure.message))?;
+    let runtime = state.cl_tagger_runtime.state.lock().await;
+    let response = ClTaggerModelResolutionResponse {
+        model_path: Some(model_dir.to_string_lossy().into_owned()),
+        cached: true,
+        downloading: runtime.downloading,
+    };
+    Ok(Json(ApiSuccess {
+        data: response,
+        meta: None,
+    }))
+}
+
+async fn cl_tagger_load(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<ClTaggerHealthResponse>>, ApiError> {
+    {
+        let mut runtime = state.cl_tagger_runtime.state.lock().await;
+        runtime.manual_loaded = true;
+        runtime.keep_loaded = true;
+    }
+    let settings = state.settings.read().await.clone();
+    let retag = cl_tagger_retag_config_from_settings(&settings);
+    let mut lease = acquire_cl_tagger_runtime(&state, true, &retag)
+        .await
+        .map_err(|failure| ApiError::bad_request("cl_tagger_load_failed", failure.message))?;
+    release_cl_tagger_runtime(&state, &mut lease)
+        .await
+        .map_err(|failure| ApiError::internal(failure.message))?;
+    Ok(cl_tagger_health(State(state)).await)
+}
+
+async fn cl_tagger_unload(
+    State(state): State<AppState>,
+) -> Result<Json<ApiSuccess<ClTaggerHealthResponse>>, ApiError> {
+    unload_cl_tagger_runtime(&state)
+        .await
+        .map_err(|failure| ApiError::bad_request(&failure.code, failure.message))?;
+    Ok(cl_tagger_health(State(state)).await)
 }
 
 #[derive(Debug, Serialize)]
@@ -6333,7 +6819,7 @@ async fn vllm_load(
     let settings = state.settings.read().await.clone();
     configured_local_vllm_port(&settings.vllm_base_url)
         .map_err(|message| ApiError::bad_request("invalid_vllm_launch_endpoint", message))?;
-    let mut lease = acquire_vllm_runtime(&state, true).await.map_err(|failure| ApiError {
+    let mut lease = acquire_vllm_runtime(&state, true, None).await.map_err(|failure| ApiError {
         status: if failure.retryable {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -6456,6 +6942,18 @@ struct UpdateConfigRequest {
     background_image: String,
     #[serde(default)]
     background_opacity: u8,
+    #[serde(default)]
+    cl_tagger_model_path: Option<String>,
+    #[serde(default)]
+    cl_tagger_general_threshold: Option<f32>,
+    #[serde(default)]
+    cl_tagger_character_threshold: Option<f32>,
+    #[serde(default)]
+    cl_tagger_copyright_threshold: Option<f32>,
+    #[serde(default)]
+    cl_tagger_quality_threshold: Option<f32>,
+    #[serde(default)]
+    cl_tagger_max_tags: Option<usize>,
 }
 
 async fn update_config(
@@ -6500,6 +6998,24 @@ async fn update_config(
     updated.blur_sensitive_media = request.blur_sensitive_media;
     updated.background_image = request.background_image;
     updated.background_opacity = request.background_opacity.min(100);
+    if let Some(model_path) = request.cl_tagger_model_path {
+        updated.cl_tagger_model_path = model_path.trim().to_string();
+    }
+    if let Some(threshold) = request.cl_tagger_general_threshold {
+        updated.cl_tagger_general_threshold = threshold;
+    }
+    if let Some(threshold) = request.cl_tagger_character_threshold {
+        updated.cl_tagger_character_threshold = threshold;
+    }
+    if let Some(threshold) = request.cl_tagger_copyright_threshold {
+        updated.cl_tagger_copyright_threshold = threshold;
+    }
+    if let Some(threshold) = request.cl_tagger_quality_threshold {
+        updated.cl_tagger_quality_threshold = threshold;
+    }
+    if let Some(max_tags) = request.cl_tagger_max_tags {
+        updated.cl_tagger_max_tags = max_tags;
+    }
     updated
         .validate()
         .map_err(|error| ApiError::bad_request("invalid_config", error.message))?;
@@ -9641,12 +10157,29 @@ fn has_batch_query_metatag(tag: &str) -> bool {
 fn contains_forbidden_task_option(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
+            // Retagging parameters are task-scoped by design: the vLLM
+            // endpoint and CL Tagger thresholds live inside this subtree and
+            // are explicitly allowed. Credentials still never are.
+            if key.eq_ignore_ascii_case("retagging") || key.eq_ignore_ascii_case("vllm") {
+                return contains_forbidden_secret_option(value);
+            }
             matches!(
                 key.to_ascii_lowercase().as_str(),
                 "api_key" | "secret" | "token" | "endpoint" | "base_url" | "allowed_hosts"
             ) || contains_forbidden_task_option(value)
         }),
         Value::Array(items) => items.iter().any(contains_forbidden_task_option),
+        _ => false,
+    }
+}
+
+fn contains_forbidden_secret_option(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(key.to_ascii_lowercase().as_str(), "api_key" | "secret" | "token")
+                || contains_forbidden_secret_option(value)
+        }),
+        Value::Array(items) => items.iter().any(contains_forbidden_secret_option),
         _ => false,
     }
 }
@@ -10185,6 +10718,12 @@ struct DerivedRetaggingOptions {
     send_to_vllm: Option<bool>,
     #[serde(default)]
     preserve_artist_character_tags: Option<bool>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    vllm: Option<serde_json::Value>,
+    #[serde(default)]
+    cl_tagger: Option<serde_json::Value>,
 }
 
 fn parse_dataset_augmentation_config(
@@ -10275,6 +10814,28 @@ fn parse_dataset_augmentation_config(
         }
         if let Some(value) = retagging.preserve_artist_character_tags {
             config.retagging.preserve_artist_character_tags = value;
+        }
+        if let Some(value) = retagging.mode {
+            config.retagging.mode = match value.as_str() {
+                "cl_tagger" => RetagMode::ClTagger,
+                _ => RetagMode::Vllm,
+            };
+        }
+        if let Some(value) = retagging.vllm {
+            config.retagging.vllm = serde_json::from_value(value).map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_dataset_augmentation_options",
+                    "vLLM 打标参数格式无效",
+                )
+            })?;
+        }
+        if let Some(value) = retagging.cl_tagger {
+            config.retagging.cl_tagger = serde_json::from_value(value).map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_dataset_augmentation_options",
+                    "CL Tagger 打标参数格式无效",
+                )
+            })?;
         }
     }
     config.validate().map_err(|message| {
@@ -11985,7 +12546,15 @@ async fn run_vllm_task(
     if !has_queued_items {
         return run_vllm_task_with_ready_runtime(state, task).await;
     }
-    let mut lease = acquire_vllm_runtime(state, false).await?;
+    let cl_tagger_mode = task_cl_tagger_mode(task)?;
+    if cl_tagger_mode {
+        return run_vllm_task_with_ready_runtime(state, task).await;
+    }
+    let task_vllm = task_vllm_config(task)?;
+    let endpoint = task_vllm
+        .as_ref()
+        .map(|config| (config.base_url.as_str(), config.model.as_str()));
+    let mut lease = acquire_vllm_runtime(state, false, endpoint).await?;
     let outcome = run_vllm_task_with_ready_runtime(state, task).await;
     let cleanup = release_vllm_runtime(state, &mut lease).await;
     match (outcome, cleanup) {
@@ -11997,6 +12566,71 @@ async fn run_vllm_task(
             Err(failure)
         }
     }
+}
+
+fn task_vllm_config(
+    task: &TaskSnapshot,
+) -> Result<Option<crate::services::dataset_augmentation::VllmRetagConfig>, TaskFailure> {
+    let request: CreateTaskRequest =
+        serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
+            code: "invalid_task_payload".to_string(),
+            message: error.to_string(),
+            retryable: false,
+        })?;
+    let Some(value) = request
+        .options
+        .as_ref()
+        .and_then(|options| options.get("vllm"))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| TaskFailure {
+            code: "invalid_task_vllm_options".to_string(),
+            message: format!("任务 vLLM 参数格式无效: {error}"),
+            retryable: false,
+        })
+}
+
+fn task_cl_tagger_mode(task: &TaskSnapshot) -> Result<bool, TaskFailure> {
+    let request: CreateTaskRequest =
+        serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
+            code: "invalid_task_payload".to_string(),
+            message: error.to_string(),
+            retryable: false,
+        })?;
+    let mode = request
+        .options
+        .as_ref()
+        .and_then(|options| options.get("mode"))
+        .and_then(Value::as_str);
+    Ok(mode == Some("cl_tagger"))
+}
+
+fn task_cl_tagger_config(
+    task: &TaskSnapshot,
+) -> Result<Option<crate::services::dataset_augmentation::ClTaggerRetagConfig>, TaskFailure> {
+    let request: CreateTaskRequest =
+        serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
+            code: "invalid_task_payload".to_string(),
+            message: error.to_string(),
+            retryable: false,
+        })?;
+    let Some(value) = request
+        .options
+        .as_ref()
+        .and_then(|options| options.get("cl_tagger"))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| TaskFailure {
+            code: "invalid_task_cl_tagger_options".to_string(),
+            message: format!("任务 CL Tagger 参数格式无效: {error}"),
+            retryable: false,
+        })
 }
 
 async fn run_vllm_task_with_ready_runtime(
@@ -12073,6 +12707,7 @@ async fn run_vllm_task_with_ready_runtime(
         return Ok(WorkerOutcome::Stopped);
     };
     let settings = state.settings.read().await.clone();
+    let task_vllm = task_vllm_config(task)?;
     let mut items = Vec::with_capacity(media_ids.len());
     let mut quarantine_by_media = HashMap::new();
     let mut sidecar_targets = HashSet::new();
@@ -12176,22 +12811,45 @@ async fn run_vllm_task_with_ready_runtime(
         });
     }
 
+    if task_cl_tagger_mode(task)? {
+        return run_cl_tagger_batch_items(
+            state,
+            task,
+            &verified_root,
+            &item_keys,
+            &quarantine_by_media,
+            items,
+        )
+        .await;
+    }
+
     let output = VllmOutputOptions {
-        language: settings.vllm_language,
-        max_tags: settings.vllm_max_tags,
-        max_length: settings.vllm_max_length,
-        verify_danbooru: settings.vllm_verify_danbooru,
+        language: task_vllm
+            .as_ref()
+            .map_or(settings.vllm_language, |config| config.language),
+        max_tags: settings.vllm_max_tags.clamp(1, 200),
+        max_length: task_vllm.as_ref().map_or(settings.vllm_max_length, |config| {
+            config.max_length.clamp(1, 4000)
+        }),
         reference_existing: settings.vllm_reference_existing,
     };
-    let verify_danbooru =
-        output.verify_danbooru && output.language == crate::services::vllm::VllmLanguage::Danbooru;
     let config = VllmServiceConfig {
-        endpoint: settings.vllm_base_url,
+        endpoint: task_vllm
+            .as_ref()
+            .map_or(settings.vllm_base_url.clone(), |config| {
+                config.base_url.clone()
+            }),
         allowed_hosts: settings.vllm_allowed_hosts,
-        model: settings.vllm_model,
-        system_prompt: settings.vllm_system_prompt,
+        model: task_vllm
+            .as_ref()
+            .map_or(settings.vllm_model.clone(), |config| config.model.clone()),
+        system_prompt: task_vllm.as_ref().map_or(settings.vllm_system_prompt.clone(), |config| {
+            config.system_prompt.clone()
+        }),
         tag_mode: settings.vllm_tag_mode,
-        concurrency: settings.vllm_concurrency,
+        concurrency: task_vllm
+            .as_ref()
+            .map_or(settings.vllm_concurrency, |config| config.concurrency.clamp(1, 64)),
         batch_limit: items.len().clamp(1, 10_000),
         ..VllmServiceConfig::default()
     };
@@ -12204,13 +12862,10 @@ async fn run_vllm_task_with_ready_runtime(
             retryable: true,
         })?;
     let wave_size = config.concurrency;
-    let mut service = VllmService::new(config, api_key)
+    let service = VllmService::new(config, api_key)
         .map_err(vllm_task_failure)?
         .with_output_options(output)
         .map_err(vllm_task_failure)?;
-    if verify_danbooru {
-        service = service.with_danbooru_client(state.danbooru.read().await.clone());
-    }
     let total = state
         .database
         .task_item_counts(&task.id)
@@ -12276,6 +12931,106 @@ async fn run_vllm_task_with_ready_runtime(
                 .as_secs(),
             "items": failures,
         }
+    })))
+}
+
+async fn run_cl_tagger_batch_items(
+    state: &AppState,
+    task: &TaskSnapshot,
+    verified_root: &VerifiedMediaRoot,
+    item_keys: &HashMap<String, String>,
+    quarantine_by_media: &HashMap<String, QuarantineInput>,
+    items: Vec<VllmBatchItem>,
+) -> Result<WorkerOutcome, TaskFailure> {
+    let settings = state.settings.read().await.clone();
+    let cl_config = task_cl_tagger_config(task)?
+        .unwrap_or_else(|| cl_tagger_retag_config_from_settings(&settings));
+    let mut lease = acquire_cl_tagger_runtime(state, false, &cl_config).await?;
+    let total = state
+        .database
+        .task_item_counts(&task.id)
+        .map_err(database_task_failure)?
+        .total;
+    let started = Instant::now();
+    let mut successes = Vec::<VllmTagSuccess>::new();
+    let mut failures = Vec::<VllmRetryItem>::new();
+    let mut completed = 0u64;
+    let mut wave_media_ids = HashSet::new();
+    for item in items {
+        if worker_was_stopped(state, &task.id) {
+            return Ok(WorkerOutcome::Stopped);
+        }
+        wave_media_ids.insert(item.media_id.clone());
+        let image_path = item.image_path.clone();
+        let inferred = tokio::task::spawn_blocking({
+            let model = Arc::clone(&lease.model);
+            move || {
+                let mut guard = model.blocking_lock();
+                guard.tag_image(&image_path)
+            }
+        })
+        .await
+        .map_err(join_task_failure)?
+        .map_err(|message| TaskFailure {
+            code: "cl_tagger_inference_failed".to_string(),
+            message,
+            retryable: true,
+        })?;
+        let caption = inferred.join(", ");
+        if let Err(error) = write_sidecar_atomic(
+            &item.image_path,
+            &caption,
+            TagWriteMode::Overwrite,
+            item.sidecar_quarantine_path.as_deref(),
+        ) {
+            failures.push(VllmRetryItem {
+                media_id: item.media_id.clone(),
+                code: error.kind,
+                message: error.message,
+                retryable: error.retryable,
+            });
+            continue;
+        }
+        successes.push(VllmTagSuccess {
+            media_id: item.media_id.clone(),
+            tags: inferred,
+            sidecar_written: true,
+        });
+        completed += 1;
+        if !report_task_progress(state, &task.id, completed, total, 0, 0, started)? {
+            return Ok(WorkerOutcome::Stopped);
+        }
+    }
+    let result = VllmBatchResult {
+        successes,
+        retry_manifest: VllmRetryManifest {
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            items: failures,
+        },
+    };
+    commit_vllm_wave(
+        state,
+        &task.id,
+        verified_root,
+        item_keys,
+        quarantine_by_media,
+        &wave_media_ids,
+        &result,
+    )
+    .await?;
+    let counts = state
+        .database
+        .task_item_counts(&task.id)
+        .map_err(database_task_failure)?;
+    if counts.failed > 0 {
+        return Err(vllm_items_failure(counts));
+    }
+    Ok(WorkerOutcome::Complete(serde_json::json!({
+        "successes": result.successes.len(),
+        "retry_manifest": { "items": result.retry_manifest.items.len() }
     })))
 }
 
@@ -12695,6 +13450,9 @@ async fn run_dataset_augmentation_task(
     state: &AppState,
     task: &TaskSnapshot,
 ) -> Result<WorkerOutcome, TaskFailure> {
+    // How many retagging waves a sample may be retried across before the
+    // worker gives up and records it as failed instead of looping forever.
+    const MAX_RETAG_ATTEMPTS: u32 = 3;
     let request: CreateTaskRequest =
         serde_json::from_value(task.payload.clone()).map_err(|error| TaskFailure {
             code: "invalid_task_payload".to_string(),
@@ -12873,12 +13631,21 @@ async fn run_dataset_augmentation_task(
             item.payload
                 .get("media_id")
                 .and_then(Value::as_str)
-                .map(|media_id| (media_id.to_string(), item.item_key))
+                .map(|media_id| (media_id.to_string(), (item.item_key, item.status)))
         })
         .collect::<HashMap<_, _>>();
     for (index, source) in sources.into_iter().enumerate() {
         if worker_was_stopped(state, &task.id) {
             return Ok(WorkerOutcome::Stopped);
+        }
+        // A retry re-enters the whole worker, but sources already committed in
+        // a previous run must not be processed again: re-finishing a completed
+        // item is rejected by the database, and re-generating would overwrite
+        // derived files under the same workspace.
+        if let Some((_, status)) = augmentation_item_keys.get(&source.media_id) {
+            if status == "completed" || status == "skipped" {
+                continue;
+            }
         }
         let source_media_id = source.media_id.clone();
         let analysis = analyses.get(&source_media_id).cloned();
@@ -12936,7 +13703,7 @@ async fn run_dataset_augmentation_task(
                     "variants": samples.iter().map(|sample| sample.variant.clone()).collect::<Vec<_>>(),
                     "status": if samples.is_empty() { "quality_rules_rejected" } else { "generated" },
                 });
-                if let Some(item_key) = augmentation_item_keys.get(&source_media_id) {
+                if let Some((item_key, _)) = augmentation_item_keys.get(&source_media_id) {
                     let status = if samples.is_empty() { "skipped" } else { "completed" };
                     if !state
                         .database
@@ -12960,7 +13727,7 @@ async fn run_dataset_augmentation_task(
                     "status": "source_rejected",
                     "reason": rejection.reason.clone(),
                 });
-                if let Some(item_key) = augmentation_item_keys.get(&source_media_id) {
+                if let Some((item_key, _)) = augmentation_item_keys.get(&source_media_id) {
                     if !state
                         .database
                         .finish_task_item(
@@ -12994,23 +13761,70 @@ async fn run_dataset_augmentation_task(
             .filter(|sample| sample.requires_retagging)
             .cloned()
             .collect::<Vec<_>>();
+        // A resumed worker fast-forwards past committed augmentation items, so
+        // this run generated nothing. Rebuild the queue from the workspace's
+        // persisted pending records so interrupted tagging can resume.
+        if retagging_samples.is_empty() {
+            let (next_workspace, restored) = tokio::task::spawn_blocking(move || {
+                let restored = workspace.retagging_pending_samples();
+                (workspace, restored)
+            })
+            .await
+            .map_err(join_task_failure)?;
+            workspace = next_workspace;
+            retagging_samples = restored.map_err(tool_task_failure)?;
+        }
         if !retagging_samples.is_empty() {
+            let loading_stage = match retagging_config.mode {
+                RetagMode::Vllm => "vllm_loading",
+                RetagMode::ClTagger => "cl_tagger_loading",
+            };
             state
                 .tasks
-                .set_stage(&task.id, "vllm_loading")
+                .set_stage(&task.id, loading_stage)
                 .map_err(task_manager_task_failure)?;
-            let mut lease = acquire_vllm_runtime(state, false).await?;
+            // Per-task runtimes: the tagger is configured from the task's own
+            // retagging options, never from global settings.
+            let mut vllm_lease: Option<VllmRuntimeLease> = None;
+            let mut cl_tagger_lease: Option<ClTaggerLease> = None;
+            match retagging_config.mode {
+                RetagMode::Vllm => {
+                    vllm_lease = Some(
+                        acquire_vllm_runtime(
+                            state,
+                            false,
+                            Some((
+                                retagging_config.vllm.base_url.as_str(),
+                                retagging_config.vllm.model.as_str(),
+                            )),
+                        )
+                        .await?,
+                    );
+                }
+                RetagMode::ClTagger => {
+                    cl_tagger_lease = Some(
+                        acquire_cl_tagger_runtime(
+                            state,
+                            false,
+                            &retagging_config.cl_tagger,
+                        )
+                        .await?,
+                    );
+                }
+            }
             state
                 .tasks
                 .set_stage(&task.id, "retagging")
                 .map_err(task_manager_task_failure)?;
-            let wave_size = {
-                let settings = state.settings.read().await;
-                settings.vllm_concurrency.clamp(1, 64)
+            let wave_size = match retagging_config.mode {
+                RetagMode::Vllm => retagging_config.vllm.concurrency.clamp(1, 64),
+                // CPU-side inference is serial inside the loaded ONNX session;
+                // a modest wave keeps progress reporting smooth.
+                RetagMode::ClTagger => 32,
             };
             let total_retag = retagging_samples.len() as u64;
             let retag_started = Instant::now();
-            let mut skip_danbooru_verify = false;
+            let mut retag_attempts = HashMap::<String, u32>::new();
             let mut stopped = false;
             loop {
                 if worker_was_stopped(state, &task.id) {
@@ -13025,16 +13839,34 @@ async fn run_dataset_augmentation_task(
                 if wave.is_empty() {
                     break;
                 }
-                let outcome = retag_dataset_augmentation_samples(
-                    state,
-                    &root_path,
-                    &source_lookup,
-                    &source_media,
-                    &wave,
-                    retagging_config.preserve_artist_character_tags,
-                    skip_danbooru_verify,
-                )
-                .await?;
+                let outcome = match retagging_config.mode {
+                    RetagMode::Vllm => {
+                        retag_dataset_augmentation_samples(
+                            state,
+                            &root_path,
+                            &source_lookup,
+                            &source_media,
+                            &wave,
+                            &retagging_config,
+                        )
+                        .await?
+                    }
+                    RetagMode::ClTagger => {
+                        retag_dataset_augmentation_samples_cl_tagger(
+                            state,
+                            &root_path,
+                            &source_lookup,
+                            &source_media,
+                            &wave,
+                            retagging_config.preserve_artist_character_tags,
+                            &cl_tagger_lease
+                                .as_ref()
+                                .expect("cl_tagger_lease acquired for cl_tagger mode")
+                                .model,
+                        )
+                        .await?
+                    }
+                };
                 let successful_samples = outcome
                     .successes
                     .iter()
@@ -13044,17 +13876,6 @@ async fn run_dataset_augmentation_task(
                             .cloned()
                     })
                     .collect::<Vec<_>>();
-                if !successful_samples.is_empty() {
-                    let (next_workspace, promoted) = tokio::task::spawn_blocking(move || {
-                        let mut workspace = workspace;
-                        let promoted = workspace.promote_retagged_samples(&successful_samples);
-                        (workspace, promoted)
-                    })
-                    .await
-                    .map_err(join_task_failure)?;
-                    workspace = next_workspace;
-                    promoted.map_err(tool_task_failure)?;
-                }
                 let processed =
                     total_retag.saturating_sub(retagging_samples.len() as u64);
                 if !report_download_progress(state, &task.id, processed, total_retag, 0, retag_started)?
@@ -13062,85 +13883,78 @@ async fn run_dataset_augmentation_task(
                     stopped = true;
                     break;
                 }
-                if let Some(reason) = outcome.danbooru_unreachable {
-                    // Return every item that still needs work (wave failures
-                    // plus anything never dispatched) to the queue, then ask
-                    // the user how to proceed.
-                    let failed_ids = outcome
-                        .failures
-                        .iter()
-                        .map(|failure| failure.media_id.as_str())
-                        .collect::<HashSet<_>>();
-                    retagging_samples.retain(|sample| {
-                        failed_ids.contains(sample.sample_id.as_str())
-                    });
-                    state
-                        .tasks
-                        .await_confirmation(
-                            &task.id,
-                            serde_json::json!({
-                                "type": "danbooru_unreachable",
-                                "message": reason,
-                                "pending": retagging_samples.len(),
-                            }),
-                        )
-                        .map_err(task_manager_task_failure)?;
-                    let mut resolved = false;
-                    while !resolved {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let snapshot = state
-                            .tasks
-                            .get(&task.id)
-                            .map_err(task_manager_task_failure)?
-                            .ok_or_else(|| TaskFailure {
-                                code: "task_not_found".to_string(),
-                                message: "任务在等待用户决定期间消失".to_string(),
-                                retryable: false,
-                            })?;
-                        match snapshot.status {
-                            crate::tasks::TaskStatus::Running => {
-                                let decision = state
-                                    .tasks
-                                    .take_confirm_decision(&task.id)
-                                    .map_err(task_manager_task_failure)?;
-                                if decision.as_ref().and_then(Value::as_str)
-                                    == Some("skip_danbooru_verify")
-                                {
-                                    skip_danbooru_verify = true;
-                                    resolved = true;
-                                }
-                            }
-                            crate::tasks::TaskStatus::Cancelling
-                            | crate::tasks::TaskStatus::Cancelled => {
-                                stopped = true;
-                                resolved = true;
-                            }
-                            crate::tasks::TaskStatus::Failed => {
-                                return Err(TaskFailure {
-                                    code: "task_failed_while_waiting".to_string(),
-                                    message: "任务在等待用户决定期间失败".to_string(),
-                                    retryable: false,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                    if stopped {
-                        break;
-                    }
-                    continue;
-                }
                 retagging_successes.extend(outcome.successes);
                 retagging_failures.extend(outcome.failures);
-                let wave_ids = wave
+                // Promote successes, keep failures for another wave attempt,
+                // and give up on samples whose attempts are exhausted so a
+                // persistently broken batch cannot loop forever. The exhausted
+                // set is recorded as failed in the workspace metadata below.
+                let succeeded_ids = successful_samples
                     .iter()
                     .map(|sample| sample.sample_id.clone())
                     .collect::<HashSet<_>>();
-                retagging_samples.retain(|sample| !wave_ids.contains(&sample.sample_id));
+                let mut exhausted = Vec::new();
+                for sample in &wave {
+                    let entry = retag_attempts
+                        .entry(sample.sample_id.clone())
+                        .or_insert(0u32);
+                    *entry += 1;
+                    if *entry > MAX_RETAG_ATTEMPTS
+                        && !succeeded_ids.contains(&sample.sample_id)
+                    {
+                        exhausted.push(sample.clone());
+                    }
+                }
+                let exhausted_ids = exhausted
+                    .iter()
+                    .map(|sample| sample.sample_id.clone())
+                    .collect::<HashSet<_>>();
+                retagging_samples.retain(|sample| {
+                    !succeeded_ids.contains(&sample.sample_id)
+                        && !exhausted_ids.contains(&sample.sample_id)
+                });
+                if !successful_samples.is_empty() || !exhausted.is_empty() {
+                    let (next_workspace, failed) = tokio::task::spawn_blocking(move || {
+                        let mut workspace = workspace;
+                        let mut failures = Vec::new();
+                        if let Err(error) =
+                            workspace.promote_retagged_samples(&successful_samples)
+                        {
+                            failures.push(error);
+                        }
+                        for sample in &exhausted {
+                            if let Err(error) = workspace.record_retagging_failure(
+                                sample,
+                                &format!(
+                                    "打标重试 {} 次仍失败，已放弃该样本",
+                                    MAX_RETAG_ATTEMPTS
+                                ),
+                            ) {
+                                failures.push(error);
+                                break;
+                            }
+                        }
+                        (workspace, failures)
+                    })
+                    .await
+                    .map_err(join_task_failure)?;
+                    workspace = next_workspace;
+                    for error in failed {
+                        return Err(tool_task_failure(error));
+                    }
+                }
             }
-            let cleanup = release_vllm_runtime(state, &mut lease).await;
-            if let Err(cleanup) = cleanup {
-                return Err(cleanup);
+            if let Some(mut lease) = vllm_lease {
+                let cleanup = release_vllm_runtime(state, &mut lease).await;
+                if let Err(cleanup) = cleanup {
+                    return Err(cleanup);
+                }
+            }
+            if let Some(mut lease) = cl_tagger_lease {
+                let cleanup = release_cl_tagger_runtime(state, &mut lease).await;
+                if let Err(cleanup) = cleanup {
+                    return Err(cleanup);
+                }
             }
             if stopped {
                 return Ok(WorkerOutcome::Stopped);
@@ -13213,10 +14027,6 @@ async fn run_dataset_augmentation_task(
 struct AugmentationRetagOutcome {
     successes: Vec<VllmTagSuccess>,
     failures: Vec<VllmRetryItem>,
-    /// Some(reason) when the batch was cut short by a Danbooru API
-    /// connectivity failure and the caller should ask the user how to
-    /// proceed before retrying the unfinished items.
-    danbooru_unreachable: Option<String>,
 }
 
 async fn retag_dataset_augmentation_samples(
@@ -13225,17 +14035,15 @@ async fn retag_dataset_augmentation_samples(
     sources: &HashMap<String, DatasetAugmentationSource>,
     source_media: &HashMap<String, MediaFileRecord>,
     samples: &[crate::services::dataset_augmentation::DatasetAugmentationSample],
-    preserve_artist_character_tags: bool,
-    skip_danbooru_verify: bool,
+    retagging: &crate::services::dataset_augmentation::DerivedRetaggingConfig,
 ) -> Result<AugmentationRetagOutcome, TaskFailure> {
     let root = VerifiedMediaRoot::open(root_path).map_err(tool_task_failure)?;
-    let settings = state.settings.read().await.clone();
     let mut items = Vec::with_capacity(samples.len());
     for sample in samples {
         let image_path = root
             .resolve_existing_file(&sample.output_relative_path)
             .map_err(tool_task_failure)?;
-        let tag_prefixes = if preserve_artist_character_tags {
+        let tag_prefixes = if retagging.preserve_artist_character_tags {
             let media = source_media
                 .get(&sample.source_media_id)
                 .ok_or_else(|| TaskFailure {
@@ -13262,25 +14070,26 @@ async fn retag_dataset_augmentation_samples(
             tag_prefixes,
         });
     }
+    let vllm = &retagging.vllm;
+    let vllm_max_tags = state.settings.read().await.vllm_max_tags.clamp(1, 200);
     let output = VllmOutputOptions {
-        language: settings.vllm_language,
-        max_tags: settings.vllm_max_tags,
-        max_length: settings.vllm_max_length,
-        verify_danbooru: settings.vllm_verify_danbooru && !skip_danbooru_verify,
+        language: vllm.language,
+        max_tags: vllm_max_tags,
+        max_length: vllm.max_length,
         reference_existing: false,
     };
-    let verify_danbooru =
-        output.verify_danbooru && output.language == crate::services::vllm::VllmLanguage::Danbooru;
     let config = VllmServiceConfig {
-        endpoint: settings.vllm_base_url,
-        allowed_hosts: settings.vllm_allowed_hosts,
-        model: settings.vllm_model,
-        system_prompt: settings.vllm_system_prompt,
+        endpoint: vllm.base_url.clone(),
+        // Per-task endpoints are trusted as configured; no global host
+        // allowlist applies to dataset retagging.
+        allowed_hosts: Vec::new(),
+        model: vllm.model.clone(),
+        system_prompt: vllm.system_prompt.clone(),
         // A derived sample starts with no sidecar. Always create a clean,
         // comma-separated caption rather than inheriting the user's global
         // append setting.
         tag_mode: TagWriteMode::Overwrite,
-        concurrency: settings.vllm_concurrency,
+        concurrency: vllm.concurrency.clamp(1, 64),
         batch_limit: items.len().clamp(1, 10_000),
         ..VllmServiceConfig::default()
     };
@@ -13292,27 +14101,97 @@ async fn retag_dataset_augmentation_samples(
             message: "无法从系统凭据库读取 vLLM 密钥".to_string(),
             retryable: true,
         })?;
-    let mut service = VllmService::new(config, api_key)
+    let service = VllmService::new(config, api_key)
         .map_err(vllm_task_failure)?
         .with_output_options(output)
         .map_err(vllm_task_failure)?;
-    if verify_danbooru {
-        service = service.with_danbooru_client(state.danbooru.read().await.clone());
-    }
     let result = service.tag_batch(items).await.map_err(vllm_task_failure)?;
-    let danbooru_unreachable = service.aborted().then(|| {
-        result
-            .retry_manifest
-            .items
-            .iter()
-            .find(|failure| failure.message.contains("Danbooru API 无法连接"))
-            .map(|failure| failure.message.clone())
-            .unwrap_or_else(|| "Danbooru API 无法连接".to_string())
-    });
     Ok(AugmentationRetagOutcome {
         successes: result.successes,
         failures: result.retry_manifest.items,
-        danbooru_unreachable,
+    })
+}
+
+/// CL Tagger retagging pass: a local ONNX model writes comma-separated
+/// Danbooru tags for every derived sample. Identity prefixes follow the same
+/// artist-first rule as the vLLM pass and are never invented.
+async fn retag_dataset_augmentation_samples_cl_tagger(
+    state: &AppState,
+    root_path: &Path,
+    sources: &HashMap<String, DatasetAugmentationSource>,
+    source_media: &HashMap<String, MediaFileRecord>,
+    samples: &[crate::services::dataset_augmentation::DatasetAugmentationSample],
+    preserve_artist_character_tags: bool,
+    model: &Arc<tokio::sync::Mutex<crate::services::cl_tagger::ClTaggerModel>>,
+) -> Result<AugmentationRetagOutcome, TaskFailure> {
+    let root = VerifiedMediaRoot::open(root_path).map_err(tool_task_failure)?;
+    let mut successes = Vec::with_capacity(samples.len());
+    let failures = Vec::new();
+    for sample in samples {
+        let image_path = root
+            .resolve_existing_file(&sample.output_relative_path)
+            .map_err(tool_task_failure)?;
+        let tag_prefixes = if preserve_artist_character_tags {
+            let media = source_media
+                .get(&sample.source_media_id)
+                .ok_or_else(|| TaskFailure {
+                    code: "dataset_source_missing".to_string(),
+                    message: "无法查找派生图的原始媒体记录".to_string(),
+                    retryable: false,
+                })?;
+            let source = sources
+                .get(&sample.source_media_id)
+                .ok_or_else(|| TaskFailure {
+                    code: "dataset_source_missing".to_string(),
+                    message: "无法查找派生图的原始标签".to_string(),
+                    retryable: false,
+                })?;
+            augmentation_identity_tag_prefixes(state, &root, media, source)?
+        } else {
+            Vec::new()
+        };
+        let tagged = tokio::task::spawn_blocking({
+            let model = Arc::clone(model);
+            let image_path = image_path.clone();
+            move || {
+                let mut guard = model.blocking_lock();
+                guard.tag_image(&image_path)
+            }
+        })
+        .await
+        .map_err(join_task_failure)?
+        .map_err(|message| TaskFailure {
+            code: "cl_tagger_inference_failed".to_string(),
+            message,
+            retryable: true,
+        })?;
+        let mut merged = tag_prefixes;
+        for tag in tagged {
+            if !merged.contains(&tag) {
+                merged.push(tag);
+            }
+        }
+        let caption = merged.join(", ");
+        crate::services::vllm::write_sidecar_atomic(
+            &image_path,
+            &caption,
+            crate::services::vllm::TagWriteMode::Overwrite,
+            None,
+        )
+        .map_err(|error| TaskFailure {
+            code: "cl_tagger_caption_write_failed".to_string(),
+            message: error.message,
+            retryable: false,
+        })?;
+        successes.push(VllmTagSuccess {
+            media_id: sample.sample_id.clone(),
+            tags: merged,
+            sidecar_written: true,
+        });
+    }
+    Ok(AugmentationRetagOutcome {
+        successes,
+        failures,
     })
 }
 
@@ -13322,7 +14201,8 @@ fn augmentation_identity_tag_prefixes(
     media: &MediaFileRecord,
     source: &DatasetAugmentationSource,
 ) -> Result<Vec<String>, TaskFailure> {
-    let mut prefixes = Vec::new();
+    let mut artists = Vec::new();
+    let mut characters = Vec::new();
     if let Some(post_id) = media.post_id {
         if let Some(metadata) = state
             .database
@@ -13331,39 +14211,60 @@ fn augmentation_identity_tag_prefixes(
         {
             for tag in metadata.tags {
                 match tag.category {
-                    1 | 4 => prefixes.push(tag.name.clone()),
+                    1 => artists.push(tag.name.clone()),
+                    4 => characters.push(tag.name.clone()),
                     _ => {}
                 }
             }
         }
     }
     // Locally supplied captions may carry explicit identity prefixes even
-    // when this root has no indexed Danbooru post metadata. Prefixes are
-    // stripped so training captions stay bare (artist/character are ordinary
-    // tags, not typed fields).
-    if prefixes.is_empty() {
+    // when this root has no indexed Danbooru post metadata. Only the typed
+    // artist/character prefixes are kept; a caption with neither contributes
+    // nothing, so an uncredited characterless image stays prefix-free.
+    if artists.is_empty() && characters.is_empty() {
         let sidecar = root
             .resolve(&source.relative_path)
             .map_err(tool_task_failure)?
             .with_extension("txt");
         let caption =
             std::fs::read_to_string(sidecar).unwrap_or_else(|_| source.fallback_caption.clone());
-        prefixes.extend(caption.split(',').filter_map(|raw| {
-            let tag = raw.trim();
-            (tag.starts_with("artist:") || tag.starts_with('@') || tag.starts_with("character:"))
-                .then(|| {
-                    tag.strip_prefix("artist:")
-                        .or_else(|| tag.strip_prefix("character:"))
-                        .or_else(|| tag.strip_prefix('@'))
-                        .unwrap_or(tag)
-                        .trim()
-                        .to_string()
-                })
-        }));
+        return Ok(extract_identity_prefixes_from_caption(&caption));
     }
-    prefixes.sort();
-    prefixes.dedup();
-    Ok(prefixes)
+    Ok(merge_identity_prefixes(artists, characters))
+}
+
+/// Identity prefixes are always artist first, then characters, with no
+/// duplicates. An image whose caption carries neither an artist nor a
+/// character tag produces no prefix at all; nothing is invented.
+fn merge_identity_prefixes(artists: Vec<String>, characters: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut prefixes = Vec::new();
+    for tag in artists.into_iter().chain(characters.into_iter()) {
+        if seen.insert(tag.clone()) {
+            prefixes.push(tag);
+        }
+    }
+    prefixes
+}
+
+/// Parses `artist:`/`@` and `character:` typed prefixes from a raw caption.
+/// Both artists and characters are optional: a caption without them yields an
+/// empty prefix list.
+fn extract_identity_prefixes_from_caption(caption: &str) -> Vec<String> {
+    let mut artists = Vec::new();
+    let mut characters = Vec::new();
+    for raw in caption.split(',') {
+        let tag = raw.trim();
+        if let Some(name) = tag.strip_prefix("artist:") {
+            artists.push(name.trim().to_string());
+        } else if let Some(name) = tag.strip_prefix('@') {
+            artists.push(name.trim().to_string());
+        } else if let Some(name) = tag.strip_prefix("character:") {
+            characters.push(name.trim().to_string());
+        }
+    }
+    merge_identity_prefixes(artists, characters)
 }
 
 const MIN_VISION_CROP_FREE_VRAM_MIB: u64 = 4_096;
@@ -17182,6 +18083,7 @@ mod security_contract_tests {
         TrainingGalleryDatasetInspection, inspect_path_training_dataset,
         training_model_path_ready, training_output_available_mib, training_resume_state_ready,
         vllm_runtime_key,
+        extract_identity_prefixes_from_caption, merge_identity_prefixes,
     };
     use crate::models::DownloadConfig;
     use crate::database::MediaIndexFingerprint;
@@ -19230,6 +20132,47 @@ mod security_contract_tests {
         (format!("http://{address}/v1"), server)
     }
 
+    async fn mock_vllm_tags_delayed(delay: std::time::Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |_: axum::Json<serde_json::Value>| async move {
+                    tokio::time::sleep(delay).await;
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "content": "<tag>cat, solo</tag>" } }]
+                    }))
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        (format!("http://{address}/v1"), server)
+    }
+
+    async fn mock_vllm_tags_failing() -> (String, tokio::task::JoinHandle<()>) {
+        async fn completions() -> Response {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message": "mock upstream failure"}})),
+            )
+                .into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/models", get(mock_vllm_models))
+            .route("/v1/chat/completions", axum::routing::post(completions));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        (format!("http://{address}/v1"), server)
+    }
+
     async fn mock_vllm_health() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -19439,7 +20382,7 @@ mod security_contract_tests {
         }
 
         let waiting_state = state.clone();
-        let waiter = tokio::spawn(async move { acquire_vllm_runtime(&waiting_state, false).await });
+        let waiter = tokio::spawn(async move { acquire_vllm_runtime(&waiting_state, false, None).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if state.vllm_runtime.state.lock().await.pending_acquires == 1 {
@@ -19511,6 +20454,52 @@ mod security_contract_tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["code"], "invalid_vllm_launch_endpoint");
+    }
+
+    #[test]
+    fn identity_prefixes_are_never_invented_when_both_artist_and_character_are_absent() {
+        assert!(extract_identity_prefixes_from_caption("1girl, blue_hair, solo, smile").is_empty());
+        assert!(extract_identity_prefixes_from_caption("").is_empty());
+        assert!(extract_identity_prefixes_from_caption("copyright:umamusume, 1girl").is_empty());
+    }
+
+    #[test]
+    fn identity_prefixes_add_only_the_present_artist_tag() {
+        assert_eq!(
+            extract_identity_prefixes_from_caption("artist:aramedraw, 1girl, blue_hair"),
+            vec!["aramedraw"]
+        );
+        assert_eq!(
+            extract_identity_prefixes_from_caption("@aramedraw, 1girl"),
+            vec!["aramedraw"]
+        );
+    }
+
+    #[test]
+    fn identity_prefixes_add_only_the_present_character_tag() {
+        assert_eq!(
+            extract_identity_prefixes_from_caption(
+                "character:alice_(alice_in_wonderland), 1girl, blonde_hair"
+            ),
+            vec!["alice_(alice_in_wonderland)"]
+        );
+    }
+
+    #[test]
+    fn identity_prefixes_keep_artist_first_when_both_are_present_and_deduplicate() {
+        assert_eq!(
+            extract_identity_prefixes_from_caption(
+                "artist:aramedraw, character:alice_(alice_in_wonderland), 1girl"
+            ),
+            vec!["aramedraw", "alice_(alice_in_wonderland)"]
+        );
+        assert_eq!(
+            merge_identity_prefixes(
+                vec!["aramedraw".to_string(), "aramedraw".to_string()],
+                vec!["alice_(alice_in_wonderland)".to_string()],
+            ),
+            vec!["aramedraw", "alice_(alice_in_wonderland)"]
+        );
     }
 
     #[tokio::test]
@@ -27145,37 +28134,26 @@ mod security_contract_tests {
         assert_eq!(completed.completed_items, 1);
     }
 
-    #[tokio::test]
-    async fn dataset_augmentation_retag_survives_danbooru_unreachable_decision() {
+#[tokio::test]
+async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retries() {
         let (application, state, directory) = test_router();
-        // Point the shared Danbooru client at a port that refuses connections
-        // so tag verification aborts and the task stalls for a decision.
-        *state
-            .danbooru
-            .try_write()
-            .expect("danbooru client lock unavailable during test setup") =
-            crate::services::danbooru::DanbooruClient::new(
-                crate::services::danbooru::DanbooruClientConfig {
-                    base_url: "http://127.0.0.1:1".into(),
-                    requests_per_second: 1_000,
-                    ..crate::services::danbooru::DanbooruClientConfig::default()
-                },
-            )
-            .unwrap();
-        let (endpoint, server) = mock_vllm_tags().await;
-        state.settings.write().await.vllm_base_url = endpoint;
-        state.settings.write().await.vllm_model = "unsloth/Qwen3.6-27B-NVFP4".into();
+        let (endpoint, server) = mock_vllm_tags_failing().await;
+        let retag_vllm = serde_json::json!({
+            "base_url": endpoint,
+            "model": "unsloth/Qwen3.6-27B-NVFP4",
+            "language": "danbooru"
+        });
 
-        let media = directory.path().join("augmentation-retag-root");
+        let media = directory.path().join("augmentation-fail-root");
         std::fs::create_dir_all(&media).unwrap();
-        image::RgbImage::from_pixel(800, 1000, image::Rgb([30, 60, 90]))
+        image::RgbImage::from_pixel(800, 1000, image::Rgb([50, 80, 110]))
             .save(media.join("sample.png"))
             .unwrap();
         state
             .database
             .create_root(
-                "augmentation-retag-root",
-                "Augmentation retag root",
+                "augmentation-fail-root",
+                "Augmentation fail root",
                 Some(media.to_str().unwrap()),
                 Some(media.to_str().unwrap()),
             )
@@ -27183,8 +28161,8 @@ mod security_contract_tests {
         state
             .database
             .upsert_media_file(&crate::database::MediaFileInput {
-                id: "augmentation-retag-media".into(),
-                root_id: "augmentation-retag-root".into(),
+                id: "augmentation-fail-media".into(),
+                root_id: "augmentation-fail-root".into(),
                 post_id: None,
                 relative_path: "sample.png".into(),
                 variant: "original".into(),
@@ -27208,9 +28186,9 @@ mod security_contract_tests {
                     .body(Body::from(
                         serde_json::json!({
                             "type": "dataset_augmentation",
-                            "root_id": "augmentation-retag-root",
+                            "root_id": "augmentation-fail-root",
                             "options": {
-                                "media_ids": ["augmentation-retag-media"],
+                                "media_ids": ["augmentation-fail-media"],
                                 "min_megapixels": 0.5,
                                 "min_long_side": 512,
                                 "min_short_side": 384,
@@ -27218,7 +28196,8 @@ mod security_contract_tests {
                                 "smart_crop": { "enabled": false },
                                 "retagging": {
                                     "send_to_vllm": true,
-                                    "preserve_artist_character_tags": false
+                                    "preserve_artist_character_tags": false,
+                                    "vllm": retag_vllm
                                 }
                             }
                         })
@@ -27228,6 +28207,143 @@ mod security_contract_tests {
             )
             .await
             .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::CREATED, "{body_text}");
+        let task_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let task = state.tasks.get(&task_id).unwrap().unwrap();
+                if matches!(
+                    task.status,
+                    crate::tasks::TaskStatus::Completed | crate::tasks::TaskStatus::Failed
+                ) {
+                    break task;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task should finish after exhausting its retagging attempts");
+        server.abort();
+
+        assert_eq!(
+            completed.status,
+            crate::tasks::TaskStatus::Completed,
+            "persistent per-item failures must not fail the whole task: {:?}",
+            completed.error
+        );
+        let ready = media
+            .join(".augmentation")
+            .join(&task_id)
+            .join("ready/train/horizontal_flip/images");
+        let ready_count = std::fs::read_dir(&ready)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(ready_count, 0);
+
+        let retagging_path = media
+            .join(".augmentation-metadata")
+            .join(&task_id)
+            .join("metadata/retagging.jsonl");
+        let retagging = std::fs::read_to_string(&retagging_path).unwrap_or_default();
+        let lines = retagging.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("\"status\":\"failed\""))
+                .count(),
+            1,
+            "the persistently failing sample must be recorded as failed"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("\"status\":\"completed\""))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_augmentation_resume_skips_committed_items_and_reruns_retagging() {
+        let (application, state, directory) = test_router();
+        let (endpoint, server) = mock_vllm_tags_delayed(std::time::Duration::from_secs(2)).await;
+        let retag_vllm = serde_json::json!({
+            "base_url": endpoint,
+            "model": "unsloth/Qwen3.6-27B-NVFP4",
+            "language": "danbooru"
+        });
+        state.settings.write().await.vllm_base_url = endpoint;
+        state.settings.write().await.vllm_model = "unsloth/Qwen3.6-27B-NVFP4".into();
+
+        let media = directory.path().join("augmentation-resume-root");
+        std::fs::create_dir_all(&media).unwrap();
+        image::RgbImage::from_pixel(800, 1000, image::Rgb([40, 70, 100]))
+            .save(media.join("sample.png"))
+            .unwrap();
+        state
+            .database
+            .create_root(
+                "augmentation-resume-root",
+                "Augmentation resume root",
+                Some(media.to_str().unwrap()),
+                Some(media.to_str().unwrap()),
+            )
+            .unwrap();
+        state
+            .database
+            .upsert_media_file(&crate::database::MediaFileInput {
+                id: "augmentation-resume-media".into(),
+                root_id: "augmentation-resume-root".into(),
+                post_id: None,
+                relative_path: "sample.png".into(),
+                variant: "original".into(),
+                mime_type: "image/png".into(),
+                byte_size: 4,
+                sha256: None,
+                md5: None,
+                width: Some(800),
+                height: Some(1000),
+                duration: None,
+            })
+            .unwrap();
+
+        let create = |application: &axum::Router| {
+            application.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "type": "dataset_augmentation",
+                            "root_id": "augmentation-resume-root",
+                            "options": {
+                                "media_ids": ["augmentation-resume-media"],
+                                "min_megapixels": 0.5,
+                                "min_long_side": 512,
+                                "min_short_side": 384,
+                                "horizontal_flip": true,
+                                "smart_crop": { "enabled": false },
+                                "retagging": {
+                                    "send_to_vllm": true,
+                                    "preserve_artist_character_tags": false,
+                                    "vllm": retag_vllm
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+        let response = create(&application).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let task_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"]["id"]
@@ -27235,47 +28351,55 @@ mod security_contract_tests {
             .unwrap()
             .to_string();
 
-        // The first retagging wave must stall on the unreachable Danbooru API
-        // instead of failing the whole task.
-        let preview_type = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        // First run: augmentation commits its items, then retagging runs
+        // through the slow mock. Pause while the retagging stage is in flight
+        // so the committed augmentation items already exist in the database.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 let task = state.tasks.get(&task_id).unwrap().unwrap();
-                if task.status == crate::tasks::TaskStatus::AwaitingConfirmation {
-                    break task;
+                match task.status {
+                    crate::tasks::TaskStatus::Running => {
+                        if task.stage == "retagging" {
+                            let response = application
+                                .clone()
+                                .oneshot(
+                                    Request::builder()
+                                        .method("POST")
+                                        .uri(format!("/api/tasks/{task_id}/pause"))
+                                        .header("content-type", "application/json")
+                                        .body(Body::from("{}"))
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(response.status(), StatusCode::OK);
+                            let _ = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                            return;
+                        }
+                    }
+                    crate::tasks::TaskStatus::Paused => return,
+                    crate::tasks::TaskStatus::Failed => {
+                        panic!("task failed while tagging: {:?}", task.error)
+                    }
+                    _ => {}
                 }
-                assert_ne!(
-                    task.status,
-                    crate::tasks::TaskStatus::Failed,
-                    "task failed before confirmation: {:?}",
-                    task.error
-                );
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("task should stall awaiting the Danbooru decision")
-        .preview
-        .and_then(|preview| {
-            preview
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .expect("awaiting_confirmation preview must carry a type");
-        assert_eq!(preview_type, "danbooru_unreachable");
+        .expect("task should reach retagging and pause");
 
-        // Skip verification: the wave reruns without duplicated samples so the
-        // promote step never collides with files it already placed.
+        // Resume: the worker re-enters the whole pipeline. Committed
+        // augmentation items must be skipped instead of re-committed, and the
+        // pending retagging sample must come back for another attempt.
         let response = application
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/tasks/{task_id}/confirm"))
+                    .uri(format!("/api/tasks/{task_id}/resume"))
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "decision": "skip_danbooru_verify" }).to_string(),
-                    ))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -27296,7 +28420,8 @@ mod security_contract_tests {
             }
         })
         .await
-        .expect("task should finish after the skip decision");
+        .expect("resumed task should finish")
+        .to_owned();
         server.abort();
 
         assert_eq!(

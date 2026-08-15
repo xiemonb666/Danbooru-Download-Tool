@@ -74,9 +74,9 @@ export VLLM_USE_MODELSCOPE=True
 
 # RTX 5090 (SM120) 上 vLLM 0.23.0 默认 Marlin 后端会挂，使用 CUTLASS 后端
 # 通过 --linear-backend cutlass 指定，无需设置 VLLM_NVFP4_GEMM_BACKEND
-# --enforce-eager 禁用 CUDA graph 捕获（曾多次在 Triton JIT 编译后引擎死锁，
-#   请求永久 running、GPU 空转）；打标输出短，eager 模式吞吐影响很小。
 # --max-num-seqs 8 降低并发，避免 16 个大图 prefill 同时压入触发引擎卡死。
+# 注意：曾用 --enforce-eager 禁用 CUDA graph 来绕过引擎死锁，但会显著拉低
+#   GPU 利用率与功耗；已移除以恢复满负载（若死锁复发需加回）。
 
 # 减少显存碎片，降低 OOM 概率
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -114,6 +114,5 @@ exec vllm serve "$MODEL_PATH" \
   --max-num-batched-tokens 4096 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --enforce-eager \
   --port "$VLLM_PORT" \
   --host "$VLLM_HOST"

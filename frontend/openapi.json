@@ -5600,6 +5600,53 @@
           }
         }
       },
+      "ClTaggerRetagTaskOptions": {
+        "type": "object",
+        "properties": {
+          "character_threshold": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "copyright_threshold": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "general_threshold": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "max_tags": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "model_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quality_threshold": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          }
+        }
+      },
       "ContentRating": {
         "type": "string",
         "enum": [
@@ -6133,9 +6180,36 @@
           "delete_selected"
         ]
       },
+      "DerivedRetaggingMode": {
+        "type": "string",
+        "enum": [
+          "vllm",
+          "cl_tagger"
+        ]
+      },
       "DerivedRetaggingTaskOptions": {
         "type": "object",
         "properties": {
+          "cl_tagger": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ClTaggerRetagTaskOptions"
+              }
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DerivedRetaggingMode"
+              }
+            ]
+          },
           "preserve_artist_character_tags": {
             "type": [
               "boolean",
@@ -6146,6 +6220,16 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "vllm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VllmRetagTaskOptions"
+              }
             ]
           }
         }
@@ -7333,6 +7417,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "vllm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VllmRetagTaskOptions"
+              }
             ]
           }
         }
@@ -9935,6 +10029,55 @@
           },
           "state": {
             "type": "string"
+          }
+        }
+      },
+      "VllmRetagTaskOptions": {
+        "type": "object",
+        "properties": {
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "language": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VllmLanguage"
+              }
+            ]
+          },
+          "max_length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

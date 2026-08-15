@@ -229,6 +229,38 @@ export function unloadVllmModel(): Promise<VllmUnloadStatus> {
   return apiClient.post<VllmUnloadStatus>('/vllm/unload')
 }
 
+export interface ClTaggerHealth {
+  model_path: string
+  loaded: boolean
+  loading: boolean
+  unloading: boolean
+  manual_loaded: boolean
+  active_leases: number
+  last_error?: string
+  downloading: boolean
+  downloaded_bytes?: number
+  total_bytes?: number
+  download_error?: string
+}
+
+export function getClTaggerHealth(signal?: AbortSignal): Promise<ClTaggerHealth> {
+  return apiClient.get<ClTaggerHealth>('/cltagger/health', { signal })
+}
+
+export interface ClTaggerModelResolution {
+  model_path?: string
+  cached: boolean
+  downloading: boolean
+}
+
+export function getClTaggerModel(): Promise<ClTaggerModelResolution> {
+  return apiClient.get<ClTaggerModelResolution>('/cltagger/model')
+}
+
+export function downloadClTaggerModel(): Promise<ClTaggerModelResolution> {
+  return apiClient.post<ClTaggerModelResolution>('/cltagger/download')
+}
+
 export type DanbooruPostsPage = ApiSchema<'DanbooruPostsPage'>
 
 export interface DanbooruPostsParams {

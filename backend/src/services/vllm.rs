@@ -1,23 +1,22 @@
 #![allow(dead_code)]
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use crate::services::danbooru::DanbooruErrorKind;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif"];
 pub const DEFAULT_MODEL: &str = "unsloth/Qwen3.6-27B-NVFP4";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.";
+pub const AUGMENTATION_RETAGGING_PROMPT: &str = "Analyze the image and return Danbooru-style tags inside exactly one <tag>...</tag> block.\nRules:\n- Put ONLY a comma-separated list of lowercase tags inside the tag block, no explanations, no markdown, no bullet points.\n- Cover the subject (1girl/1boy/solo/group), every clearly visible character, clothing, hair, eyes, pose, expression, props, background and art style.\n- Do not use artist: or character: prefixes.\n- Output at least 8 tags; a typical anime illustration needs 15-40 tags.";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VllmLanguage {
@@ -92,7 +91,6 @@ pub struct VllmOutputOptions {
     pub language: VllmLanguage,
     pub max_tags: usize,
     pub max_length: usize,
-    pub verify_danbooru: bool,
     pub reference_existing: bool,
 }
 
@@ -102,7 +100,6 @@ impl Default for VllmOutputOptions {
             language: VllmLanguage::Danbooru,
             max_tags: 60,
             max_length: 400,
-            verify_danbooru: false,
             reference_existing: false,
         }
     }
@@ -224,9 +221,6 @@ pub struct VllmService {
     api_key: Option<Arc<str>>,
     semaphore: Arc<Semaphore>,
     output: Arc<VllmOutputOptions>,
-    danbooru_client: Option<crate::services::danbooru::DanbooruClient>,
-    danbooru_tag_cache: Arc<RwLock<HashMap<String, bool>>>,
-    abort: Arc<AtomicBool>,
 }
 
 impl VllmService {
@@ -265,9 +259,6 @@ impl VllmService {
                 .map(|value| Arc::<str>::from(value.trim())),
             semaphore: Arc::new(Semaphore::new(concurrency)),
             output: Arc::new(VllmOutputOptions::default()),
-            danbooru_client: None,
-            danbooru_tag_cache: Arc::new(RwLock::new(HashMap::new())),
-            abort: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -275,14 +266,6 @@ impl VllmService {
         output.validate()?;
         self.output = Arc::new(output);
         Ok(self)
-    }
-
-    pub fn with_danbooru_client(
-        mut self,
-        client: crate::services::danbooru::DanbooruClient,
-    ) -> Self {
-        self.danbooru_client = Some(client);
-        self
     }
 
     pub async fn tag_batch(&self, items: Vec<VllmBatchItem>) -> Result<VllmBatchResult, VllmError> {
@@ -305,7 +288,6 @@ impl VllmService {
 
         let mut successes = Vec::new();
         let mut failures = Vec::new();
-        let mut aborted = false;
         while let Some(result) = running.join_next().await {
             match result {
                 Ok(Ok(success)) => successes.push(success),
@@ -317,27 +299,9 @@ impl VllmService {
                     retryable: true,
                 }),
             }
-            // A Danbooru connectivity failure inside verification flips the
-            // abort flag: stop dispatching new items so the batch stalls at a
-            // known point instead of burning rate-limited requests.
-            if !aborted && self.abort.load(Ordering::Relaxed) {
-                aborted = true;
-            }
-            if !aborted {
-                if let Some(item) = pending.next() {
-                    let service = self.clone();
-                    running.spawn(async move { service.process_item(item).await });
-                }
-            }
-        }
-        if aborted {
-            while let Some(item) = pending.next() {
-                failures.push(VllmRetryItem {
-                    media_id: item.media_id,
-                    code: VllmErrorKind::Upstream,
-                    message: "批处理因 Danbooru API 无法连接而中止，等待用户决定后续处理方式".to_string(),
-                    retryable: true,
-                });
+            if let Some(item) = pending.next() {
+                let service = self.clone();
+                running.spawn(async move { service.process_item(item).await });
             }
         }
         successes.sort_by(|left, right| left.media_id.cmp(&right.media_id));
@@ -426,17 +390,11 @@ impl VllmService {
                 })?
                 .map_err(|error| retry_item(&media_id, error))?;
 
-        let mut tags = retry_operation(self.config.max_attempts, || {
+        let tags = retry_operation(self.config.max_attempts, || {
             self.request_tags(&prepared, item.existing_tags.as_deref())
         })
         .await
         .map_err(|error| retry_item(&media_id, error))?;
-        if self.output.language == VllmLanguage::Danbooru && self.output.verify_danbooru {
-            tags = self
-                .verify_danbooru_tags(tags)
-                .await
-                .map_err(|error| retry_item(&media_id, error))?;
-        }
         drop(permit);
 
         let final_tags = merge_caption_tags(item.tag_prefixes, tags);
@@ -551,88 +509,6 @@ impl VllmService {
             self.output.max_length,
         )
     }
-
-    /// True when the last `tag_batch` was cut short by a Danbooru API
-    /// connectivity failure (see `verify_danbooru_tags`). The caller decides
-    /// how to proceed; the returned batch result already contains every item
-    /// that still needs work.
-    pub fn aborted(&self) -> bool {
-        self.abort.load(Ordering::Relaxed)
-    }
-
-    async fn verify_danbooru_tags(&self, tags: Vec<String>) -> Result<Vec<String>, VllmError> {
-        let client = self.danbooru_client.as_ref().ok_or_else(|| VllmError {
-            kind: VllmErrorKind::InvalidRequest,
-            message: "已启用 Danbooru 标签校验，但共享客户端不可用".to_string(),
-            retryable: false,
-        })?;
-        let mut verified = Vec::new();
-        for tag in tags {
-            let cached = self.danbooru_tag_cache.read().await.get(&tag).copied();
-            let exists = match cached {
-                Some(exists) => exists,
-                None => {
-                    match client.tag_category(&tag).await {
-                        Ok(Some(_)) => {
-                            self.danbooru_tag_cache.write().await.insert(tag.clone(), true);
-                            true
-                        }
-                        Ok(None) => {
-                            self.danbooru_tag_cache.write().await.insert(tag.clone(), false);
-                            false
-                        }
-                        Err(error) => match error.kind {
-                            // Connectivity/credential failures must surface to
-                            // the user instead of silently degrading: stall the
-                            // batch so the task can ask for a decision.
-                            DanbooruErrorKind::Network
-                            | DanbooruErrorKind::UpstreamUnavailable
-                            | DanbooruErrorKind::InvalidCredentials
-                            | DanbooruErrorKind::RateLimited => {
-                                self.abort.store(true, Ordering::Relaxed);
-                                return Err(VllmError {
-                                    kind: VllmErrorKind::Upstream,
-                                    message: format!(
-                                        "Danbooru API 无法连接（{}）：{}",
-                                        kind_name(&error.kind),
-                                        error.message
-                                    ),
-                                    retryable: true,
-                                });
-                            }
-                            // A single-tag lookup hiccup is not worth stalling
-                            // on: keep the tag and continue.
-                            _ => {
-                                self.danbooru_tag_cache.write().await.insert(tag.clone(), true);
-                                true
-                            }
-                        },
-                    }
-                }
-            };
-            if exists {
-                verified.push(tag);
-            }
-        }
-        if verified.is_empty() {
-            return Err(VllmError {
-                kind: VllmErrorKind::InvalidResponse,
-                message: "模型返回的标签均未通过 Danbooru 在线校验".to_string(),
-                retryable: false,
-            });
-        }
-        Ok(verified)
-    }
-}
-
-fn kind_name(kind: &DanbooruErrorKind) -> &'static str {
-    match kind {
-        DanbooruErrorKind::Network => "网络错误",
-        DanbooruErrorKind::UpstreamUnavailable => "上游服务不可用",
-        DanbooruErrorKind::InvalidCredentials => "凭据无效",
-        DanbooruErrorKind::RateLimited => "请求频率受限",
-        _ => "错误",
-    }
 }
 
 fn merge_caption_tags(prefixes: Vec<String>, inferred: Vec<String>) -> Vec<String> {
@@ -703,11 +579,25 @@ async fn read_limited_response(
 
 fn parse_tag_output(raw: &str) -> Result<Vec<String>, VllmError> {
     let without_thinking =
-        if let (Some(start), Some(end)) = (raw.find("<think>"), raw.find("</think>")) {
-            format!("{}{}", &raw[..start], &raw[end + "</think>".len()..])
+        if let (Some(start), Some(end)) = (raw.find(" thinking"), raw.find(" response")) {
+            format!("{}{}", &raw[..start], &raw[end + " response".len()..])
         } else {
             raw.to_string()
         };
+    // A model that leaks its reasoning/analysis instead of a tag list
+    // produces markdown emphasis (or sentence-like fragments); treat it as
+    // invalid so the caller can retry with fresh sampling.
+    if without_thinking.contains("**")
+        || without_thinking.contains("the_user_wants")
+        || without_thinking.contains("analyze_the_image")
+        || without_thinking.contains("let's")
+    {
+        return Err(VllmError {
+            kind: VllmErrorKind::InvalidResponse,
+            message: "模型输出疑似思考过程而非标签列表".to_string(),
+            retryable: true,
+        });
+    }
     let candidate = if let Some(start) = without_thinking.rfind("<tag>") {
         let after_start = &without_thinking[start + "<tag>".len()..];
         after_start
@@ -737,6 +627,9 @@ fn parse_tag_output(raw: &str) -> Result<Vec<String>, VllmError> {
             !tag.is_empty()
                 && tag.len() <= 80
                 && !tag.starts_with("http")
+                // Tokens that survived trimming but still carry sentence
+                // punctuation are reasoning fragments, not Danbooru tags.
+                && !tag.contains(['\'', '/', '?', '!', '%', '*', '"', '`'])
                 // Typed identity prefixes are never inferred: artist/character
                 // tags come from the source caption, and a model that fabricates
                 // them would add characters the image does not actually have.
@@ -1334,6 +1227,26 @@ mod secure_tests {
     }
 
     #[test]
+    fn leaked_reasoning_output_is_rejected_as_retryable_instead_of_treated_as_tags() {
+        let leak = "1. **analyze the image**, subject: a girl, character:** blue hair, it's a digital illustration";
+        let error = parse_tag_output(leak).expect_err("reasoning leak must be invalid");
+        assert_eq!(error.kind, VllmErrorKind::InvalidResponse);
+        assert!(error.retryable, "reasoning leaks must be retried, not silently kept");
+
+        let sentence_fragment = "the_user_wants_danbooru-style_tags_for_the_provided_image, 2.**analyze_the_art_style:**";
+        assert!(parse_tag_output(sentence_fragment).is_err());
+
+        let clean = "aramedraw, 1girl, blue_hair, smile, white_dress";
+        assert_eq!(
+            parse_tag_output(clean).expect("clean list still accepted"),
+            vec!["aramedraw", "1girl", "blue_hair", "smile", "white_dress"]
+        );
+
+        let parens_kept = parse_tag_output("solo, nice_nature_(umamusume)").expect("parens kept");
+        assert_eq!(parens_kept, vec!["solo", "nice_nature_(umamusume)"]);
+    }
+
+    #[test]
     fn english_and_chinese_modes_preserve_natural_language_descriptions() {
         assert_eq!(
             parse_model_output(
@@ -1559,51 +1472,5 @@ mod secure_tests {
         server.abort();
         assert!(health.available);
         assert_eq!(health.models, vec!["vision-model"]);
-    }
-
-    #[tokio::test]
-    async fn online_danbooru_validation_filters_unknown_generated_tags() {
-        async fn tags(
-            axum::extract::Query(query): axum::extract::Query<
-                std::collections::HashMap<String, String>,
-            >,
-        ) -> axum::Json<serde_json::Value> {
-            if query.get("search[name]").is_some_and(|tag| tag == "cat") {
-                axum::Json(serde_json::json!([{ "category": 0 }]))
-            } else {
-                axum::Json(serde_json::json!([]))
-            }
-        }
-        let app = axum::Router::new().route("/tags.json", axum::routing::get(tags));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let danbooru = crate::services::danbooru::DanbooruClient::new(
-            crate::services::danbooru::DanbooruClientConfig {
-                base_url: format!("http://{address}"),
-                requests_per_second: 1_000,
-                ..crate::services::danbooru::DanbooruClientConfig::default()
-            },
-        )
-        .unwrap();
-        let service = VllmService::new(VllmServiceConfig::default(), None)
-            .unwrap()
-            .with_output_options(VllmOutputOptions {
-                language: VllmLanguage::Danbooru,
-                max_tags: 60,
-                max_length: 400,
-                verify_danbooru: true,
-                reference_existing: false,
-            })
-            .unwrap()
-            .with_danbooru_client(danbooru);
-
-        let verified = service
-            .verify_danbooru_tags(vec!["cat".to_string(), "invented_tag".to_string()])
-            .await
-            .unwrap();
-
-        server.abort();
-        assert_eq!(verified, vec!["cat"]);
     }
 }

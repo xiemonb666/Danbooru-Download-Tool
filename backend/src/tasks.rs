@@ -857,6 +857,7 @@ impl<S: TaskStore> TaskManager<S> {
         Ok(task)
     }
 
+    #[allow(dead_code)]
     /// Reads and clears the decision attached by the last
     /// `confirm_with_decision` call. Called by the waiting worker once it
     /// resumes, so a stale decision never leaks into a later phase.

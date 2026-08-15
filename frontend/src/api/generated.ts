@@ -1598,6 +1598,19 @@ export interface components {
             /** Format: int64 */
             minimum_score: number;
         };
+        ClTaggerRetagTaskOptions: {
+            /** Format: float */
+            character_threshold?: number | null;
+            /** Format: float */
+            copyright_threshold?: number | null;
+            /** Format: float */
+            general_threshold?: number | null;
+            /** Format: int32 */
+            max_tags?: number | null;
+            model_path?: string | null;
+            /** Format: float */
+            quality_threshold?: number | null;
+        };
         /** @enum {string} */
         ContentRating: "g" | "s" | "q" | "e" | "unknown";
         CreateMediaDirectoryRequest: {
@@ -1722,9 +1735,14 @@ export interface components {
         };
         /** @enum {string} */
         DeleteSelectedTaskType: "delete_selected";
+        /** @enum {string} */
+        DerivedRetaggingMode: "vllm" | "cl_tagger";
         DerivedRetaggingTaskOptions: {
+            cl_tagger?: null | components["schemas"]["ClTaggerRetagTaskOptions"];
+            mode?: null | components["schemas"]["DerivedRetaggingMode"];
             preserve_artist_character_tags?: boolean | null;
             send_to_vllm?: boolean | null;
+            vllm?: null | components["schemas"]["VllmRetagTaskOptions"];
         };
         DownloadHistoryPage: {
             items: components["schemas"]["DownloadHistoryRecord"][];
@@ -2051,6 +2069,7 @@ export interface components {
             library_relative_directory?: string | null;
             media_ids?: string[] | null;
             relative_directory?: string | null;
+            vllm?: null | components["schemas"]["VllmRetagTaskOptions"];
         };
         MediaPolicy: {
             original: boolean;
@@ -2703,6 +2722,16 @@ export interface components {
         VllmLoadStatus: {
             message: string;
             state: string;
+        };
+        VllmRetagTaskOptions: {
+            base_url?: string | null;
+            /** Format: int32 */
+            concurrency?: number | null;
+            language?: null | components["schemas"]["VllmLanguage"];
+            /** Format: int32 */
+            max_length?: number | null;
+            model?: string | null;
+            system_prompt?: string | null;
         };
         /** @enum {string} */
         VllmTagMode: "overwrite" | "append";

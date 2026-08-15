@@ -11,7 +11,7 @@ pub enum UgoiraPolicy {
     ZipOnly,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StoredSettings {
     pub version: u32,
@@ -37,6 +37,13 @@ pub struct StoredSettings {
     /// Background overlay opacity as a percentage in 0..=100.
     pub background_opacity: u8,
     pub legacy_media_path_suggestion: Option<String>,
+    /// Directory containing the local CL Tagger ONNX model and tag mapping.
+    pub cl_tagger_model_path: String,
+    pub cl_tagger_general_threshold: f32,
+    pub cl_tagger_character_threshold: f32,
+    pub cl_tagger_copyright_threshold: f32,
+    pub cl_tagger_quality_threshold: f32,
+    pub cl_tagger_max_tags: usize,
 }
 
 impl Default for StoredSettings {
@@ -63,6 +70,12 @@ impl Default for StoredSettings {
             background_image: String::new(),
             background_opacity: 18,
             legacy_media_path_suggestion: None,
+            cl_tagger_model_path: String::new(),
+            cl_tagger_general_threshold: 0.35,
+            cl_tagger_character_threshold: 0.6,
+            cl_tagger_copyright_threshold: 0.6,
+            cl_tagger_quality_threshold: 0.35,
+            cl_tagger_max_tags: 60,
         }
     }
 }
@@ -140,6 +153,31 @@ impl StoredSettings {
                     message: "代理凭据不能保存在设置 URL 中".to_string(),
                 });
             }
+        }
+        if self.cl_tagger_model_path.len() > 1_024 {
+            return Err(ConfigValidationError {
+                field: "cl_tagger_model_path",
+                message: "CL Tagger 模型路径过长".to_string(),
+            });
+        }
+        for (field, value) in [
+            ("cl_tagger_general_threshold", self.cl_tagger_general_threshold),
+            ("cl_tagger_character_threshold", self.cl_tagger_character_threshold),
+            ("cl_tagger_copyright_threshold", self.cl_tagger_copyright_threshold),
+            ("cl_tagger_quality_threshold", self.cl_tagger_quality_threshold),
+        ] {
+            if !(0.0..1.0).contains(&value) {
+                return Err(ConfigValidationError {
+                    field,
+                    message: "CL Tagger 阈值必须在 0..1 之间".to_string(),
+                });
+            }
+        }
+        if !(1..=500).contains(&self.cl_tagger_max_tags) {
+            return Err(ConfigValidationError {
+                field: "cl_tagger_max_tags",
+                message: "CL Tagger 标签数限制必须在 1..=500 之间".to_string(),
+            });
         }
         validate_vllm_endpoint(&self.vllm_base_url, &self.vllm_allowed_hosts)?;
         Ok(())
@@ -510,7 +548,7 @@ fn persist_json(path: &Path, document: &serde_json::Value) -> Result<(), String>
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct PublicConfig {
     pub danbooru_username: String,
     pub danbooru_api_key_configured: bool,
@@ -533,6 +571,12 @@ pub struct PublicConfig {
     pub blur_sensitive_media: bool,
     pub background_image: String,
     pub background_opacity: u8,
+    pub cl_tagger_model_path: String,
+    pub cl_tagger_general_threshold: f32,
+    pub cl_tagger_character_threshold: f32,
+    pub cl_tagger_copyright_threshold: f32,
+    pub cl_tagger_quality_threshold: f32,
+    pub cl_tagger_max_tags: usize,
 }
 
 impl PublicConfig {
@@ -567,6 +611,12 @@ impl PublicConfig {
             blur_sensitive_media: settings.blur_sensitive_media,
             background_image: settings.background_image.clone(),
             background_opacity: settings.background_opacity,
+            cl_tagger_model_path: settings.cl_tagger_model_path.clone(),
+            cl_tagger_general_threshold: settings.cl_tagger_general_threshold,
+            cl_tagger_character_threshold: settings.cl_tagger_character_threshold,
+            cl_tagger_copyright_threshold: settings.cl_tagger_copyright_threshold,
+            cl_tagger_quality_threshold: settings.cl_tagger_quality_threshold,
+            cl_tagger_max_tags: settings.cl_tagger_max_tags,
         }
     }
 }

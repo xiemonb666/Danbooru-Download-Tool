@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, type Component } from 'vue'
+import { computed, onMounted, reactive, ref, type Component } from 'vue'
 import { ArchiveRestore, Bot, FileCode2, FileCheck2, FileImage, Images, ScanSearch, Tags, Trash2, WandSparkles } from '@lucide/vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
 import {
   createTask,
+  downloadClTaggerModel,
   exportTrainingPreset,
+  getClTaggerHealth,
+  getClTaggerModel,
   getMediaDirectories,
   getMediaRoots,
   getQuarantine,
@@ -17,6 +20,7 @@ import {
   purgeQuarantine,
   restoreQuarantine,
   updateTrainingPresetToml,
+  type ClTaggerHealth,
   type MediaRoot,
   type QuarantineEntry,
   type RootTaskRequest,
@@ -26,6 +30,7 @@ import {
   type VisionCropRuntimeHealth,
 } from '../api'
 import { useTasksStore } from '../stores/tasks'
+import { useConfigStore } from '../stores/config'
 import { useToastStore } from '../stores/toast'
 
 interface ToolDefinition {
@@ -84,8 +89,104 @@ const datasetSmartCropFullBody = ref(true)
 const datasetSmartCropLowerBody = ref(true)
 const datasetSmartCropFeet = ref(true)
 const datasetSmartCropRequireBothFeet = ref(false)
-const datasetRetagWithVllm = ref(false)
+const datasetRetagMode = ref<'none' | 'cl_tagger' | 'vllm'>('none')
 const datasetPreserveArtistCharacterTags = ref(true)
+const retagParamsOpen = ref(false)
+const vllmParams = reactive({
+  baseUrl: 'http://127.0.0.1:8000/v1',
+  model: 'unsloth/Qwen3.6-27B-NVFP4',
+  systemPrompt: 'Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.',
+  language: 'en' as 'danbooru' | 'zh' | 'en',
+  maxLength: 400,
+  concurrency: 8,
+})
+const clTaggerParams = reactive({
+  modelPath: '',
+  generalThreshold: 0.35,
+  characterThreshold: 0.6,
+  copyrightThreshold: 0.6,
+  qualityThreshold: 0.35,
+  maxTags: 60,
+})
+const vllmTagMode = ref<'vllm' | 'cl_tagger'>('vllm')
+const clTaggerHealth = ref<ClTaggerHealth | null>(null)
+const clTaggerBusy = ref(false)
+const vllmPromptPresets = {
+  zh: '你是图像描述助手。请使用简洁、客观、自然的中文描述画面中可见的内容，并且只在一个 <tag>...</tag> 块中返回描述；不要添加解释或无关内容。',
+  en: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
+  danbooru: 'You are a Danbooru image tagging assistant. Return concise, canonical Danbooru tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas, replace spaces inside tags with underscores, and do not include prose or explanations.',
+} as const
+
+function applyVllmPromptPreset(): void {
+  vllmParams.systemPrompt = vllmPromptPresets[vllmParams.language]
+}
+
+const config = useConfigStore()
+const taggerDefaultsSeeded = ref(false)
+
+function seedTaggerDefaults(): void {
+  if (taggerDefaultsSeeded.value) return
+  taggerDefaultsSeeded.value = true
+  if (config.config.vllm_base_url) vllmParams.baseUrl = config.config.vllm_base_url
+  if (config.config.vllm_model) vllmParams.model = config.config.vllm_model
+}
+
+function openRetagParams(): void {
+  seedTaggerDefaults()
+  retagParamsOpen.value = true
+  startClTaggerPolling()
+}
+const clTaggerPolling = ref<ReturnType<typeof setInterval> | null>(null)
+
+function startClTaggerPolling(): void {
+  if (clTaggerPolling.value) return
+  void refreshClTaggerHealth()
+  clTaggerPolling.value = setInterval(() => void refreshClTaggerHealth(), 2000)
+}
+
+function stopClTaggerPolling(): void {
+  if (clTaggerPolling.value) {
+    clearInterval(clTaggerPolling.value)
+    clTaggerPolling.value = null
+  }
+}
+
+async function refreshClTaggerHealth(): Promise<void> {
+  try {
+    clTaggerHealth.value = await getClTaggerHealth()
+  } catch {
+    clTaggerHealth.value = null
+  }
+}
+
+async function refreshClTaggerModel(): Promise<void> {
+  clTaggerBusy.value = true
+  try {
+    const result = await getClTaggerModel()
+    await refreshClTaggerHealth()
+    if (clTaggerHealth.value?.model_path) clTaggerParams.modelPath = clTaggerHealth.value.model_path
+    if (result.model_path) clTaggerParams.modelPath = result.model_path
+    toast.success(result.cached ? '已从 HuggingFace 缓存检测到 CL Tagger 模型' : '未在缓存中找到 CL Tagger 模型，可点击下载')
+  } catch (reason: unknown) {
+    toast.error('无法检测 CL Tagger 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    clTaggerBusy.value = false
+  }
+}
+
+async function downloadClTaggerModelNow(): Promise<void> {
+  clTaggerBusy.value = true
+  try {
+    const result = await downloadClTaggerModel()
+    clTaggerParams.modelPath = result.model_path ?? clTaggerParams.modelPath
+    await refreshClTaggerHealth()
+    toast.success('CL Tagger 模型下载完成')
+  } catch (reason: unknown) {
+    toast.error('无法下载 CL Tagger 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    clTaggerBusy.value = false
+  }
+}
 const visionCropHealth = ref<VisionCropRuntimeHealth | null>(null)
 const visionCropBusy = ref(false)
 const artistPrefix = ref<'artist' | 'at'>('artist')
@@ -257,6 +358,7 @@ function chooseTool(tool: ToolDefinition): void {
     toast.warning('请选择媒体库')
     return
   }
+  if (tool.type === 'vllm_tag') seedTaggerDefaults()
   selectedTool.value = tool
 }
 
@@ -309,8 +411,38 @@ async function createSelectedTask(): Promise<void> {
     request = { type: kind, root_id: rootId.value, options: { preflight: true, relative_directory } }
   } else if (kind === 'resize') {
     request = { type: kind, root_id: rootId.value, options: { relative_directory, max_size: resizeMaxSize.value, quality: resizeQuality.value } }
-  } else if (kind === 'heic_convert' || kind === 'vllm_tag') {
+  } else if (kind === 'heic_convert') {
     request = { type: kind, root_id: rootId.value, options: { relative_directory } }
+  } else if (kind === 'vllm_tag') {
+    request = {
+      type: kind,
+      root_id: rootId.value,
+      options: {
+        relative_directory,
+        ...(vllmTagMode.value === 'cl_tagger'
+          ? {
+              mode: 'cl_tagger',
+              cl_tagger: {
+                model_path: clTaggerParams.modelPath.trim(),
+                general_threshold: clTaggerParams.generalThreshold,
+                character_threshold: clTaggerParams.characterThreshold,
+                copyright_threshold: clTaggerParams.copyrightThreshold,
+                quality_threshold: clTaggerParams.qualityThreshold,
+                max_tags: clTaggerParams.maxTags,
+              },
+            }
+          : {
+              vllm: {
+                base_url: vllmParams.baseUrl.trim(),
+                model: vllmParams.model.trim(),
+                system_prompt: vllmParams.systemPrompt.trim(),
+                language: vllmParams.language,
+                max_length: vllmParams.maxLength,
+                concurrency: vllmParams.concurrency,
+              },
+            }),
+      },
+    }
   } else if (kind === 'dataset_augmentation') {
     request = {
       type: kind,
@@ -339,8 +471,25 @@ async function createSelectedTask(): Promise<void> {
           max_derived_per_family: 6,
         },
         retagging: {
-          send_to_vllm: datasetRetagWithVllm.value,
+          send_to_vllm: datasetRetagMode.value !== 'none',
           preserve_artist_character_tags: datasetPreserveArtistCharacterTags.value,
+          mode: datasetRetagMode.value === 'none' ? undefined : datasetRetagMode.value,
+          vllm: {
+            base_url: vllmParams.baseUrl.trim(),
+            model: vllmParams.model.trim(),
+            system_prompt: vllmParams.systemPrompt.trim(),
+            language: vllmParams.language,
+            max_length: vllmParams.maxLength,
+            concurrency: vllmParams.concurrency,
+          },
+          cl_tagger: {
+            model_path: clTaggerParams.modelPath.trim(),
+            general_threshold: clTaggerParams.generalThreshold,
+            character_threshold: clTaggerParams.characterThreshold,
+            copyright_threshold: clTaggerParams.copyrightThreshold,
+            quality_threshold: clTaggerParams.qualityThreshold,
+            max_tags: clTaggerParams.maxTags,
+          },
         },
       },
     }
@@ -470,8 +619,8 @@ onMounted(async () => {
       :confirm-label="selectedTool?.preflight ? '开始预检' : '创建任务'"
       :wide="selectedTool?.type === 'dataset_augmentation'"
       :busy="creating"
-      @cancel="selectedTool = null"
-      @confirm="createSelectedTask"
+      @cancel="selectedTool = null; stopClTaggerPolling()"
+      @confirm="createSelectedTask(); stopClTaggerPolling()"
     >
       <p style="margin-top: 0">{{ selectedTool?.description }}</p>
       <div class="field">
@@ -554,17 +703,57 @@ onMounted(async () => {
             </section>
 
             <section class="dataset-augmentation-section">
-              <div class="dataset-augmentation-section-header"><div><strong>二次打标与数据切分</strong><span>派生图可交给 vLLM 重打标，整组 family 始终留在同一训练切分。</span></div></div>
-              <div class="field"><label class="checkbox-row" for="dataset-retag-vllm"><input id="dataset-retag-vllm" v-model="datasetRetagWithVllm" type="checkbox"> 增广完成后发送派生图到 vLLM 二次打标</label><label v-if="datasetRetagWithVllm" class="checkbox-row" for="dataset-retag-identity"><input id="dataset-retag-identity" v-model="datasetPreserveArtistCharacterTags" type="checkbox"> 将原图 artist / character 标签置于新标签最前（逗号分隔）</label></div>
+              <div class="dataset-augmentation-section-header"><div><strong>二次打标与数据切分</strong><span>CL Tagger 输出 Danbooru 标签；vLLM 视觉模型输出自然语言描述。选择引擎后弹出专属参数页配置。</span></div></div>
+              <div class="field">
+                <label class="field-label" for="dataset-retag-mode">二次打标引擎</label>
+                <select id="dataset-retag-mode" v-model="datasetRetagMode" class="select">
+                  <option value="none">不二次打标</option>
+                  <option value="cl_tagger">CL Tagger（Danbooru 标签）</option>
+                  <option value="vllm">vLLM 视觉模型（自然语言描述）</option>
+                </select>
+                <span class="inline" style="margin-top: 8px">
+                  <button type="button" class="button button-small" :disabled="datasetRetagMode === 'none'" @click="openRetagParams">{{ datasetRetagMode === 'cl_tagger' ? '配置 CL Tagger 参数' : datasetRetagMode === 'vllm' ? '配置 vLLM 参数' : '选择引擎后配置参数' }}</button>
+                  <label v-if="datasetRetagMode !== 'none'" class="checkbox-row" for="dataset-retag-identity" style="margin: 0"><input id="dataset-retag-identity" v-model="datasetPreserveArtistCharacterTags" type="checkbox"> 将原图 artist / character 标签置于新标签最前（逗号分隔）</label>
+                </span>
+              </div>
               <div class="dataset-split-grid">
                 <div class="field"><label class="field-label" for="dataset-train-percent">训练集比例</label><input id="dataset-train-percent" v-model.number="datasetTrainPercent" class="input" type="number" min="0" max="100"></div>
                 <div class="field"><label class="field-label" for="dataset-validation-percent">验证集比例</label><input id="dataset-validation-percent" v-model.number="datasetValidationPercent" class="input" type="number" min="0" max="100"></div>
                 <div class="field"><label class="field-label" for="dataset-test-percent">测试集比例</label><input id="dataset-test-percent" v-model.number="datasetTestPercent" class="input" type="number" min="0" max="100"></div>
               </div>
-              <span class="field-help">三项必须合计 100；只含 vLLM 成功写入新 Caption 的派生图才会加入对应的 ready 子集。</span>
+              <span class="field-help">三项必须合计 100；只含成功写入新 Caption 的派生图才会加入对应的 ready 子集。</span>
             </section>
           </div>
         </section>
+      </template>
+      <template v-if="selectedTool?.type === 'vllm_tag'">
+        <div class="field"><label class="field-label" for="vllm-tag-mode">打标引擎</label><select id="vllm-tag-mode" v-model="vllmTagMode" class="select" @change="startClTaggerPolling"><option value="vllm">vLLM 视觉模型（自然语言描述）</option><option value="cl_tagger">CL Tagger（Danbooru 标签）</option></select></div>
+        <template v-if="vllmTagMode === 'vllm'">
+          <div class="field"><label class="field-label" for="vllm-url">vLLM Base URL</label><input id="vllm-url" v-model="vllmParams.baseUrl" class="input" placeholder="http://127.0.0.1:8000/v1"></div>
+          <div class="field"><label class="field-label" for="vllm-model">vLLM 模型</label><input id="vllm-model" v-model="vllmParams.model" class="input" placeholder="model/name"></div>
+          <div class="field"><label class="field-label" for="vllm-concurrency">vLLM 并发数</label><input id="vllm-concurrency" v-model.number="vllmParams.concurrency" class="input" type="number" min="1" max="64"></div>
+          <div class="field"><label class="field-label" for="vllm-language">输出格式</label><select id="vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="danbooru">Danbooru 标签</option><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
+          <div class="field"><label class="field-label" for="vllm-max-length">最大输出长度</label><input id="vllm-max-length" v-model.number="vllmParams.maxLength" class="input" type="number" min="1" max="4000"></div>
+          <div class="field"><label class="field-label" for="vllm-prompt">系统提示词</label><span class="field-help">切换输出格式会载入匹配模板，载入后仍可编辑</span><textarea id="vllm-prompt" v-model="vllmParams.systemPrompt" class="textarea"></textarea></div>
+        </template>
+        <template v-else>
+          <div class="field"><label class="field-label" for="vllm-tag-cl-model">CL Tagger 模型目录</label><input id="vllm-tag-cl-model" v-model="clTaggerParams.modelPath" class="input" placeholder="留空自动检测 HuggingFace 缓存或自动下载"></div>
+          <div class="dataset-runtime-status">
+            <div class="inline"><button class="button button-small" type="button" :disabled="clTaggerBusy" @click="refreshClTaggerModel">检测模型</button><button class="button button-small" type="button" :disabled="clTaggerBusy || clTaggerHealth?.downloading" @click="downloadClTaggerModelNow">下载模型</button></div>
+            <span v-if="clTaggerHealth?.downloading" class="field-help">正在下载：{{ clTaggerHealth.downloaded_bytes ?? 0 }} / {{ clTaggerHealth.total_bytes ?? '?' }} 字节</span>
+            <span v-else-if="clTaggerHealth?.loading" class="field-help">模型正在加载…</span>
+            <span v-else-if="clTaggerHealth?.download_error" class="field-help">下载失败：{{ clTaggerHealth.download_error }}</span>
+            <span v-else-if="clTaggerHealth?.loaded" class="field-help">模型已加载：{{ clTaggerHealth.model_path }}</span>
+            <span v-else class="field-help">本地 CPU 推理（ONNX）；留空模型目录时任务会自动检测缓存，缺失则自动下载。</span>
+          </div>
+          <div class="dataset-resolution-grid">
+            <div class="field"><label class="field-label" for="vllm-tag-cl-general">general 阈值</label><input id="vllm-tag-cl-general" v-model.number="clTaggerParams.generalThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="field-label" for="vllm-tag-cl-character">character 阈值</label><input id="vllm-tag-cl-character" v-model.number="clTaggerParams.characterThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="field-label" for="vllm-tag-cl-copyright">copyright 阈值</label><input id="vllm-tag-cl-copyright" v-model.number="clTaggerParams.copyrightThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="field-label" for="vllm-tag-cl-quality">quality 阈值</label><input id="vllm-tag-cl-quality" v-model.number="clTaggerParams.qualityThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+            <div class="field"><label class="field-label" for="vllm-tag-cl-max-tags">最大标签数</label><input id="vllm-tag-cl-max-tags" v-model.number="clTaggerParams.maxTags" class="input" type="number" min="1" max="200"></div>
+          </div>
+        </template>
       </template>
       <div v-if="selectedTool?.type === 'tag_pipeline'" class="field">
         <label class="field-label" for="artist-prefix">艺术家标签前缀</label>
@@ -573,6 +762,42 @@ onMounted(async () => {
           <option value="at">@标签</option>
         </select>
       </div>
+    </ConfirmDialog>
+
+    <ConfirmDialog
+      :open="retagParamsOpen"
+      :title="datasetRetagMode === 'cl_tagger' ? 'CL Tagger 参数' : 'vLLM 参数'"
+      confirm-label="完成"
+      :wide="true"
+      @cancel="retagParamsOpen = false; stopClTaggerPolling()"
+      @confirm="retagParamsOpen = false; stopClTaggerPolling()"
+    >
+      <template v-if="datasetRetagMode === 'vllm'">
+        <p style="margin-top: 0">vLLM 视觉模型生成自然语言描述或标签；端点仅允许 loopback，除非设置页配置了额外 allowlist。API Key 仍由系统凭据库提供。</p>
+        <div class="field"><label class="field-label" for="retag-vllm-url">vLLM Base URL</label><input id="retag-vllm-url" v-model="vllmParams.baseUrl" class="input" placeholder="http://127.0.0.1:8000/v1"></div>
+        <div class="field"><label class="field-label" for="retag-vllm-model">vLLM 模型</label><input id="retag-vllm-model" v-model="vllmParams.model" class="input" placeholder="model/name"></div>
+        <div class="field"><label class="field-label" for="retag-vllm-concurrency">并发数</label><input id="retag-vllm-concurrency" v-model.number="vllmParams.concurrency" class="input" type="number" min="1" max="64"></div>
+        <div class="field"><label class="field-label" for="retag-vllm-language">输出格式</label><select id="retag-vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="danbooru">Danbooru 标签</option><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
+        <div class="field"><label class="field-label" for="retag-vllm-max-length">最大输出长度</label><input id="retag-vllm-max-length" v-model.number="vllmParams.maxLength" class="input" type="number" min="1" max="4000"></div>
+        <div class="field"><label class="field-label" for="retag-vllm-prompt">系统提示词</label><span class="field-help">切换输出格式会载入匹配模板，载入后仍可编辑</span><textarea id="retag-vllm-prompt" v-model="vllmParams.systemPrompt" class="textarea"></textarea></div>
+      </template>
+      <template v-else-if="datasetRetagMode === 'cl_tagger'">
+        <p style="margin-top: 0">CL Tagger 在本地 CPU 推理（ONNX），输出 Danbooru 标签格式；首次运行会在任务开始时加载模型。</p>
+        <div class="field"><label class="field-label" for="retag-cl-model">CL Tagger 模型目录</label><input id="retag-cl-model" v-model="clTaggerParams.modelPath" class="input" placeholder="留空自动检测 HuggingFace 缓存或自动下载"></div>
+        <div class="dataset-runtime-status">
+          <div class="inline"><button class="button button-small" type="button" :disabled="clTaggerBusy" @click="refreshClTaggerModel">检测模型</button><button class="button button-small" type="button" :disabled="clTaggerBusy || clTaggerHealth?.downloading" @click="downloadClTaggerModelNow">下载模型</button></div>
+          <span v-if="clTaggerHealth?.downloading" class="field-help">正在下载：{{ clTaggerHealth.downloaded_bytes ?? 0 }} / {{ clTaggerHealth.total_bytes ?? '?' }} 字节</span>
+          <span v-else-if="clTaggerHealth?.loading" class="field-help">模型正在加载…</span>
+          <span v-else-if="clTaggerHealth?.download_error" class="field-help">下载失败：{{ clTaggerHealth.download_error }}</span>
+          <span v-else-if="clTaggerHealth?.loaded" class="field-help">模型已加载：{{ clTaggerHealth.model_path }}</span>
+          <span v-else class="field-help">留空模型目录时任务会自动检测缓存，缺失则自动下载。</span>
+        </div>
+        <div class="field"><label class="field-label" for="retag-cl-general">general 置信度阈值</label><input id="retag-cl-general" v-model.number="clTaggerParams.generalThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+        <div class="field"><label class="field-label" for="retag-cl-character">character 置信度阈值</label><input id="retag-cl-character" v-model.number="clTaggerParams.characterThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+        <div class="field"><label class="field-label" for="retag-cl-copyright">copyright 置信度阈值</label><input id="retag-cl-copyright" v-model.number="clTaggerParams.copyrightThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+        <div class="field"><label class="field-label" for="retag-cl-quality">quality 置信度阈值</label><input id="retag-cl-quality" v-model.number="clTaggerParams.qualityThreshold" class="input" type="number" min="0" max="1" step="0.05"></div>
+        <div class="field"><label class="field-label" for="retag-cl-max-tags">最大标签数</label><input id="retag-cl-max-tags" v-model.number="clTaggerParams.maxTags" class="input" type="number" min="1" max="200"></div>
+      </template>
     </ConfirmDialog>
 
     <ConfirmDialog

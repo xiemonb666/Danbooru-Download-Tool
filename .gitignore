@@ -49,3 +49,6 @@ env/
 /benchmark_*.py
 .DS_Store
 Thumbs.db
+
+# Large model files
+*.safetensors

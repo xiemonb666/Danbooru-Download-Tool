@@ -1,4 +1,4 @@
-import { fireEvent, render, within } from '@testing-library/vue'
+import { fireEvent, render } from '@testing-library/vue'
 import { reactive } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SettingsView from './SettingsView.vue'
@@ -8,8 +8,6 @@ const mocks = vi.hoisted(() => ({
   deleteMediaRoot: vi.fn(),
   deleteSecret: vi.fn(),
   getMediaRoots: vi.fn(),
-  loadVllmModel: vi.fn(),
-  unloadVllmModel: vi.fn(),
   getMediaDirectories: vi.fn(),
   createMediaDirectory: vi.fn(),
   saveSecret: vi.fn(),
@@ -27,8 +25,6 @@ vi.mock('../api', () => ({
   deleteMediaRoot: mocks.deleteMediaRoot,
   deleteSecret: mocks.deleteSecret,
   getMediaRoots: mocks.getMediaRoots,
-  loadVllmModel: mocks.loadVllmModel,
-  unloadVllmModel: mocks.unloadVllmModel,
   getMediaDirectories: mocks.getMediaDirectories,
   createMediaDirectory: mocks.createMediaDirectory,
   saveSecret: mocks.saveSecret,
@@ -44,23 +40,11 @@ vi.mock('../stores/config', () => ({
     config: reactive({
       danbooru_username: '',
       danbooru_api_key_configured: false,
-      vllm_api_key_configured: false,
-      vllm_base_url: 'http://127.0.0.1:8000/v1',
-      vllm_allowed_hosts: [],
       proxy_url: null,
       download_concurrency: 8,
       filename_template: '{id}_score_{score}.{ext}',
       ugoira_policy: 'webm_and_zip',
       blur_sensitive_media: true,
-      vllm_model: 'vision-model',
-      vllm_system_prompt: '生成准确标签',
-      vllm_tag_mode: 'overwrite',
-      vllm_concurrency: 4,
-      vllm_language: 'danbooru',
-      vllm_max_tags: 60,
-      vllm_max_length: 400,
-      vllm_verify_danbooru: true,
-      vllm_reference_existing: false,
     }),
   }),
 }))
@@ -69,8 +53,6 @@ vi.mock('../stores/health', () => ({
   useHealthStore: () => ({
     status: 'online',
     message: '本地服务正常',
-    vllmStatus: 'offline',
-    vllmMessage: 'vLLM 未加载',
     check: mocks.healthCheck,
   }),
 }))
@@ -152,80 +134,6 @@ describe('SettingsView media root mapping', () => {
     await view.findByText('下载位置')
     expect(view.queryByText('C:\\Legacy\\Danbooru')).not.toBeInTheDocument()
     expect(view.queryByRole('button', { name: '将旧路径添加为下载位置' })).not.toBeInTheDocument()
-  })
-
-  it('edits and saves the complete vLLM execution settings', async () => {
-    const view = render(SettingsView)
-
-    await fireEvent.update(await view.findByLabelText('vLLM 模型'), '  local/vision-v2  ')
-    await fireEvent.update(view.getByLabelText('标签写入模式'), 'append')
-    await fireEvent.update(view.getByLabelText('vLLM 并发数'), '12')
-    await fireEvent.update(view.getByLabelText('输出格式'), 'zh')
-    await fireEvent.update(view.getByLabelText('系统提示词'), '  只返回规范标签  ')
-    await fireEvent.update(view.getByLabelText('最大标签数'), '48')
-    await fireEvent.update(view.getByLabelText('最大输出长度'), '640')
-    await fireEvent.click(view.getByRole('checkbox', { name: '联网校验 Danbooru 标签' }))
-    await fireEvent.click(view.getByRole('checkbox', { name: '参考现有标签文件' }))
-    await fireEvent.click(view.getByRole('button', { name: '保存设置' }))
-
-    expect(view.getByLabelText('vLLM 模型')).toHaveValue('local/vision-v2')
-    expect(view.getByLabelText('系统提示词')).toHaveValue('只返回规范标签')
-    expect(view.getByLabelText('标签写入模式')).toHaveValue('append')
-    expect(view.getByLabelText('vLLM 并发数')).toHaveValue(12)
-    expect(view.getByLabelText('输出格式')).toHaveValue('zh')
-    expect(view.getByLabelText('最大标签数')).toHaveValue(48)
-    expect(view.getByLabelText('最大输出长度')).toHaveValue(640)
-    expect(view.getByRole('checkbox', { name: '联网校验 Danbooru 标签' })).not.toBeChecked()
-    expect(view.getByRole('checkbox', { name: '参考现有标签文件' })).toBeChecked()
-    expect(mocks.saveConfig).toHaveBeenCalledOnce()
-  })
-
-  it('loads a matching system prompt when the output format changes', async () => {
-    const view = render(SettingsView)
-    const prompt = await view.findByLabelText('系统提示词')
-
-    await fireEvent.update(view.getByLabelText('输出格式'), 'zh')
-
-    expect((prompt as HTMLTextAreaElement).value).toContain('中文')
-    expect((prompt as HTMLTextAreaElement).value).toContain('<tag>...</tag>')
-
-    await fireEvent.update(view.getByLabelText('输出格式'), 'en')
-
-    expect((prompt as HTMLTextAreaElement).value).toContain('English')
-    expect((prompt as HTMLTextAreaElement).value).toContain('<tag>...</tag>')
-  })
-
-  it('aligns the vLLM output options as matching settings controls', async () => {
-    const view = render(SettingsView)
-    const group = await view.findByRole('group', { name: '视觉模型输出选项' })
-    const verify = within(group).getByRole('checkbox', { name: '联网校验 Danbooru 标签' })
-    const reference = within(group).getByRole('checkbox', { name: '参考现有标签文件' })
-
-    expect(verify.closest('label')).toHaveClass('setting-check')
-    expect(reference.closest('label')).toHaveClass('setting-check')
-  })
-
-  it('saves the selected vLLM settings and requests model loading on demand', async () => {
-    mocks.loadVllmModel.mockResolvedValue({ state: 'started', message: '模型正在加载' })
-    const view = render(SettingsView)
-
-    await fireEvent.click(await view.findByRole('button', { name: '加载 vLLM 模型' }))
-
-    await vi.waitFor(() => expect(mocks.loadVllmModel).toHaveBeenCalledOnce())
-    expect(mocks.saveConfig).toHaveBeenCalledOnce()
-    expect(mocks.success).toHaveBeenCalledWith('模型正在加载')
-    expect(mocks.healthCheck).toHaveBeenCalledOnce()
-  })
-
-  it('lets the user unload the vLLM model and refreshes its status', async () => {
-    mocks.unloadVllmModel.mockResolvedValue({ state: 'stopped', message: 'vLLM 模型已卸载，显存已释放' })
-    const view = render(SettingsView)
-
-    await fireEvent.click(await view.findByRole('button', { name: '卸载 vLLM 模型' }))
-
-    await vi.waitFor(() => expect(mocks.unloadVllmModel).toHaveBeenCalledOnce())
-    expect(mocks.success).toHaveBeenCalledWith('vLLM 模型已卸载，显存已释放')
-    expect(mocks.healthCheck).toHaveBeenCalledOnce()
   })
 
   it('lets the user disable sensitive-media blur and persists the choice', async () => {
