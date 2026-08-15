@@ -838,8 +838,12 @@ impl DatasetAugmentationWorkspace {
                 "没有满足关键部位保护和原生分辨率约束的智能裁剪候选",
             )?;
         }
+        let mut selected_kinds = std::collections::HashSet::new();
         let selected = candidates
             .iter()
+            .filter(|candidate| {
+                selected_kinds.insert(candidate.kind)
+            })
             .take(usize::from(self.config.smart_crop.max_derived_per_family))
             .copied()
             .collect::<Vec<_>>();
@@ -3348,6 +3352,81 @@ mod tests {
         assert!(smart_crop_candidates(&analysis, 1800, 2400, &config)
             .iter()
             .any(|candidate| candidate.kind == "feet"));
+    }
+
+    #[test]
+    fn smart_crop_keeps_one_best_candidate_per_kind_to_avoid_sample_id_collisions() {
+        let temporary = tempfile::tempdir().unwrap();
+        RgbImage::new(3000, 4000)
+            .save(temporary.path().join("source.png"))
+            .unwrap();
+        let config = DatasetAugmentationConfig {
+            min_megapixels: 0.1,
+            min_long_side: 1,
+            min_short_side: 512,
+            horizontal_flip: false,
+            smart_crop: SmartCropConfig {
+                enabled: true,
+                portrait: false,
+                upper_body: true,
+                cowboy_shot: true,
+                full_body_tight: false,
+                lower_body: false,
+                feet: false,
+                ..SmartCropConfig::default()
+            },
+            ..DatasetAugmentationConfig::default()
+        };
+        let root = VerifiedMediaRoot::open(temporary.path()).unwrap();
+        let mut workspace =
+            DatasetAugmentationWorkspace::create(root, "task-1", config).unwrap();
+        let analysis = AnimeCropAnalysis {
+            persons: vec![crop_box(500.0, 400.0, 1900.0, 3200.0)],
+            heads: vec![crop_box(850.0, 500.0, 1510.0, 1120.0)],
+            faces: vec![crop_box(970.0, 680.0, 1390.0, 1050.0)],
+            poses: vec![stylized_full_body_pose()],
+            ..AnimeCropAnalysis::default()
+        };
+        let result = workspace
+            .process_with_analysis(
+                &DatasetAugmentationSource {
+                    media_id: "media-1".to_string(),
+                    relative_path: PathBuf::from("source.png"),
+                    sha256: Some("source-hash".to_string()),
+                    fallback_caption: String::new(),
+                },
+                Some(&analysis),
+            )
+            .unwrap();
+        let DatasetAugmentationItemResult::Generated(samples) = result else {
+            panic!("source should qualify for augmentation");
+        };
+        let mut kinds = std::collections::BTreeMap::new();
+        for sample in &samples {
+            *kinds.entry(sample.variant.clone()).or_insert(0) += 1;
+        }
+        for (kind, count) in &kinds {
+            assert!(
+                *count <= 1,
+                "kind {kind} must yield at most one sample so sample ids and retag queue entries stay unique (got {count})"
+            );
+        }
+        assert_eq!(samples.len(), 2, "expecting upper_body + cowboy_shot");
+        let retagging = std::fs::read_to_string(
+            temporary
+                .path()
+                .join(".augmentation-metadata/task-1/metadata/retagging.jsonl"),
+        )
+        .unwrap();
+        let ids = retagging
+            .lines()
+            .map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                record["sample_id"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        let unique = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique, ids.len(), "retagging queue must not repeat sample ids");
     }
 
     #[test]

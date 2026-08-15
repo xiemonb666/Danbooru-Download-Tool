@@ -56,7 +56,7 @@ impl Default for StoredSettings {
             vllm_model: crate::services::vllm::DEFAULT_MODEL.to_string(),
             vllm_system_prompt: crate::services::vllm::DEFAULT_SYSTEM_PROMPT.to_string(),
             vllm_tag_mode: crate::services::vllm::TagWriteMode::Overwrite,
-            vllm_language: crate::services::vllm::VllmLanguage::Danbooru,
+            vllm_language: crate::services::vllm::VllmLanguage::English,
             vllm_max_tags: 60,
             vllm_max_length: 400,
             vllm_verify_danbooru: true,

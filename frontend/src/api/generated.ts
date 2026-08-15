@@ -2718,7 +2718,7 @@ export interface components {
             models: string[];
         };
         /** @enum {string} */
-        VllmLanguage: "zh" | "en" | "danbooru";
+        VllmLanguage: "zh" | "en";
         VllmLoadStatus: {
             message: string;
             state: string;

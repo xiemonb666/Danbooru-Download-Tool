@@ -24095,7 +24095,7 @@ mod security_contract_tests {
         );
         assert_eq!(
             std::fs::read_to_string(media_root.join("image.txt")).unwrap(),
-            "human_tag,\ncat,solo"
+            "human_tag,\ncat, solo"
         );
         let detail_response = application
             .oneshot(
@@ -24112,7 +24112,7 @@ mod security_contract_tests {
         let detail: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
         assert_eq!(
             detail["data"]["items"][0]["result"]["tags"],
-            serde_json::json!(["cat", "solo"])
+            serde_json::json!(["cat, solo"])
         );
         assert_eq!(
             detail["data"]["items"][0]["result"]["sidecar_written"],
@@ -24206,7 +24206,7 @@ mod security_contract_tests {
         );
         assert_eq!(
             std::fs::read_to_string(media.join("selected.txt")).unwrap(),
-            "cat,solo"
+            "cat, solo"
         );
         let quarantined = state.database.list_quarantine("root-1", false).unwrap();
         assert_eq!(quarantined.len(), 1);
@@ -24228,7 +24228,7 @@ mod security_contract_tests {
             .unwrap();
         assert_eq!(
             item.result.as_ref().unwrap()["tags"],
-            serde_json::json!(["cat", "solo"])
+            serde_json::json!(["cat, solo"])
         );
     }
 
@@ -28141,7 +28141,7 @@ async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retri
         let retag_vllm = serde_json::json!({
             "base_url": endpoint,
             "model": "unsloth/Qwen3.6-27B-NVFP4",
-            "language": "danbooru"
+            "language": "en"
         });
 
         let media = directory.path().join("augmentation-fail-root");
@@ -28277,7 +28277,7 @@ async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retri
         let retag_vllm = serde_json::json!({
             "base_url": endpoint,
             "model": "unsloth/Qwen3.6-27B-NVFP4",
-            "language": "danbooru"
+            "language": "en"
         });
         state.settings.write().await.vllm_base_url = endpoint;
         state.settings.write().await.vllm_model = "unsloth/Qwen3.6-27B-NVFP4".into();
@@ -28449,6 +28449,6 @@ async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retri
             .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(captions.len(), 1);
-        assert_eq!(captions[0], "cat,solo");
+        assert_eq!(captions[0], "cat, solo");
     }
 }

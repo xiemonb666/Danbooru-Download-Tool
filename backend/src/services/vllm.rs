@@ -15,18 +15,15 @@ use tokio::task::JoinSet;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif"];
 pub const DEFAULT_MODEL: &str = "unsloth/Qwen3.6-27B-NVFP4";
-pub const DEFAULT_SYSTEM_PROMPT: &str = "Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.";
-pub const AUGMENTATION_RETAGGING_PROMPT: &str = "Analyze the image and return Danbooru-style tags inside exactly one <tag>...</tag> block.\nRules:\n- Put ONLY a comma-separated list of lowercase tags inside the tag block, no explanations, no markdown, no bullet points.\n- Cover the subject (1girl/1boy/solo/group), every clearly visible character, clothing, hair, eyes, pose, expression, props, background and art style.\n- Do not use artist: or character: prefixes.\n- Output at least 8 tags; a typical anime illustration needs 15-40 tags.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VllmLanguage {
     #[serde(rename = "zh", alias = "chinese")]
     Chinese,
-    #[serde(rename = "en", alias = "english")]
-    English,
     #[default]
-    #[serde(rename = "danbooru")]
-    Danbooru,
+    #[serde(rename = "en", alias = "english", alias = "danbooru")]
+    English,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,7 +94,7 @@ pub struct VllmOutputOptions {
 impl Default for VllmOutputOptions {
     fn default() -> Self {
         Self {
-            language: VllmLanguage::Danbooru,
+            language: VllmLanguage::English,
             max_tags: 60,
             max_length: 400,
             reference_existing: false,
@@ -446,7 +443,6 @@ impl VllmService {
             VllmLanguage::English => {
                 "Describe the visible image content in concise, objective English"
             }
-            VllmLanguage::Danbooru => "为这张图片生成规范的 Danbooru 风格标签",
         };
         let user_text = if existing.trim().is_empty() {
             format!("{task}，优先放入 <tag>...</tag>；不要输出无关内容。")
@@ -502,12 +498,7 @@ impl VllmService {
                 message: "vLLM 响应没有文本内容".to_string(),
                 retryable: false,
             })?;
-        parse_model_output(
-            content,
-            self.output.language,
-            self.output.max_tags,
-            self.output.max_length,
-        )
+        parse_model_output(content, self.output.max_tags, self.output.max_length)
     }
 }
 
@@ -649,23 +640,13 @@ fn parse_tag_output(raw: &str) -> Result<Vec<String>, VllmError> {
     Ok(tags)
 }
 
-fn parse_model_output(
-    raw: &str,
-    language: VllmLanguage,
-    max_tags: usize,
-    max_length: usize,
-) -> Result<Vec<String>, VllmError> {
+fn parse_model_output(raw: &str, max_tags: usize, max_length: usize) -> Result<Vec<String>, VllmError> {
     if !(1..=200).contains(&max_tags) || !(1..=4_000).contains(&max_length) {
         return Err(VllmError {
             kind: VllmErrorKind::InvalidRequest,
             message: "vLLM 输出数量或长度限制无效".to_string(),
             retryable: false,
         });
-    }
-    if language == VllmLanguage::Danbooru {
-        let mut tags = parse_tag_output(raw)?;
-        tags.truncate(max_tags);
-        return Ok(tags);
     }
     let without_thinking =
         if let (Some(start), Some(end)) = (raw.find("<think>"), raw.find("</think>")) {
@@ -1251,7 +1232,6 @@ mod secure_tests {
         assert_eq!(
             parse_model_output(
                 "<tag>A woman with blue hair standing beside a red car.</tag>",
-                VllmLanguage::English,
                 60,
                 400,
             )
@@ -1259,13 +1239,8 @@ mod secure_tests {
             vec!["A woman with blue hair standing beside a red car."]
         );
         assert_eq!(
-            parse_model_output(
-                "画面中是一位蓝发少女，站在红色汽车旁。",
-                VllmLanguage::Chinese,
-                60,
-                400,
-            )
-            .unwrap(),
+            parse_model_output("画面中是一位蓝发少女，站在红色汽车旁。", 60, 400,)
+                .unwrap(),
             vec!["画面中是一位蓝发少女，站在红色汽车旁。"]
         );
     }

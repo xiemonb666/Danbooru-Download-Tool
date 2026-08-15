@@ -88,8 +88,6 @@ pub enum VllmLanguage {
     Zh,
     #[serde(rename = "en")]
     En,
-    #[serde(rename = "danbooru")]
-    Danbooru,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

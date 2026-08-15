@@ -9,7 +9,9 @@ import {
   deleteMediaRoot,
   deleteSecret,
   getMediaRoots,
+  loadVllmModel,
   saveSecret,
+  unloadVllmModel,
   updateMediaRoot,
   type MediaRoot,
   type SaveMediaRootRequest,
@@ -31,9 +33,26 @@ const rootForm = ref<SaveMediaRootRequest>({ name: '', windows_path: null, linux
 const managedRootId = ref('')
 const managedDirectory = ref('')
 const danbooruSecret = ref('')
+const vllmSecret = ref('')
+const allowedHosts = ref('')
 const credentialSaving = ref<SecretKind | null>(null)
+const vllmLoading = ref(false)
+const vllmUnloading = ref(false)
 const backgroundUploading = ref(false)
 const backgroundPicker = ref<HTMLInputElement | null>(null)
+
+const vllmPromptPresets = {
+  zh: '你是图像描述助手。请使用简洁、客观、自然的中文描述画面中可见的内容，并且只在一个 <tag>...</tag> 块中返回描述；不要添加解释或无关内容。',
+  en: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
+} as const
+
+function applyVllmPromptPreset(event: Event): void {
+  const target = event.currentTarget
+  if (!(target instanceof HTMLSelectElement)) return
+  const language = target.value as keyof typeof vllmPromptPresets
+  config.config.vllm_language = language
+  config.config.vllm_system_prompt = vllmPromptPresets[language]
+}
 
 async function pickBackgroundFile(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
@@ -78,6 +97,7 @@ async function removeBackground(): Promise<void> {
 }
 async function load(): Promise<void> {
   await config.load()
+  allowedHosts.value = config.config.vllm_allowed_hosts.join('\n')
   roots.value = await getMediaRoots()
   managedRootId.value = roots.value[0]?.id ?? ''
 }
@@ -90,7 +110,13 @@ async function saveSettings(): Promise<boolean> {
   saving.value = true
   try {
     config.config.download_concurrency = Math.max(1, Math.min(32, config.config.download_concurrency))
+    config.config.vllm_concurrency = Math.max(1, Math.min(32, config.config.vllm_concurrency))
+    config.config.vllm_max_length = Math.max(1, Math.min(4000, config.config.vllm_max_length))
     config.config.proxy_url = config.config.proxy_url?.trim() || null
+    config.config.vllm_base_url = config.config.vllm_base_url.trim()
+    config.config.vllm_model = config.config.vllm_model.trim()
+    config.config.vllm_system_prompt = config.config.vllm_system_prompt.trim()
+    config.config.vllm_allowed_hosts = allowedHosts.value.split(/[,\n]/).map((host) => host.trim()).filter(Boolean)
     await config.save()
     toast.success('设置已保存')
     return true
@@ -99,6 +125,33 @@ async function saveSettings(): Promise<boolean> {
     return false
   } finally {
     saving.value = false
+  }
+}
+
+async function requestVllmModelLoad(): Promise<void> {
+  if (!(await saveSettings())) return
+  vllmLoading.value = true
+  try {
+    const result = await loadVllmModel()
+    toast.success(result.message)
+    await health.check()
+  } catch (reason: unknown) {
+    toast.error('无法加载 vLLM 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    vllmLoading.value = false
+  }
+}
+
+async function requestVllmModelUnload(): Promise<void> {
+  vllmUnloading.value = true
+  try {
+    const result = await unloadVllmModel()
+    toast.success(result.message)
+    await health.check()
+  } catch (reason: unknown) {
+    toast.error('无法卸载 vLLM 模型', reason instanceof Error ? reason.message : '未知错误')
+  } finally {
+    vllmUnloading.value = false
   }
 }
 
@@ -179,7 +232,7 @@ async function saveRoot(): Promise<void> {
 }
 
 async function storeCredential(kind: SecretKind): Promise<void> {
-  const value = kind === 'danbooru' ? danbooruSecret.value : ''
+  const value = kind === 'danbooru' ? danbooruSecret.value : vllmSecret.value
   if (!value) return
   credentialSaving.value = kind
   try {
@@ -187,6 +240,9 @@ async function storeCredential(kind: SecretKind): Promise<void> {
     if (kind === 'danbooru') {
       config.config.danbooru_api_key_configured = true
       danbooruSecret.value = ''
+    } else {
+      config.config.vllm_api_key_configured = true
+      vllmSecret.value = ''
     }
     if (stored.storage === 'system') {
       toast.success('凭据已保存到系统凭据库')
@@ -205,6 +261,7 @@ async function removeCredential(kind: SecretKind): Promise<void> {
   try {
     await deleteSecret(kind)
     if (kind === 'danbooru') config.config.danbooru_api_key_configured = false
+    else config.config.vllm_api_key_configured = false
     toast.success('凭据已移除')
   } catch (reason: unknown) {
     toast.error('无法移除凭据', reason instanceof Error ? reason.message : '未知错误')
@@ -308,9 +365,23 @@ onMounted(() => {
         </section>
 
         <section class="surface">
-          <header class="surface-header"><div><h2 class="section-title">网络</h2><p class="section-copy">代理失败时不会静默直连。</p></div></header>
+          <header class="surface-header"><div><h2 class="section-title">网络与 vLLM</h2><p class="section-copy">代理失败时不会静默直连。vLLM 生成自然语言描述；Danbooru 标签由 CL Tagger 负责。</p></div></header>
           <div class="surface-body form-grid">
             <div class="field span-full"><label class="field-label" for="proxy">代理 URL</label><input id="proxy" v-model="config.config.proxy_url" class="input" placeholder="socks5://127.0.0.1:1080"></div>
+            <div class="field span-full"><label class="field-label" for="vllm-url">vLLM Base URL</label><input id="vllm-url" v-model="config.config.vllm_base_url" class="input" placeholder="http://127.0.0.1:8000/v1"></div>
+            <div class="field span-full"><label class="field-label" for="vllm-model">vLLM 模型</label><input id="vllm-model" v-model="config.config.vllm_model" class="input" required placeholder="model/name"></div>
+            <div class="field"><label class="field-label" for="vllm-tag-mode">标签写入模式</label><select id="vllm-tag-mode" v-model="config.config.vllm_tag_mode" class="select"><option value="overwrite">覆盖现有标签</option><option value="append">追加到现有标签</option></select></div>
+            <div class="field"><label class="field-label" for="vllm-concurrency">vLLM 并发数</label><input id="vllm-concurrency" v-model.number="config.config.vllm_concurrency" class="input" type="number" min="1" max="32"></div>
+            <div class="field"><label class="field-label" for="vllm-language">输出格式</label><select id="vllm-language" v-model="config.config.vllm_language" class="select" @change="applyVllmPromptPreset"><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
+            <div class="field"><label class="field-label" for="vllm-max-length">最大输出长度</label><input id="vllm-max-length" v-model.number="config.config.vllm_max_length" class="input" type="number" min="1" max="4000"></div>
+            <div class="setting-options span-full" role="group" aria-label="视觉模型输出选项">
+              <label class="setting-check" for="vllm-reference">
+                <input id="vllm-reference" v-model="config.config.vllm_reference_existing" type="checkbox" aria-label="参考现有标签文件" aria-describedby="vllm-reference-help">
+                <span><strong>参考现有标签文件</strong><small id="vllm-reference-help">读取同名 .txt，作为生成与修正描述的上下文。</small></span>
+              </label>
+            </div>
+            <div class="field span-full"><label class="field-label" for="vllm-prompt">系统提示词</label><span id="vllm-prompt-help" class="field-help">切换输出格式会载入匹配模板，载入后仍可编辑</span><textarea id="vllm-prompt" v-model="config.config.vllm_system_prompt" class="textarea" required aria-describedby="vllm-prompt-help"></textarea></div>
+            <div class="field span-full"><label class="field-label" for="allowed-hosts">额外地址 allowlist <span class="field-help">每行一个 host:port；外部地址仅 HTTPS，默认端口也需写 :443</span></label><textarea id="allowed-hosts" v-model="allowedHosts" class="textarea" placeholder="vision.example.com:443"></textarea></div>
           </div>
         </section>
       </div>
@@ -323,6 +394,14 @@ onMounted(() => {
               <Server :size="20" :class="health.status === 'online' ? 'configured' : 'not-configured'" />
               <span><strong>{{ health.status === 'online' ? '服务正常' : health.status === 'offline' ? '服务离线' : '正在检查' }}</strong><small>{{ health.message }}</small></span>
               <button type="button" class="button button-small" @click="health.check">重新检查</button>
+            </div>
+            <div class="credential-row">
+              <Server :size="20" :class="health.vllmStatus === 'online' ? 'configured' : 'not-configured'" />
+              <span><strong>{{ health.vllmStatus === 'online' ? 'vLLM 正常' : health.vllmStatus === 'offline' ? 'vLLM 离线' : '正在检查 vLLM' }}</strong><small>{{ health.vllmMessage }}</small></span>
+              <span class="inline">
+                <button type="button" class="button button-small" :disabled="vllmLoading || vllmUnloading || health.vllmStatus === 'online'" @click="requestVllmModelLoad">{{ vllmLoading ? '正在请求加载' : health.vllmStatus === 'online' ? '模型已加载' : '加载 vLLM 模型' }}</button>
+                <button type="button" class="button button-small button-danger" :disabled="vllmLoading || vllmUnloading" @click="requestVllmModelUnload">{{ vllmUnloading ? '正在卸载' : '卸载 vLLM 模型' }}</button>
+              </span>
             </div>
           </div>
         </section>
@@ -338,6 +417,14 @@ onMounted(() => {
             <div class="field" style="margin: 12px 0 18px"><label class="field-label" for="danbooru-user">Danbooru 用户名</label><input id="danbooru-user" v-model="config.config.danbooru_username" class="input" autocomplete="username"></div>
             <div class="field"><label class="field-label" for="danbooru-secret">更新 API Key</label><input id="danbooru-secret" v-model="danbooruSecret" class="input" type="password" autocomplete="new-password" placeholder="输入后安全保存"></div>
             <div class="inline" style="margin-top: 10px"><button type="button" class="button button-primary button-small" :disabled="!danbooruSecret || credentialSaving !== null" @click="storeCredential('danbooru')">保存凭据</button><button v-if="config.config.danbooru_api_key_configured" type="button" class="button button-danger button-small" :disabled="credentialSaving !== null" @click="removeCredential('danbooru')">移除</button></div>
+
+            <div class="credential-row" style="margin-top: 20px">
+              <KeyRound :size="20" />
+              <span><strong>vLLM API Key</strong><small :class="config.config.vllm_api_key_configured ? 'configured' : 'not-configured'">{{ config.config.vllm_api_key_configured ? '已配置，不回显' : '未配置或无需认证' }}</small></span>
+              <Check v-if="config.config.vllm_api_key_configured" :size="17" class="configured" />
+            </div>
+            <div class="field" style="margin-top: 12px"><label class="field-label" for="vllm-secret">更新 API Key</label><input id="vllm-secret" v-model="vllmSecret" class="input" type="password" autocomplete="new-password" placeholder="输入后安全保存"></div>
+            <div class="inline" style="margin-top: 10px"><button type="button" class="button button-primary button-small" :disabled="!vllmSecret || credentialSaving !== null" @click="storeCredential('vllm')">保存凭据</button><button v-if="config.config.vllm_api_key_configured" type="button" class="button button-danger button-small" :disabled="credentialSaving !== null" @click="removeCredential('vllm')">移除</button></div>
           </div>
         </section>
 

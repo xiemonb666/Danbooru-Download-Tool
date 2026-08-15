@@ -24,7 +24,7 @@ describe('generated OpenAPI contracts', () => {
       vllm_system_prompt: 'return tags',
       vllm_tag_mode: 'overwrite',
       vllm_concurrency: 16,
-      vllm_language: 'danbooru',
+      vllm_language: 'en',
       vllm_max_tags: 60,
       vllm_max_length: 400,
       vllm_verify_danbooru: true,

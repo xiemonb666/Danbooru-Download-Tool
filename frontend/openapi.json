@@ -10013,8 +10013,7 @@
         "type": "string",
         "enum": [
           "zh",
-          "en",
-          "danbooru"
+          "en"
         ]
       },
       "VllmLoadStatus": {

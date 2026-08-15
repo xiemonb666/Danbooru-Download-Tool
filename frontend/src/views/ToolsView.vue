@@ -95,8 +95,8 @@ const retagParamsOpen = ref(false)
 const vllmParams = reactive({
   baseUrl: 'http://127.0.0.1:8000/v1',
   model: 'unsloth/Qwen3.6-27B-NVFP4',
-  systemPrompt: 'Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.',
-  language: 'en' as 'danbooru' | 'zh' | 'en',
+  systemPrompt: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
+  language: 'en' as 'zh' | 'en',
   maxLength: 400,
   concurrency: 8,
 })
@@ -114,7 +114,6 @@ const clTaggerBusy = ref(false)
 const vllmPromptPresets = {
   zh: '你是图像描述助手。请使用简洁、客观、自然的中文描述画面中可见的内容，并且只在一个 <tag>...</tag> 块中返回描述；不要添加解释或无关内容。',
   en: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
-  danbooru: 'You are a Danbooru image tagging assistant. Return concise, canonical Danbooru tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas, replace spaces inside tags with underscores, and do not include prose or explanations.',
 } as const
 
 function applyVllmPromptPreset(): void {
@@ -732,7 +731,7 @@ onMounted(async () => {
           <div class="field"><label class="field-label" for="vllm-url">vLLM Base URL</label><input id="vllm-url" v-model="vllmParams.baseUrl" class="input" placeholder="http://127.0.0.1:8000/v1"></div>
           <div class="field"><label class="field-label" for="vllm-model">vLLM 模型</label><input id="vllm-model" v-model="vllmParams.model" class="input" placeholder="model/name"></div>
           <div class="field"><label class="field-label" for="vllm-concurrency">vLLM 并发数</label><input id="vllm-concurrency" v-model.number="vllmParams.concurrency" class="input" type="number" min="1" max="64"></div>
-          <div class="field"><label class="field-label" for="vllm-language">输出格式</label><select id="vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="danbooru">Danbooru 标签</option><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
+          <div class="field"><label class="field-label" for="vllm-language">输出格式</label><select id="vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
           <div class="field"><label class="field-label" for="vllm-max-length">最大输出长度</label><input id="vllm-max-length" v-model.number="vllmParams.maxLength" class="input" type="number" min="1" max="4000"></div>
           <div class="field"><label class="field-label" for="vllm-prompt">系统提示词</label><span class="field-help">切换输出格式会载入匹配模板，载入后仍可编辑</span><textarea id="vllm-prompt" v-model="vllmParams.systemPrompt" class="textarea"></textarea></div>
         </template>
@@ -777,7 +776,7 @@ onMounted(async () => {
         <div class="field"><label class="field-label" for="retag-vllm-url">vLLM Base URL</label><input id="retag-vllm-url" v-model="vllmParams.baseUrl" class="input" placeholder="http://127.0.0.1:8000/v1"></div>
         <div class="field"><label class="field-label" for="retag-vllm-model">vLLM 模型</label><input id="retag-vllm-model" v-model="vllmParams.model" class="input" placeholder="model/name"></div>
         <div class="field"><label class="field-label" for="retag-vllm-concurrency">并发数</label><input id="retag-vllm-concurrency" v-model.number="vllmParams.concurrency" class="input" type="number" min="1" max="64"></div>
-        <div class="field"><label class="field-label" for="retag-vllm-language">输出格式</label><select id="retag-vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="danbooru">Danbooru 标签</option><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
+        <div class="field"><label class="field-label" for="retag-vllm-language">输出格式</label><select id="retag-vllm-language" v-model="vllmParams.language" class="select" @change="applyVllmPromptPreset"><option value="zh">中文描述</option><option value="en">英文描述</option></select></div>
         <div class="field"><label class="field-label" for="retag-vllm-max-length">最大输出长度</label><input id="retag-vllm-max-length" v-model.number="vllmParams.maxLength" class="input" type="number" min="1" max="4000"></div>
         <div class="field"><label class="field-label" for="retag-vllm-prompt">系统提示词</label><span class="field-help">切换输出格式会载入匹配模板，载入后仍可编辑</span><textarea id="retag-vllm-prompt" v-model="vllmParams.systemPrompt" class="textarea"></textarea></div>
       </template>

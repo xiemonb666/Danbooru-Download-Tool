@@ -306,7 +306,7 @@ describe('ToolsView media selection boundary', () => {
           vllm: {
             base_url: 'http://127.0.0.1:8000/v1',
             model: 'unsloth/Qwen3.6-27B-NVFP4',
-            system_prompt: 'Analyze the image and return concise Danbooru-style tags inside exactly one <tag>...</tag> block. Use lowercase tags separated by commas; do not put explanations inside the tag block.',
+            system_prompt: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
             language: 'en',
             max_length: 400,
             concurrency: 8,
