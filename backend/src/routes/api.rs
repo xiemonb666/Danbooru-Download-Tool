@@ -4672,23 +4672,32 @@ async fn execute_vllm_unload(
     state: &AppState,
     failure_code: &'static str,
 ) -> Result<&'static str, TaskFailure> {
+    const UNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
     let project_root = state.vllm_launcher_root.clone().ok_or_else(|| TaskFailure {
         code: "vllm_launcher_missing".to_string(),
         message: "找不到随应用提供的 vLLM 卸载脚本".to_string(),
         retryable: false,
     })?;
-    tokio::task::spawn_blocking(move || unload_vllm_process(&project_root))
-        .await
-        .map_err(|error| TaskFailure {
-            code: failure_code.to_string(),
-            message: format!("vLLM 卸载任务失败: {error}"),
-            retryable: true,
-        })?
-        .map_err(|message| TaskFailure {
-            code: failure_code.to_string(),
-            message,
-            retryable: true,
-        })
+    tokio::time::timeout(
+        UNLOAD_TIMEOUT,
+        tokio::task::spawn_blocking(move || unload_vllm_process(&project_root)),
+    )
+    .await
+    .map_err(|_| TaskFailure {
+        code: failure_code.to_string(),
+        message: "vLLM 卸载脚本在 30 秒内未完成，已放弃等待".to_string(),
+        retryable: true,
+    })?
+    .map_err(|error| TaskFailure {
+        code: failure_code.to_string(),
+        message: format!("vLLM 卸载任务失败: {error}"),
+        retryable: true,
+    })?
+    .map_err(|message| TaskFailure {
+        code: failure_code.to_string(),
+        message,
+        retryable: true,
+    })
 }
 
 async fn unload_vllm_generation(
@@ -4730,6 +4739,8 @@ async fn acquire_vllm_runtime(
 ) -> Result<VllmRuntimeLease, TaskFailure> {
     const START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    const START_WAIT_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+    const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
     let settings = state.settings.read().await.clone();
     let (base_url, model) = endpoint
@@ -4769,7 +4780,13 @@ async fn acquire_vllm_runtime(
 
             if runtime.stopping {
                 drop(runtime);
-                changed.await;
+                if tokio::time::timeout(STOP_WAIT_TIMEOUT, changed).await.is_err() {
+                    return Err(TaskFailure {
+                        code: "vllm_stop_wait_timeout".to_string(),
+                        message: "等待 vLLM 停止超时，请稍后重试".to_string(),
+                        retryable: true,
+                    });
+                }
                 continue;
             }
             if runtime.starting {
@@ -4783,7 +4800,13 @@ async fn acquire_vllm_runtime(
                     }
                 }
                 drop(runtime);
-                changed.await;
+                if tokio::time::timeout(START_WAIT_TIMEOUT, changed).await.is_err() {
+                    return Err(TaskFailure {
+                        code: "vllm_start_wait_timeout".to_string(),
+                        message: "等待 vLLM 启动完成超时，请稍后重试".to_string(),
+                        retryable: true,
+                    });
+                }
                 continue;
             }
             if runtime.ready {
