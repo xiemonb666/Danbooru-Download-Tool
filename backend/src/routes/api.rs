@@ -12968,7 +12968,7 @@ async fn run_cl_tagger_batch_items(
     let settings = state.settings.read().await.clone();
     let cl_config = task_cl_tagger_config(task)?
         .unwrap_or_else(|| cl_tagger_retag_config_from_settings(&settings));
-    let mut lease = acquire_cl_tagger_runtime(state, false, &cl_config).await?;
+    let lease = acquire_cl_tagger_runtime(state, false, &cl_config).await?;
     let total = state
         .database
         .task_item_counts(&task.id)

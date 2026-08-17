@@ -93,15 +93,6 @@ pub fn detect_model_in_hf_cache() -> Option<PathBuf> {
     None
 }
 
-/// 解析模型目录：显式路径优先，其次 HF 缓存检测，最后返回 None。
-pub fn resolve_model_dir(requested: &str) -> Option<PathBuf> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return detect_model_in_hf_cache();
-    }
-    Some(PathBuf::from(requested))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClTagCategory {
