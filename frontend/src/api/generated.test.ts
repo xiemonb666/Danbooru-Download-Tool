@@ -20,7 +20,7 @@ describe('generated OpenAPI contracts', () => {
       vllm_api_key_configured: false,
       vllm_base_url: 'http://127.0.0.1:8000/v1',
       vllm_allowed_hosts: [],
-      vllm_model: 'unsloth/Qwen3.6-27B-NVFP4',
+      vllm_model: 'unsloth/Qwen3.8-27B-NVFP4',
       vllm_system_prompt: 'return tags',
       vllm_tag_mode: 'overwrite',
       vllm_concurrency: 16,

@@ -3,7 +3,7 @@
 
 set -e
 
-MODEL_PATH="${MODEL_PATH:-unsloth/Qwen3.6-27B-NVFP4}"
+MODEL_PATH="${MODEL_PATH:-unsloth/Qwen3.8-27B-NVFP4}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 启动 vLLM 0.23.0 服务（unsloth/Qwen3.6-27B-NVFP4，用于 AI 打标）
+# 启动 vLLM 0.23.0 服务（unsloth/Qwen3.8-27B-NVFP4，用于 AI 打标）
 # 在 WSL2 中运行：bash start_vllm.sh
 
 set -Eeuo pipefail
 
 # 模型路径或 ModelScope/HuggingFace ID
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-MODEL_PATH="${MODEL_PATH:-unsloth/Qwen3.6-27B-NVFP4}"
+MODEL_PATH="${MODEL_PATH:-unsloth/Qwen3.8-27B-NVFP4}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_HOST="${VLLM_HOST:-127.0.0.1}"
 VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-vllm}"

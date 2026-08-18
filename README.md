@@ -86,7 +86,7 @@ Vite 服务位于 <http://127.0.0.1:5173>，`/api` 会代理至后端。
 | `DEV_CORS` | 未启用 | 仅 `1` 时允许本地 Vite 来源。 |
 | `START_VLLM` | `0` | 设为 `1` 才会随启动器尝试后台启动 vLLM。 |
 | `VLLM_HOST` / `VLLM_PORT` | `127.0.0.1` / `8000` | 本地 vLLM 地址。 |
-| `MODEL_PATH` | `unsloth/Qwen3.6-27B-NVFP4` | vLLM 模型路径或模型 ID。 |
+| `MODEL_PATH` | `unsloth/Qwen3.8-27B-NVFP4` | vLLM 模型路径或模型 ID。 |
 | `VLLM_CONDA_ENV` | `vllm` | vLLM conda 环境名。 |
 
 HEIC 转换另需将 `heif-convert` 放入 `PATH`。缺失时该任务会失败并保留原文件。

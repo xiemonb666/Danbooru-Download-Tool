@@ -20131,7 +20131,7 @@ mod security_contract_tests {
         Json(serde_json::json!({
             "data": [
                 { "id": "local/vision-model" },
-                { "id": "unsloth/Qwen3.6-27B-NVFP4" },
+                { "id": "unsloth/Qwen3.8-27B-NVFP4" },
                 { "id": "local/custom-vision" }
             ]
         }))
@@ -28163,7 +28163,7 @@ async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retri
         let (endpoint, server) = mock_vllm_tags_failing().await;
         let retag_vllm = serde_json::json!({
             "base_url": endpoint,
-            "model": "unsloth/Qwen3.6-27B-NVFP4",
+            "model": "unsloth/Qwen3.8-27B-NVFP4",
             "language": "en"
         });
 
@@ -28299,11 +28299,11 @@ async fn dataset_augmentation_persistent_vllm_failures_are_abandoned_after_retri
         let (endpoint, server) = mock_vllm_tags_delayed(std::time::Duration::from_secs(2)).await;
         let retag_vllm = serde_json::json!({
             "base_url": endpoint,
-            "model": "unsloth/Qwen3.6-27B-NVFP4",
+            "model": "unsloth/Qwen3.8-27B-NVFP4",
             "language": "en"
         });
         state.settings.write().await.vllm_base_url = endpoint;
-        state.settings.write().await.vllm_model = "unsloth/Qwen3.6-27B-NVFP4".into();
+        state.settings.write().await.vllm_model = "unsloth/Qwen3.8-27B-NVFP4".into();
 
         let media = directory.path().join("augmentation-resume-root");
         std::fs::create_dir_all(&media).unwrap();

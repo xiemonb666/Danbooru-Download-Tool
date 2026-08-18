@@ -8,7 +8,7 @@ const defaults: AppConfig = {
   vllm_api_key_configured: false,
   vllm_base_url: 'http://127.0.0.1:8000/v1',
   vllm_allowed_hosts: [],
-  vllm_model: 'unsloth/Qwen3.6-27B-NVFP4',
+  vllm_model: 'unsloth/Qwen3.8-27B-NVFP4',
   vllm_system_prompt: 'You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.',
   vllm_tag_mode: 'overwrite',
   vllm_concurrency: 16,

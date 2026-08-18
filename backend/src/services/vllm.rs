@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif"];
-pub const DEFAULT_MODEL: &str = "unsloth/Qwen3.6-27B-NVFP4";
+pub const DEFAULT_MODEL: &str = "unsloth/Qwen3.8-27B-NVFP4";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an image description assistant. Describe the visible content in concise, objective, natural English and return only the description inside exactly one <tag>...</tag> block. Do not add explanations or unrelated content.";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
